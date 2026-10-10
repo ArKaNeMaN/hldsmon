@@ -1,0 +1,11 @@
+{"type":"server","t":1712345678.0,"frame_ms":{"min":3.1,"avg":4.0,"max":61.2},"hitch":{"gt50":2,"gt100":0},"cpu_pct":41.2,"rss_kb":120000,"minflt":100,"majflt":1,"players":17,"real":16,"proxy":0,"fake":1,"in_kbps":812.4,"out_kbps":1400.1,"edicts":245,"map":"de_dust2","uptime_s":84213,"fps":100.0,"maxclients":32}
+{"type":"client","t":1712345678.5,"id":7,"gen":1712000000,"ping":42,"loss":3,"dloss":1,"choke":0,"dchoke":0,"delta_seq":100,"in_seq":100234,"in_ack":100200,"out_seq":99980,"rel_seq":99900,"rel_fill":3,"rate":20000,"cleartime":0.5,"updaterate":101,"cmdrate":101,"state":7,"fragbuf_total":0,"incomingready_mask":0,"flow_in_kbps":12.3,"flow_out_kbps":18.1,"flow_in_avg":12.0,"flow_out_avg":17.5,"msg_flags":0}
+{"type":"drop","t":1712345679.0,"id":7,"gen":1712000000,"reason":"Reliable channel overflowed","category":"overflow","crash":false,"observed_via":"sv_dropclient","client":{"active":true,"spawned":true,"fully_connected":true,"connected":true,"proxy":false,"fake":false,"userid":7,"connecttime":1712000000.0,"cmdtime":1712345678.9,"connection_started":1712000000.0},"netchan":{"in_seq":100234,"in_ack":100200,"in_rel_ack":99900,"in_rel_seq":99900,"out_seq":99980,"rel_seq":99900,"last_rel_seq":99800,"rel_len":3900,"rel_fill":95,"rate":20000,"cleartime":0.5,"msg_flags":0,"last_received":1712345678.9,"connect_time":1712000000.0},"window":[{"t":1712345678.0,"ping":40,"loss":2,"choke":0,"rel_fill":3},{"t":1712345678.5,"ping":42,"loss":3,"choke":0,"rel_fill":3}],"server":{"frame_ms":{"min":3.1,"avg":4.0,"max":61.2},"players":17},"neighbors":{"count":3,"avg_loss":2.0,"avg_ping":50.0,"max_loss":4}}
+{"type":"reject","t":1712345679.5,"ip":"1.2.3.4","steamid":"STEAM_0:0:123","stage":"SV_CheckUserInfo:password","detail":"bad password"}
+{"type":"connect","t":1712345680.0,"id":8,"ip":"5.6.7.8","steamid":"STEAM_0:1:456","name":"Player Eight"}
+{"type":"netcmd","t":1712345680.2,"id":8,"cmd":"clc_move","count":10}
+{"type":"massdrop","t":1712345680.5,"window_s":5,"count":4,"reason":"Timeout","category":"timeout"}
+{"type":"packet","t":1712345681.0,"pps":1500,"bytes":900000,"sizes":{"lt128":100,"lt512":500,"lt1024":300,"ge1024":600},"unique_ips":20,"top_ip":"5.6.7.8"}
+{"type":"hitch","t":1712345681.5,"duration_ms":120}
+{"type":"mapchange","t":1712345682.0,"map":"de_nuke"}
+{"type":"voice","t":1712345682.5,"id":7,"last_voice_time":1712345680.0}

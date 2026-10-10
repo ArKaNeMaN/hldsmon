@@ -1,0 +1,9 @@
+
+{"type":"server","t":150.0,"frame_ms":{"min":2.0,"avg":3.0,"max":4.0},"hitch":{"gt50":0,"gt100":0},"players":2}
+   
+{"type":"unknown","t":151.0,"foo":"bar"}
+{"type":"client","t":152.0,"id":2,"gen":2,"ping":20,"loss":1,"choke":0,"rel_fill":2}
+this is not json at all
+{"no_type":"missing"}
+{"type":"hitch","t":153.0,"duration_ms":50}
+

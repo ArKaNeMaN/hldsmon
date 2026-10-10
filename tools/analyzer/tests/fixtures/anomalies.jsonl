@@ -1,0 +1,14 @@
+{"type":"client","t":200.0,"id":3,"gen":3,"ping":30,"loss":1,"choke":0,"rel_fill":10}
+{"type":"drop","t":200.0,"id":10,"gen":10,"reason":"Timeout","category":"timeout","crash":false,"observed_via":"sv_dropclient"}
+{"type":"drop","t":201.0,"id":11,"gen":11,"reason":"Timeout","category":"timeout","crash":false,"observed_via":"sv_dropclient"}
+{"type":"drop","t":202.0,"id":12,"gen":12,"reason":"Timeout","category":"timeout","crash":false,"observed_via":"sv_dropclient"}
+{"type":"hitch","t":210.0,"duration_ms":120}
+{"type":"hitch","t":211.0,"duration_ms":130}
+{"type":"hitch","t":212.0,"duration_ms":140}
+{"type":"client","t":220.0,"id":3,"gen":3,"ping":35,"loss":2,"choke":0,"rel_fill":30}
+{"type":"client","t":221.0,"id":3,"gen":3,"ping":40,"loss":3,"choke":0,"rel_fill":55}
+{"type":"client","t":222.0,"id":3,"gen":3,"ping":45,"loss":4,"choke":1,"rel_fill":80}
+{"type":"client","t":223.0,"id":3,"gen":3,"ping":50,"loss":5,"choke":2,"rel_fill":95}
+{"type":"client","t":230.0,"id":4,"gen":4,"ping":60,"loss":50,"choke":0,"rel_fill":5}
+{"type":"client","t":230.5,"id":4,"gen":4,"ping":60,"loss":52,"choke":0,"rel_fill":5}
+{"type":"server","t":240.0,"frame_ms":{"min":3.0,"avg":5.0,"max":130.0},"hitch":{"gt50":5,"gt100":1},"players":3}

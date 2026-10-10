@@ -21,3 +21,5 @@ __pycache__/
 # logs (runtime)
 addons/metamod/hldsmon/logs/
 *.jsonl
+# ...but keep the analyzer's test fixtures
+!tools/analyzer/tests/fixtures/*.jsonl
