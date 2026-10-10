@@ -7,6 +7,7 @@
 // must stay at zero. std::string is deliberately absent from the measured path.
 
 #include "serialization.h"
+#include "modnet.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -136,6 +137,26 @@ int main() {
         ++g_fail;
     }
 
+    ModnetRecord mr;
+    std::memset(&mr, 0, sizeof mr);
+    mr.t = 1712345679.0;
+    std::strcpy(mr.module, "easy_http_amxx_i386");
+    std::strcpy(mr.so, "easy_http_amxx_i386.so");
+    {
+        ModnetSnapshot prev{};
+        ModnetSnapshot cur{};
+        cur.in_bytes = 100;
+        cur.out_bytes = 200;
+        cur.conns = 1;
+        mr.t = 1712345679.0;
+        modnet_diff(prev, cur, 1.0, mr);
+    }
+    const size_t n_modnet = write_modnet_json(buf, sizeof buf, mr);
+    if (n_modnet == 0) {
+        std::printf("FAIL: modnet serialization returned 0\n");
+        ++g_fail;
+    }
+
     const size_t allocs_in_measured_region = g_allocs;
 
     // ---- end measured region ----
@@ -148,6 +169,7 @@ int main() {
     CHECK(n_client > 0);
     CHECK(n_server > 0);
     CHECK(n_esc > 0);
+    CHECK(n_modnet > 0);
 
     if (g_fail == 0) std::printf("test_no_alloc: PASS\n");
     return g_fail == 0 ? 0 : 1;

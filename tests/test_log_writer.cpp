@@ -30,6 +30,8 @@ void check(bool cond, const char* what)
 // Epoch for 2024-04-05 12:00:00 UTC (monotonic reference point).
 const double kDay1 = 1712322000.0;
 const double kDay2 = kDay1 + 86400.0;
+const double kDay3 = kDay2 + 86400.0;
+const double kDay4 = kDay3 + 86400.0;
 
 void day_name(double now_utc, char* out, size_t cap)
 {
@@ -50,6 +52,31 @@ bool is_dir(const char* path)
 {
     struct stat st;
     return ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool is_symlink(const char* path)
+{
+    struct stat st;
+    return ::lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+
+// Create `dir/<name>` holding one JSON line. Returns the full path in `out`.
+void make_daily_file(const char* dir, const char* name, char* out, size_t cap)
+{
+    std::snprintf(out, cap, "%s/%s", dir, name);
+    FILE* f = std::fopen(out, "w");
+    if (f != nullptr) {
+        std::fputs("{}\n", f);
+        std::fclose(f);
+    }
+}
+
+// Full path of the daily file for `now_utc`.
+void daily_path(const char* dir, double now_utc, char* out, size_t cap)
+{
+    char name[128];
+    day_name(now_utc, name, sizeof(name));
+    std::snprintf(out, cap, "%s/%s", dir, name);
 }
 
 // Create a unique temp directory; returns false on failure.
@@ -130,6 +157,7 @@ void test_unavailable_dir()
 {
     std::printf("[unavailable dir]\n");
     hldsmon::LogWriter w;
+    w.set_retention_days(3);
     const bool ok = w.open("/proc/nonexistent/hldsmon", kDay1);
     check(!ok, "open returns false");
     check(!w.enabled(), "writer disabled");
@@ -178,6 +206,161 @@ void test_size_cap()
     check(w.error_count() == 0, "no spurious errors on clean cap");
 }
 
+void test_prune_basic()
+{
+    std::printf("[prune basic]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for prune basic");
+        return;
+    }
+
+    char name[128];
+    char p1[512], p2[512], p3[512], p4[512];
+    day_name(kDay1, name, sizeof(name));
+    make_daily_file(dir, name, p1, sizeof(p1));
+    day_name(kDay2, name, sizeof(name));
+    make_daily_file(dir, name, p2, sizeof(p2));
+    day_name(kDay3, name, sizeof(name));
+    make_daily_file(dir, name, p3, sizeof(p3));
+    daily_path(dir, kDay4, p4, sizeof(p4));
+
+    char marker[512];
+    std::snprintf(marker, sizeof(marker), "%s/hldsmon-crash.marker", dir);
+    FILE* m = std::fopen(marker, "w");
+    if (m != nullptr) {
+        std::fputs("x\n", m);
+        std::fclose(m);
+    }
+
+    hldsmon::LogWriter w;
+    w.set_retention_days(3);
+    check(w.open(dir, kDay4), "open day4 with retention 3");
+    check(!file_exists(p1), "day1 (T-3) pruned");
+    check(file_exists(p2), "day2 (T-2) kept");
+    check(file_exists(p3), "day3 (T-1) kept");
+    check(file_exists(p4), "day4 (T) kept");
+    check(std::strcmp(w.current_path(), p4) == 0, "current file is day4");
+    check(file_exists(marker), "crash marker never pruned");
+    check(w.error_count() == 0, "no errors on clean prune");
+}
+
+void test_prune_rotation()
+{
+    std::printf("[prune rotation N=1]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for prune rotation");
+        return;
+    }
+
+    char p1[512], p2[512];
+    daily_path(dir, kDay1, p1, sizeof(p1));
+    daily_path(dir, kDay2, p2, sizeof(p2));
+
+    hldsmon::LogWriter w;
+    w.set_retention_days(1);
+    check(w.open(dir, kDay1), "open day1 with retention 1");
+    const char* line = "{\"type\":\"server\",\"t\":1}";
+    w.write(line, std::strlen(line));
+    w.flush();
+
+    w.maybe_rotate(kDay2);
+    check(!file_exists(p1), "day1 pruned after rotation (N=1)");
+    check(file_exists(p2), "day2 kept after rotation");
+    check(std::strcmp(w.current_path(), p2) == 0, "current file is day2");
+    check(w.error_count() == 0, "no errors across rotation prune");
+}
+
+void test_prune_symlink()
+{
+    std::printf("[prune symlink]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for symlink");
+        return;
+    }
+
+    char target[512];
+    std::snprintf(target, sizeof(target), "%s/real.dat", dir);
+    FILE* f = std::fopen(target, "w");
+    if (f != nullptr) {
+        std::fputs("secret\n", f);
+        std::fclose(f);
+    }
+
+    char link[512];
+    daily_path(dir, kDay1, link, sizeof(link));
+    check(::symlink("real.dat", link) == 0, "create daily-named symlink");
+    check(is_symlink(link), "link is a symlink");
+
+    hldsmon::LogWriter w;
+    w.set_retention_days(1);
+    check(w.open(dir, kDay2), "open day2 with retention 1");
+    check(!is_symlink(link), "daily-named symlink unlinked");
+    check(file_exists(target), "symlink target file survives");
+
+    FILE* rf = std::fopen(target, "r");
+    char buf[32] = {0};
+    const bool ok = rf != nullptr && std::fgets(buf, sizeof(buf), rf) != nullptr &&
+                    std::strcmp(buf, "secret\n") == 0;
+    if (rf != nullptr) {
+        std::fclose(rf);
+    }
+    check(ok, "target content untouched");
+}
+
+void test_prune_unlink_open()
+{
+    std::printf("[prune unlink-while-open]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for unlink-open");
+        return;
+    }
+
+    char p1[512];
+    daily_path(dir, kDay1, p1, sizeof(p1));
+    FILE* f = std::fopen(p1, "w");
+    if (f != nullptr) {
+        std::fputs("one-line\n", f);
+        std::fclose(f);
+    }
+
+    FILE* rd = std::fopen(p1, "r");
+    check(rd != nullptr, "open reader on the old file");
+
+    hldsmon::LogWriter w;
+    w.set_retention_days(1);
+    check(w.open(dir, kDay2), "open day2 with retention 1");
+    check(!file_exists(p1), "old file unlinked while a reader holds it");
+
+    char buf[32] = {0};
+    const bool read_ok = rd != nullptr && std::fgets(buf, sizeof(buf), rd) != nullptr &&
+                         std::strcmp(buf, "one-line\n") == 0;
+    if (rd != nullptr) {
+        std::fclose(rd);
+    }
+    check(read_ok, "reader still reads the unlinked inode");
+    check(w.error_count() == 0, "no errors on unlink-while-open");
+}
+
+void test_prune_empty_dir()
+{
+    std::printf("[prune fresh dir]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for prune empty");
+        return;
+    }
+
+    hldsmon::LogWriter w;
+    w.set_retention_days(3);
+    check(w.open(dir, kDay1), "open fresh dir with retention");
+    check(w.enabled(), "enabled on fresh dir");
+    check(w.error_count() == 0, "no error when only the current file exists");
+}
+
 int g_obs_fd = -2;
 int g_obs_calls = 0;
 
@@ -224,6 +407,11 @@ int main()
     test_permissions();
     test_unavailable_dir();
     test_size_cap();
+    test_prune_basic();
+    test_prune_rotation();
+    test_prune_symlink();
+    test_prune_unlink_open();
+    test_prune_empty_dir();
     test_fd_observer();
 
     if (g_failures == 0) {

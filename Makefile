@@ -2,6 +2,7 @@
 # Build: 32-bit Metamod plugin (Linux). Tests: host-native core + python analyzer.
 
 CXX      ?= g++
+CC       ?= gcc
 PYTHON   ?= python3
 
 # ---- vendored include dirs (system-style: suppress third-party warnings) ----
@@ -25,14 +26,19 @@ PLUGIN_DEFS := \
 WARN       := -Wall -Wextra -Werror
 BASE_FLAGS := -std=c++17 $(WARN) -O2
 PLUGIN_FLAGS := $(BASE_FLAGS) -m32 -fPIC -shared $(PLUGIN_DEFS) $(VENDOR_INC)
-HOST_FLAGS := $(BASE_FLAGS) -Isrc
+HOST_FLAGS := $(BASE_FLAGS) -Isrc -pthread
+# 32-bit synthetic GOT/PLT harness (M-P5): driver + target objects, no engine headers.
+HARNESS_DIR    := build/modnet_harness
+HARNESS_SRCS   := src/modnet_got.cpp src/modnet.cpp
+HARNESS_FLAGS  := -std=c++17 $(WARN) -O2 -m32 -Isrc
+HARNESS_TFLAGS := $(WARN) -O2 -m32 -fPIC -shared -fno-optimize-sibling-calls
 
 TARGET := HldsMonitoring_mm_i386.so
 SRCS   := $(wildcard src/*.cpp)
-CORE_SRCS := $(wildcard src/serialization.cpp src/log_writer.cpp src/metrics.cpp)
+CORE_SRCS := $(wildcard src/serialization.cpp src/log_writer.cpp src/metrics.cpp src/modnet.cpp src/retention.cpp)
 TEST_SRCS := $(wildcard tests/test_*.cpp)
 
-.PHONY: all test test-host-core test-core test-python web verify-exports clean
+.PHONY: all test test-host-core test-core test-python web verify-exports test-modnet-harness clean
 
 all: $(TARGET)
 
@@ -58,6 +64,18 @@ verify-exports: $(TARGET)
 	@nm -D --defined-only $(TARGET) | awk '{print $$3}' | sed 's/@.*//' | grep -v '^HLDSMON_1.0$$' | LC_ALL=C sort -u > build/exports.got
 	@LC_ALL=C sort -u exports.whitelist > build/exports.expected
 	@diff build/exports.got build/exports.expected && echo "verify-exports: OK"
+
+# 32-bit synthetic GOT/PLT harness (plan M-P5). Builds synthetic target `.so`s
+# (lazy + BIND_NOW), a 32-bit driver linking `src/modnet_got.cpp` +
+# `src/modnet.cpp` (no engine headers), and runs it; non-zero on any failure.
+# Needs a working i686 toolchain/multilib; NOT part of the host `make test`.
+test-modnet-harness:
+	@mkdir -p $(HARNESS_DIR)
+	$(CC) $(HARNESS_TFLAGS) tests/modnet_harness/target.c -o $(HARNESS_DIR)/target_lazy.so
+	$(CC) $(HARNESS_TFLAGS) tests/modnet_harness/target.c -o $(HARNESS_DIR)/target_now.so -Wl,-z,now
+	$(CXX) $(HARNESS_FLAGS) tests/modnet_harness/harness.cpp $(HARNESS_SRCS) \
+		-o $(HARNESS_DIR)/harness -ldl
+	$(HARNESS_DIR)/harness $(HARNESS_DIR)/target_lazy.so $(HARNESS_DIR)/target_now.so
 
 test-python:
 	@if [ -f tools/analyzer/tests/test_hldsmon.py ]; then \

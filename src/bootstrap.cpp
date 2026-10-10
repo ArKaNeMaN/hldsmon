@@ -23,7 +23,7 @@ IRehldsServerStatic* g_RehldsSvs   = nullptr;
 plugin_info_t Plugin_info = {
     META_INTERFACE_VERSION,   // ifvers
     "HldsMonitoring",         // name
-    "0.2.2",                  // version
+    "0.3.0",                  // version
     __DATE__,                 // date
     "Sisyphus",               // author
     "",                       // url
@@ -54,6 +54,10 @@ char s_val_drop_window[] = "60";
 char s_val_dir[]         = "addons/metamod/hldsmon/logs";
 char s_val_max_mb[]      = "512";
 char s_val_ip_table[]    = "4096";
+char s_val_retention_days[] = "3";
+char s_val_modnet[]           = "0";
+char s_val_modnet_targets[]   = "";
+char s_val_modnet_rescan_sec[] = "5";
 
 cvar_t s_cvar_enable;
 cvar_t s_cvar_client_hz;
@@ -65,6 +69,10 @@ cvar_t s_cvar_drop_window;
 cvar_t s_cvar_dir;
 cvar_t s_cvar_max_mb;
 cvar_t s_cvar_ip_table;
+cvar_t s_cvar_retention_days;
+cvar_t s_cvar_modnet;
+cvar_t s_cvar_modnet_targets;
+cvar_t s_cvar_modnet_rescan_sec;
 
 void util_log(const char* msg) noexcept {
     if (gpMetaUtilFuncs != nullptr && gpMetaUtilFuncs->pfnLogConsole != nullptr) {
@@ -104,6 +112,10 @@ void register_cvars() noexcept {
     reg_cvar(s_cvar_dir,         "hldsmon_dir",         s_val_dir,         FCVAR_ARCHIVE);
     reg_cvar(s_cvar_max_mb,      "hldsmon_max_mb",      s_val_max_mb,      FCVAR_ARCHIVE);
     reg_cvar(s_cvar_ip_table,    "hldsmon_ip_table",    s_val_ip_table,    FCVAR_ARCHIVE);
+    reg_cvar(s_cvar_retention_days, "hldsmon_retention_days", s_val_retention_days, FCVAR_ARCHIVE);
+    reg_cvar(s_cvar_modnet,           "hldsmon_modnet",           s_val_modnet,           FCVAR_ARCHIVE);
+    reg_cvar(s_cvar_modnet_targets,   "hldsmon_modnet_targets",   s_val_modnet_targets,   FCVAR_ARCHIVE);
+    reg_cvar(s_cvar_modnet_rescan_sec, "hldsmon_modnet_rescan_sec", s_val_modnet_rescan_sec, FCVAR_ARCHIVE);
 
     c.cvars.enable      = engine_cvar("hldsmon_enable",      &s_cvar_enable);
     c.cvars.client_hz   = engine_cvar("hldsmon_client_hz",   &s_cvar_client_hz);
@@ -115,6 +127,10 @@ void register_cvars() noexcept {
     c.cvars.dir         = engine_cvar("hldsmon_dir",         &s_cvar_dir);
     c.cvars.max_mb      = engine_cvar("hldsmon_max_mb",      &s_cvar_max_mb);
     c.cvars.ip_table    = engine_cvar("hldsmon_ip_table",    &s_cvar_ip_table);
+    c.cvars.retention_days = engine_cvar("hldsmon_retention_days", &s_cvar_retention_days);
+    c.cvars.modnet           = engine_cvar("hldsmon_modnet",           &s_cvar_modnet);
+    c.cvars.modnet_targets   = engine_cvar("hldsmon_modnet_targets",   &s_cvar_modnet_targets);
+    c.cvars.modnet_rescan_sec = engine_cvar("hldsmon_modnet_rescan_sec", &s_cvar_modnet_rescan_sec);
 }
 
 size_t clamp_size(double v, size_t lo, size_t hi) noexcept {
@@ -230,6 +246,26 @@ bool resolve_api() noexcept {
     return true;
 }
 
+void init_modnet() noexcept {
+    PluginContext& c = ctx();
+    const char* targets = "";
+    if (c.cvars.modnet_targets != nullptr && c.cvars.modnet_targets->string != nullptr) {
+        targets = c.cvars.modnet_targets->string;
+    }
+    const bool using_builtin = (targets[0] == '\0');
+    modnet_got_configure_targets(targets);
+    if (using_builtin) {
+        util_log("modnet: hldsmon_modnet_targets is empty; using built-in target list");
+    }
+    // Enable only when the master-switch is on; when OFF neither the probe nor
+    // any GOT slot is touched, even transiently (QAS-M6, MN-5).
+    if (cvar_f(c.cvars.modnet, 0.0f) > 0.5f) {
+        modnet_enable();
+    }
+    c.modnet = modnet_got_status();
+    c.modnet.next_rescan_t = 0.0;
+}
+
 bool open_log() noexcept {
     PluginContext& c = ctx();
     c.log = new (std::nothrow) LogWriter();
@@ -240,6 +276,7 @@ bool open_log() noexcept {
     // Route the log file's raw fd to the crash handler before the first open.
     set_log_fd_observer(&platform_set_crash_log_fd);
     c.log->set_max_mb(static_cast<uint64_t>(cvar_f(c.cvars.max_mb, 512.0f)));
+    c.log->set_retention_days(static_cast<int>(cvar_f(c.cvars.retention_days, 3.0f)));
 
     const char* dir = "addons/metamod/hldsmon/logs";
     if (c.cvars.dir != nullptr && c.cvars.dir->string != nullptr &&
@@ -302,6 +339,7 @@ bool plugin_init() noexcept {
 
     open_log();
     register_control_commands();
+    init_modnet();
 
     c.attached = true;
     if (!register_hooks()) {
@@ -312,6 +350,7 @@ bool plugin_init() noexcept {
 
 void plugin_shutdown() noexcept {
     PluginContext& c = ctx();
+    modnet_disable();
     if (c.log != nullptr) {
         c.log->flush();
     }

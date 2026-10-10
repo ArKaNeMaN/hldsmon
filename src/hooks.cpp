@@ -505,6 +505,7 @@ void h_SV_Spawn_f(IRehldsHook_SV_Spawn_f* chain) {
                 events::write_mapchange(rec);
             }
         }
+        modnet_request_rescan();
     }
     chain->callNext();
 }

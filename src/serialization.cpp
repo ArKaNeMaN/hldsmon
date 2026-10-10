@@ -575,6 +575,34 @@ void emit_crash(JsonBuf& b, const CrashRecord& r) {
     b.ch('}');
 }
 
+void emit_modnet(JsonBuf& b, const ModnetRecord& r) {
+    b.ch('{');
+    kv_str(b, "type", "modnet");
+    b.ch(',');
+    kv_fixed(b, "t", r.t, 3);
+    b.ch(',');
+    kv_str(b, "module", r.module);
+    b.ch(',');
+    kv_str(b, "so", r.so);
+    b.ch(',');
+    kv_u64(b, "conns", r.conns);
+    b.ch(',');
+    kv_u64(b, "conn_fail", r.conn_fail);
+    b.ch(',');
+    kv_u64(b, "connect_attempts", r.connect_attempts);
+    b.ch(',');
+    kv_u64(b, "dns_calls", r.dns_calls);
+    b.ch(',');
+    kv_u64(b, "in_bytes", r.in_bytes);
+    b.ch(',');
+    kv_u64(b, "out_bytes", r.out_bytes);
+    b.ch(',');
+    kv_fixed(b, "in_kbps", r.in_kbps, 3);
+    b.ch(',');
+    kv_fixed(b, "out_kbps", r.out_kbps, 3);
+    b.ch('}');
+}
+
 // Measure pass then write pass; on short capacity nothing is written.
 template <class Record>
 using EmitFn = void (*)(JsonBuf&, const Record&);
@@ -676,6 +704,9 @@ size_t write_shutdown_json(char* out, size_t cap, const ShutdownRecord& r) {
 }
 size_t write_crash_json(char* out, size_t cap, const CrashRecord& r) {
     return write_record(out, cap, r, &emit_crash);
+}
+size_t write_modnet_json(char* out, size_t cap, const ModnetRecord& r) {
+    return write_record(out, cap, r, &emit_modnet);
 }
 
 } // namespace hldsmon

@@ -112,6 +112,24 @@ void cmd_status() {
     ap_u32(out, cap, pos, c.connect_attempts);
     ap(out, cap, pos, " challenges: ");
     ap_u32(out, cap, pos, c.challenge_count);
+    ap(out, cap, pos, "\n  modnet: enabled ");
+    ap_yn(out, cap, pos, c.modnet.enabled);
+    ap(out, cap, pos, " probe_ok ");
+    ap_yn(out, cap, pos, c.modnet.probe_ok);
+    ap(out, cap, pos, " lazy_bound ");
+    ap_yn(out, cap, pos, c.modnet.lazy_bound);
+    ap(out, cap, pos, " patched_objects ");
+    ap_u32(out, cap, pos, c.modnet.patched_objects);
+    ap(out, cap, pos, " patched_slots ");
+    ap_u32(out, cap, pos, c.modnet.patched_slots);
+    ap(out, cap, pos, " restored_slots ");
+    ap_u32(out, cap, pos, c.modnet.restored_slots);
+    ap(out, cap, pos, " conflicts ");
+    ap_u32(out, cap, pos, c.modnet.conflicts);
+    ap(out, cap, pos, "\n    modnet_targets: ");
+    ap(out, cap, pos, c.modnet.targets[0] != '\0' ? c.modnet.targets : "(none)");
+    ap(out, cap, pos, " last_error: ");
+    ap(out, cap, pos, c.modnet.last_error[0] != '\0' ? c.modnet.last_error : "-");
     ap(out, cap, pos, "\n");
 
     out[pos < cap ? pos : cap - 1] = '\0';

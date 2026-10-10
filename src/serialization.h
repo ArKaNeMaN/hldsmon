@@ -36,6 +36,7 @@ size_t write_mapchange_json(char* out, size_t cap, const MapChangeRecord& r);
 size_t write_voice_json(char* out, size_t cap, const VoiceRecord& r);
 size_t write_shutdown_json(char* out, size_t cap, const ShutdownRecord& r);
 size_t write_crash_json(char* out, size_t cap, const CrashRecord& r);
+size_t write_modnet_json(char* out, size_t cap, const ModnetRecord& r);
 
 } // namespace hldsmon
 

@@ -42,6 +42,7 @@ void write_mapchange(const MapChangeRecord& r){ emit(r, &write_mapchange_json); 
 void write_voice(const VoiceRecord& r)      { emit(r, &write_voice_json); }
 void write_shutdown(const ShutdownRecord& r){ emit(r, &write_shutdown_json); }
 void write_crash(const CrashRecord& r)      { emit(r, &write_crash_json); }
+void write_modnet(const ModnetRecord& r)    { emit(r, &write_modnet_json); }
 
 } // namespace events
 } // namespace hldsmon

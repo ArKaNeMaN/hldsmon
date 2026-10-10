@@ -11,6 +11,7 @@ Native Metamod-плагин для ReHLDS (Half-Life Dedicated Server, GoldSrc),
 make            # -> HldsMonitoring_mm_i386.so (32-bit, -Wall -Wextra -Werror)
 make verify-exports   # определённые символы ровно = exports.whitelist
 make test       # C++ host-тесты ядра + Python-тесты анализатора
+make test-modnet-harness   # 32-битный синтетический .so-стенд атрибуции modnet
 make clean
 ```
 
@@ -46,6 +47,7 @@ readelf -d HldsMonitoring_mm_i386.so | grep NEEDED                              
 - **Серверные метрики (1 Гц):** кадровое время (min/avg/max), hitch-гистограмма, CPU%/RSS/page-faults, игроки (всего/реальные/прокси/fake), in/out KB/s, edicts, карта, uptime, FPS.
 - **Per-client (staggered):** ping, loss/Δloss, choke/Δchoke, delta_seq, sequence-номера, заполнение reliable-канала, rate/cleartime, `cl_updaterate`/`cl_cmdrate`/`rate` из userinfo, state-битмаска, flow in/out, флаги сообщения, **простой (`idle_ms`)**. **Идентичность:** `name`, `authid` (Steam2), `steamid64`, `ip`+`port`, `userid`, `slot` (1..maxclients), `conn_s`, `fake`/`proxy` — эмитятся в `client` и `drop`.
 - **События:** drop (причина+`crash`+срез client/netchan+окно+идентичность), reject (стадия валидатора), connect, challenge-флуд, netcmd-гистограмма, mass-drop, packet-статистика, hitch, mapchange, voice, **shutdown** (graceful: `quit`/SIGTERM/SIGINT через `NEW_DLL_FUNCTIONS::pfnGameShutdown`), **crash** (аварийный сигнал: best-effort JSONL-строка из signal-обработчика + маркер).
+- **`modnet` (1 Гц, per target `.so`):** атрибуция сетевого трафика чужих in-process модулей (по умолчанию `easy_http_amxx_i386.so`/`sockets_amxx_i386.so`): байты `send/recv/sendto/recvfrom/sendmsg/recvmsg`, соединения `connect`/`accept` (`conns`/`conn_fail`/`connect_attempts`), счётчик DNS `getaddrinfo`; одна запись на каждый активный целевой объект (интерпозиция GOT/PLT, вызывающий модуль по адресу возврата).
 
 Схема JSONL — `docs/plan.md`, Приложение P1.
 
@@ -56,7 +58,11 @@ readelf -d HldsMonitoring_mm_i386.so | grep NEEDED                              
 | `hldsmon_status` | статус: путь лога, объём, счётчики, размеры колец, проба layout |
 | `hldsmon_flush_log` | принудительный сброс буфера |
 
-Cvar'ы: `hldsmon_enable`, `hldsmon_client_hz`, `hldsmon_disk_hz`, `hldsmon_flush_sec`, `hldsmon_client_ring`, `hldsmon_server_ring`, `hldsmon_drop_window`, `hldsmon_dir`, `hldsmon_max_mb`, `hldsmon_ip_table`.
+Cvar'ы: `hldsmon_enable`, `hldsmon_client_hz`, `hldsmon_disk_hz`, `hldsmon_flush_sec`, `hldsmon_client_ring`, `hldsmon_server_ring`, `hldsmon_drop_window`, `hldsmon_dir`, `hldsmon_max_mb`, `hldsmon_ip_table`, `hldsmon_retention_days`.
+
+**Retention (автоудаление):** `hldsmon_retention_days` (default `3`) задаёт максимум одновременно существующих дневных файлов, включая текущий. При открытии лога и на суточной ротации старые `hldsmon-YYYY-MM-DD.jsonl` (дата старше `сегодня − (N−1)`) удаляются; `N=1` оставляет только текущий файл, `N<=0` отключает удаление (keep-all). Значение перечитывается каждый server-tick, поэтому изменение вступает в силу на ближайшей ротации. Удаляются только файлы точного шаблона в `hldsmon_dir`; маркер краша и прочие файлы не трогаются.
+
+Cvar'ы атрибуции `modnet`: `hldsmon_modnet` (default 0 — мастер-выключатель), `hldsmon_modnet_targets` (default `""` — пусто ⇒ встроенная пара `easy_http_amxx_i386.so`/`sockets_amxx_i386.so`), `hldsmon_modnet_rescan_sec` (default 5 — период rescan; плюс rescan по `SV_Spawn_f`).
 
 ## Анализ (офлайн)
 
@@ -101,7 +107,7 @@ python3 tools/analyzer/hldsmon.py export-csv logs/hldsmon-2026-10-09.jsonl --typ
 - **Панель «События»** — «зависания клиента» (долгий непрерывный рост `idle_ms`; из `focus_points`) со кнопкой **«фокус»**: скролл к общему графику, выбор игрока и период ±10 с вокруг события (механизм расширяемый по `kind`).
 - **Настройки датасетов** (набор серверных метрик, нормализация, полосы событий и **выбор клиентских метрик**) сохраняются в `localStorage`; клиентские метрики — **единый набор** (не зависит от выбранного игрока), фокус на событие его не меняет.
 
-**Источник FTP (живой хвост):** панель «Источник: FTP» — хост/порт/логин/пароль/путь (токен `{date}` подставляет текущую UTC-дату). Приложение однократно забирает весь файл (с **прогресс-баром загрузки** и отдельной фазой **«Разбор данных…»** после скачивания), затем дочитывает **только новые данные** по offset и подмешивает их в анализ (авто-обновление с настраиваемым интервалом). Креды хранятся только в памяти локального сервера, не пишутся на диск и не возвращаются в браузер; только stdlib (`ftplib`). Чекбокс «сохранять креды» (по умолчанию вкл.) кладёт хост/логин/пароль/путь в `localStorage` **браузера**, чтобы не вводить их заново (в открытом виде — инструмент локальный). Авто-обновление не мешает вводу: такт пропускается, пока открыт список/поле формы (фокус после перерисовки восстанавливается).
+**Источник FTP (живой хвост):** панель «Источник: FTP» — хост/порт/логин/пароль/путь (токен `{date}` подставляет текущую UTC-дату). Приложение сначала забирает **только последние ~30 минут** лога (range-чтение хвоста по offset; прогресс-бар + фаза **«Разбор данных…»**), затем дочитывает **только новые данные** (авто-обновление). Кнопка **«← загрузить раньше»** догружает предыдущее окно (~30 мин) по нажатию, пока не дойдёт до начала файла. Креды хранятся только в памяти локального сервера, не пишутся на диск и не возвращаются в браузер; только stdlib (`ftplib`). Чекбокс «сохранять креды» (по умолчанию вкл.) кладёт хост/логин/пароль/путь в `localStorage` **браузера**, чтобы не вводить их заново (в открытом виде — инструмент локальный). Авто-обновление не мешает вводу: такт пропускается, пока открыт список/поле формы (фокус после перерисовки восстанавливается).
 
 ### Веб-интерфейс как один `.exe` (Windows, опционально)
 Веб-сервер (`tools/analyzer/webui.py`) на чистой stdlib, поэтому собирается в один самодостаточный `.exe` через **PyInstaller** (страница `index.html` включается внутрь; путь к ней в коде frozen-aware). **Собирать нужно на Windows** — PyInstaller не кросс-компилирует с Linux/WSL.

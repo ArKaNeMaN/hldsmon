@@ -67,9 +67,15 @@ public:
     // mb==0 disables the cap.
     void set_max_mb(uint64_t mb);
 
+    // Max number of daily files kept (incl. the current one) before older
+    // rotated files are pruned at open/rotation. days<=0 disables retention.
+    // Re-read from the cvar each server tick; applies at the next open.
+    void set_retention_days(int days);
+
 private:
     bool open_day(int year, int month, int day);
     void close_file();
+    void prune();
 
     FILE*    file_         = nullptr;
     bool     enabled_      = false;
@@ -82,6 +88,7 @@ private:
     uint64_t bytes_today_ = 0;
     uint64_t error_count_ = 0;
     uint64_t max_bytes_   = 0;
+    int      retention_days_ = 0;
 };
 
 } // namespace hldsmon

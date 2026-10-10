@@ -55,6 +55,7 @@ KNOWN_TYPES = (
     "hitch",
     "mapchange",
     "voice",
+    "modnet",
     "shutdown",
     "crash",
 )
@@ -69,6 +70,10 @@ REL_FILL_GROWTH = 25.0
 REL_FILL_HIGH = 80.0
 LOSS_SPIKE_ABS = 20.0
 LOSS_SPIKE_DELTA = 15.0
+
+#: modnet correlation: a sample at or above this rate (KB/s) next to a
+#: drop/hitch counts as a traffic burst; any ``conn_fail`` counts as an anomaly.
+MODNET_BURST_KBPS = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +634,182 @@ def player_groups(records):
 
 
 # ---------------------------------------------------------------------------
+# Modnet aggregation
+# ---------------------------------------------------------------------------
+
+_MODNET_SERIES_KEYS = ("t", "conns", "conn_fail", "connect_attempts",
+                       "dns_calls", "in_bytes", "out_bytes",
+                       "in_kbps", "out_kbps")
+
+_MODNET_SUM_FIELDS = ("conns", "conn_fail", "connect_attempts", "dns_calls",
+                      "in_bytes", "out_bytes")
+
+
+def _modnet_text(value):
+    """Return a modnet ``module``/``so`` label as a string (``""`` if unusable)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def modnet_key(rec, run):
+    """Return the ``"<module>|<so>|<run>"`` series key for a modnet record.
+
+    ``run`` is the process-level run index from :func:`_attach_runs` (a
+    ``shutdown``/``crash`` boundary); object unload/reload inside one run is not
+    split because the object-level counter reset has no log marker (MN-8).
+    """
+    return "%s|%s|%d" % (_modnet_text(rec.get("module")),
+                         _modnet_text(rec.get("so")), int(run))
+
+
+def modnet_series(records):
+    """Return per-object modnet parallel time series keyed by :func:`modnet_key`.
+
+    Each entry holds ``t/conns/conn_fail/connect_attempts/dns_calls/in_bytes/
+    out_bytes/in_kbps/out_kbps`` lists, one value per ``modnet`` record in file
+    order. A missing or non-numeric value becomes ``None``. An interval in which
+    the object had no activity emits no record at all, so it is simply absent
+    from the arrays -- a gap means zero, never a null or a series reset.
+    """
+    series = {}
+    for rec, run in _attach_runs(records):
+        if rec.get("type") != "modnet":
+            continue
+        key = modnet_key(rec, run)
+        entry = series.get(key)
+        if entry is None:
+            entry = {name: [] for name in _MODNET_SERIES_KEYS}
+            series[key] = entry
+        for name in _MODNET_SERIES_KEYS:
+            entry[name].append(_num(rec.get(name)))
+    return series
+
+
+def modnet_summary(records):
+    """Return ``{module: aggregate}`` over all ``modnet`` records.
+
+    Each aggregate carries the summed ``conns``/``conn_fail``/
+    ``connect_attempts``/``dns_calls``/``in_bytes``/``out_bytes`` (over every
+    run and object of that module) and the peak ``in_kbps``/``out_kbps``
+    (``None`` when no usable sample). Missing/non-numeric fields contribute
+    nothing; sums are integer ``0`` when no usable value was seen.
+    """
+    acc = {}
+    for rec in records:
+        if rec.get("type") != "modnet":
+            continue
+        module = _modnet_text(rec.get("module"))
+        entry = acc.get(module)
+        if entry is None:
+            entry = {name: 0 for name in _MODNET_SUM_FIELDS}
+            entry["peak_in_kbps"] = None
+            entry["peak_out_kbps"] = None
+            acc[module] = entry
+        for name in _MODNET_SUM_FIELDS:
+            value = _num(rec.get(name))
+            if value is not None:
+                entry[name] += value
+        for name, peak_name in (("in_kbps", "peak_in_kbps"),
+                                ("out_kbps", "peak_out_kbps")):
+            value = _num(rec.get(name))
+            if value is None:
+                continue
+            peak = entry[peak_name]
+            if peak is None or value > peak:
+                entry[peak_name] = value
+    return acc
+
+
+def correlate_modnet(records, window_s=5.0):
+    """Correlate ``modnet`` anomalies with ``drop``/``hitch`` events.
+
+    Every sample within ``window_s`` seconds (inclusive) of a ``drop``/``hitch``
+    event whose ``in_kbps``/``out_kbps`` is at least :data:`MODNET_BURST_KBPS`,
+    or whose ``conn_fail`` is non-zero, yields one entry::
+
+        {"event_t", "kind", "module", "so", "metric", "value"}
+
+    A sample may match several events/metrics; entries are sorted by
+    ``(event_t, kind, module, so, metric, value)`` so the output is
+    deterministic. Events and samples without a usable ``t`` are skipped.
+    """
+    try:
+        half = float(window_s)
+    except (TypeError, ValueError):
+        half = 0.0
+
+    events = []
+    for rec in records:
+        if rec.get("type") not in ("drop", "hitch"):
+            continue
+        t = _record_ts(rec)
+        if t is not None:
+            events.append((float(t), rec.get("type")))
+
+    out = []
+    for rec in records:
+        if rec.get("type") != "modnet":
+            continue
+        t = _record_ts(rec)
+        if t is None:
+            continue
+        t = float(t)
+        metrics = (
+            ("in_kbps", MODNET_BURST_KBPS, False),
+            ("out_kbps", MODNET_BURST_KBPS, False),
+            ("conn_fail", 0.0, True),
+        )
+        for name, threshold, is_counter in metrics:
+            value = _num(rec.get(name))
+            if value is None:
+                continue
+            anomaly = value > 0 if is_counter else value >= threshold
+            if not anomaly:
+                continue
+            for event_t, kind in events:
+                if event_t - half <= t <= event_t + half:
+                    out.append({
+                        "event_t": event_t,
+                        "kind": kind,
+                        "module": _modnet_text(rec.get("module")),
+                        "so": _modnet_text(rec.get("so")),
+                        "metric": name,
+                        "value": value,
+                    })
+    out.sort(key=lambda item: (item["event_t"], item["kind"], item["module"],
+                               item["so"], item["metric"], item["value"]))
+    return out
+
+
+def _modnet_digest_block(records):
+    """Return the digest ``modnet`` block: totals plus per-module rows."""
+    summary = modnet_summary(records)
+    total_in = 0
+    total_out = 0
+    total_fail = 0
+    rows = []
+    for module, agg in summary.items():
+        total_in += agg["in_bytes"]
+        total_out += agg["out_bytes"]
+        total_fail += agg["conn_fail"]
+        rows.append([module, agg["in_bytes"], agg["out_bytes"],
+                     agg["conn_fail"]])
+    rows.sort(key=lambda row: (-(row[1] + row[2]), row[0]))
+    return {
+        "records": sum(1 for r in records if r.get("type") == "modnet"),
+        "in_bytes": total_in,
+        "out_bytes": total_out,
+        "conn_fail": total_fail,
+        "modules": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Anomaly heuristics
 # ---------------------------------------------------------------------------
 
@@ -945,6 +1126,7 @@ def build_digest(records, files=None):
         "top_drop_reasons": [[k, v] for k, v in _sorted_counts(drops)],
         "hitch_lines": counts.get("hitch", 0),
         "lag_spikes": lag_spike_count(records),
+        "modnet": _modnet_digest_block(records),
         "log_end": log_end_state(records),
         "exclusions": exclusion_windows(records),
         "anomalies_excluded": len(
@@ -1026,6 +1208,10 @@ def cmd_summary(args):
 
     print("Hitch lines: %d" % counts.get("hitch", 0))
     print("Lag spikes (server frames >100ms): %d" % lag_spike_count(records))
+
+    modules = ", ".join(sorted(modnet_summary(records)))
+    print("Modnet: %d records, modules: %s"
+          % (counts.get("modnet", 0), modules if modules else "(none)"))
 
     detail = find_anomalies_detail(records, exclude=(not args.no_exclude))
     print("Anomalies: %d" % len(detail["findings"]))

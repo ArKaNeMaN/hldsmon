@@ -25,6 +25,7 @@ void write_mapchange(const MapChangeRecord& r);
 void write_voice(const VoiceRecord& r);
 void write_shutdown(const ShutdownRecord& r);
 void write_crash(const CrashRecord& r);
+void write_modnet(const ModnetRecord& r);
 
 } // namespace events
 } // namespace hldsmon

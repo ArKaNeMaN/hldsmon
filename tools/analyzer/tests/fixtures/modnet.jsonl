@@ -1,0 +1,7 @@
+{"type":"modnet","t":3000.0,"module":"easy_http_amxx_i386","so":"easy_http_amxx_i386.so","conns":1,"conn_fail":0,"connect_attempts":1,"dns_calls":1,"in_bytes":1024,"out_bytes":2048,"in_kbps":1.0,"out_kbps":2.0}
+{"type":"modnet","t":3001.0,"module":"sockets_amxx_i386","so":"sockets_amxx_i386.so","conns":0,"conn_fail":2,"connect_attempts":3,"dns_calls":0,"in_bytes":0,"out_bytes":0,"in_kbps":0.0,"out_kbps":0.0}
+{"type":"hitch","t":3001.5,"duration_ms":120}
+{"type":"modnet","t":3002.0,"module":"easy_http_amxx_i386","so":"easy_http_amxx_i386.so","conns":0,"conn_fail":0,"connect_attempts":0,"dns_calls":0,"in_bytes":204800,"out_bytes":102400,"in_kbps":200.0,"out_kbps":100.0}
+{"type":"modnet","t":3010.0,"module":"easy_http_amxx_i386","so":"easy_http_amxx_i386.so","conns":0,"conn_fail":3,"connect_attempts":3,"dns_calls":1,"in_bytes":0,"out_bytes":0,"in_kbps":0.0,"out_kbps":0.0}
+{"type":"drop","t":3010.5,"id":7,"gen":7,"reason":"Timeout","category":"timeout","crash":false,"observed_via":"sv_dropclient"}
+{"type":"modnet","t":3100.0,"module":"sockets_amxx_i386","so":"sockets_amxx_i386.so","conns":1,"conn_fail":0,"connect_attempts":1,"dns_calls":0,"in_bytes":4096,"out_bytes":8192,"in_kbps":4.0,"out_kbps":8.0}

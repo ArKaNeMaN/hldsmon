@@ -3,10 +3,12 @@
 // Host-testable: no engine/metamod headers, no exceptions, no RTTI.
 
 #include "log_writer.h"
+#include "retention.h"
 
 #include <cerrno>
 #include <cstring>
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -118,6 +120,7 @@ bool LogWriter::open_day(int year, int month, int day)
     size_capped_ = false;
     enabled_     = true;
     notify_fd(file_);
+    prune();
     return true;
 }
 
@@ -223,6 +226,66 @@ void LogWriter::set_max_mb(uint64_t mb)
     if (max_bytes_ != 0 && bytes_today_ >= max_bytes_) {
         size_capped_ = true;
         enabled_     = false;
+    }
+}
+
+void LogWriter::set_retention_days(int days)
+{
+    retention_days_ = days;
+}
+
+void LogWriter::prune()
+{
+    if (retention_days_ <= 0) {
+        return; // retention disabled: keep all files
+    }
+
+    DIR* d = ::opendir(dir_);
+    if (d == nullptr) {
+        ++error_count_; // counted, non-fatal: writing/rotation continue
+        return;
+    }
+
+    constexpr size_t kMaxNames = 1024;
+    constexpr size_t kNameCap  = 256;
+    static char s_names[kMaxNames][kNameCap];
+    static const char* s_ptrs[kMaxNames];
+    size_t n = 0;
+    struct dirent* ent = nullptr;
+    while ((ent = ::readdir(d)) != nullptr) {
+        if (n >= kMaxNames) {
+            break; // bounded: any further entries are left untouched
+        }
+        std::snprintf(s_names[n], kNameCap, "%s", ent->d_name);
+        s_ptrs[n] = s_names[n];
+        ++n;
+    }
+    ::closedir(d);
+
+    if (n == 0) {
+        return;
+    }
+
+    static const char* s_doomed[kMaxNames];
+    size_t doomed_n = 0;
+    if (!retention_select(s_ptrs, n, year_, month_, day_, retention_days_,
+                          s_doomed, kMaxNames, &doomed_n)) {
+        return; // fail-safe: selection overflow => exactly zero unlink
+    }
+
+    for (size_t i = 0; i < doomed_n; ++i) {
+        char full[HLDSMON_LOGWRITER_PATH_MAX];
+        const int fn = std::snprintf(full, sizeof(full), "%s/%s", dir_, s_doomed[i]);
+        if (fn < 0 || static_cast<size_t>(fn) >= sizeof(full)) {
+            ++error_count_;
+            continue;
+        }
+        if (std::strcmp(full, path_) == 0) {
+            continue; // never delete the currently-open file
+        }
+        if (::unlink(full) != 0) {
+            ++error_count_; // counted, loop continues with other candidates
+        }
     }
 }
 

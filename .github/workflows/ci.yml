@@ -27,7 +27,7 @@ jobs:
       - name: Build in manylinux2014_i686 (CentOS 7 toolchain)
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_i686 \
-            bash -lc 'for d in /opt/rh/devtoolset-*/enable; do source "$d" && break; done; make clean && make && make verify-exports'
+            bash -lc 'for d in /opt/rh/devtoolset-*/enable; do source "$d" && break; done; make clean && make && make verify-exports && make test-modnet-harness'
       - name: Assert GLIBC <= 2.17 and no dynamic libstdc++/libgcc
         run: |
           set -e

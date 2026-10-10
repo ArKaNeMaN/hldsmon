@@ -40,6 +40,7 @@ inline edict_t* edictByIndex(int index) { return g_pEdicts + index; }
 #include "engine_layout.h"
 #include "log_writer.h"
 #include "metrics.h"
+#include "modnet_got.h"
 #include "platform_linux.h"
 #include "runtime_ring.h"
 #include "serialization.h"
@@ -77,6 +78,10 @@ struct CvarRefs {
     cvar_t* dir         = nullptr;
     cvar_t* max_mb      = nullptr;
     cvar_t* ip_table    = nullptr;
+    cvar_t* retention_days = nullptr;
+    cvar_t* modnet           = nullptr;
+    cvar_t* modnet_targets   = nullptr;
+    cvar_t* modnet_rescan_sec = nullptr;
 };
 
 // Bounded per-IP packet table entry (open addressing).
@@ -199,6 +204,10 @@ struct PluginContext {
     // mass-drop + last seen map
     MassDropState massdrop;
     char          last_map[64] = {0};
+
+    // modnet adapter state (mirrored from the header-free GOT adapter for
+    // control output; synced on enable/disable/rescan). Server thread only.
+    ModnetState   modnet;
 
     // preallocated scratch buffers
     char line_buf[kLineBufSize];

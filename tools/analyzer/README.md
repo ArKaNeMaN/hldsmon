@@ -30,12 +30,12 @@ for rec in iter_records("hldsmon-2026-10-09.jsonl"):     # потоково
 
 | Команда | Назначение |
 |---|---|
-| `summary FILE...` | Период покрытия, счётчики по типам, игроки, топ причин дропов, число hitch-строк, число всплесков лага (кадры >100 ms). |
+| `summary FILE...` | Период покрытия, счётчики по типам, игроки, топ причин дропов, число hitch-строк, число всплесков лага (кадры >100 ms), строка `modnet` (число записей и модули). |
 | `drops FILE...` | Список drop-событий. Фильтры: `--reason` (подстрока по reason/category, регистронезависимо), `--client ID`, `--since`, `--until` (ISO-8601 или epoch-секунды, включительно). |
 | `window FILE --around TS --secs N` | Все записи в окне ±N секунд вокруг `TS` — для скармливания агенту. |
 | `clients FILE` | Per-client агрегаты: число сэмплов, avg/max ping, avg/max loss, avg/max choke, max rel_fill. |
 | `anomalies FILE` | Эвристики: массовые дропы (≥3 дропа за 5 с), серии hitch (≥3 за 10 с), рост reliable-fill, всплески loss. |
-| `digest FILE` | Компактный машинно-читаемый JSON-дайджест (сортированные ключи, детерминированный). |
+| `digest FILE` | Компактный машинно-читаемый JSON-дайджест (сортированные ключи, детерминированный), включая блок `modnet` (Σ in/out bytes, `conn_fail`, per-module top). |
 | `export-csv FILE [--type TYPE]` | Выгрузка записей в CSV на stdout; вложенные объекты сериализуются в JSON-строку. |
 
 ### Примеры
@@ -54,8 +54,20 @@ python3 hldsmon.py export-csv hldsmon-2026-10-09.jsonl --type drop > drops.csv
 ## Типы записей
 
 `server`, `client`, `drop` (с вложенными `client`/`netchan`/`window`/`server`/`neighbors`),
-`reject`, `connect`, `netcmd`, `massdrop`, `packet`, `hitch`, `mapchange`, `voice`.
-Полная схема полей — `docs/plan.md`, Приложение P1.
+`reject`, `connect`, `netcmd`, `massdrop`, `packet`, `hitch`, `mapchange`, `voice`,
+`modnet` (per-`.so` трафик чужих модулей: `module`/`so`, Δ счётчиков и байт за интервал;
+стадия `modnet`).
+Полная схема полей — `docs/plan.md`, Приложение P1 и его расширение `modnet`.
+
+Библиотечный API для modnet-рядов (ключ `(module, so, run)`; пропуск интервала = ноль):
+
+```python
+from hldsmon import modnet_series, modnet_summary, correlate_modnet
+
+series = modnet_series(records)          # {"module|so|run": {t, conn_fail, ...}}
+summary = modnet_summary(records)        # {module: Σ bytes/счётчиков, peak kbps}
+corr = correlate_modnet(records, 5.0)    # всплески/conn_fail рядом с drop/hitch
+```
 
 ## Тесты
 
@@ -64,11 +76,13 @@ cd tools/analyzer
 python3 -m unittest discover -s tests -v
 ```
 
-Фикстуры в `tests/fixtures/` покрывают все типы записей P1, вложенные срезы drop,
-а также устойчивость парсера (обрезанную последнюю строку, неизвестный `type`,
-пустые строки, мусорные строки):
+Фикстуры в `tests/fixtures/` покрывают все типы записей P1 (включая расширение
+`modnet`), вложенные срезы drop, а также устойчивость парсера (обрезанную
+последнюю строку, неизвестный `type`, пустые строки, мусорные строки):
 
 - `types_ok.jsonl` — по одной записи каждого типа, включая полный nested drop;
+- `modnet.jsonl` — `modnet` двух модулей (активные и пустые интервалы,
+  `conn_fail`, `dns_calls`) плюс `drop`/`hitch` для корреляции;
 - `truncated.jsonl` — заканчивается намеренно обрезанной (невалидной) строкой;
 - `dirty.jsonl` — пустые строки, неизвестный `type`, не-JSON строки, объект без `type`;
 - `anomalies.jsonl` — данные, активирующие все четыре эвристики.

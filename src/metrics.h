@@ -246,6 +246,22 @@ struct CrashRecord {
     int32_t signal;
 };
 
+// Per-`.so` network attribution (modnet stage) — P1 `modnet` extension.
+// Emitted (delta over the interval) only for target objects with activity.
+struct ModnetRecord {
+    double   t;                  // wall-clock epoch seconds (emission moment)
+    char     module[64];         // short module label (e.g. easy_http_amxx_i386)
+    char     so[64];             // basename of the loaded object
+    uint64_t conns;              // Δ successful blocking connect() + accept()
+    uint64_t conn_fail;          // Δ connect() failures (errno ∉ {EINPROGRESS,EALREADY})
+    uint64_t connect_attempts;   // Δ all connect() calls (incl. pending)
+    uint64_t dns_calls;          // Δ getaddrinfo() calls (no bytes)
+    uint64_t in_bytes;           // Δ received bytes
+    uint64_t out_bytes;          // Δ sent bytes
+    float    in_kbps;            // in_bytes / Δt / 1024
+    float    out_kbps;           // out_bytes / Δt / 1024
+};
+
 #pragma pack(pop)
 
 // Zeroes the instantaneous per-client flow fields when the client has been
@@ -282,6 +298,7 @@ static_assert(sizeof(MapChangeRecord) == 72, "MapChangeRecord layout drift");
 static_assert(sizeof(VoiceRecord) == 13, "VoiceRecord layout drift");
 static_assert(sizeof(ShutdownRecord) == 24, "ShutdownRecord layout drift");
 static_assert(sizeof(CrashRecord) == 12, "CrashRecord layout drift");
+static_assert(sizeof(ModnetRecord) == 192, "ModnetRecord layout drift");
 
 } // namespace hldsmon
 

@@ -216,6 +216,27 @@ void emit_netcmd_interval(double now_epoch) noexcept {
     }
 }
 
+void modnet_emit_interval(double now_epoch, double now_real) noexcept {
+    PluginContext& c = ctx();
+    if (!c.modnet.enabled) {
+        return;
+    }
+    static ModnetEmitItem items[HLDSMON_MODNET_MAX_OBJECTS];
+    const size_t n = modnet_got_collect_emit(items, HLDSMON_MODNET_MAX_OBJECTS, now_real);
+    for (size_t k = 0; k < n; ++k) {
+        ModnetRecord r;
+        std::memset(&r, 0, sizeof(r));
+        r.t = now_epoch;
+        copy_str(r.module, sizeof(r.module), items[k].module);
+        copy_str(r.so, sizeof(r.so), items[k].so);
+        modnet_diff(items[k].prev, items[k].cur, items[k].dt, r);
+        if (!modnet_has_activity(r)) {
+            continue;
+        }
+        events::write_modnet(r);
+    }
+}
+
 void do_server_tick(double now_real, double now_epoch) noexcept {
     PluginContext& c = ctx();
     ServerSample s;
@@ -284,6 +305,7 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
 
     emit_packet_interval(now_epoch);
     emit_netcmd_interval(now_epoch);
+    modnet_emit_interval(now_epoch, now_real);
 
     c.frame_count = 0;
     c.frame_min = 0.0f;
@@ -293,6 +315,7 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
     c.hitch_gt100 = 0;
 
     if (c.log != nullptr) {
+        c.log->set_retention_days(static_cast<int>(cvar_f(c.cvars.retention_days, 3.0f)));
         c.log->maybe_rotate(now_epoch);
         const double flush_sec = cvar_f(c.cvars.flush_sec, 1.0f);
         if (flush_sec > 0.0 && now_real - c.last_flush_t >= flush_sec) {
@@ -372,8 +395,39 @@ const char* current_map() noexcept {
 
 void sampler_on_frame(double frame_ms, double now_real) noexcept {
     PluginContext& c = ctx();
-    if (!c.attached || !plugin_enabled()) {
+    if (!c.attached) {
         return;
+    }
+
+    // modnet master-switch sync (MN-2): live enable/disable on cvar change,
+    // independent of hldsmon_enable so disabling never leaves GOT slots patched.
+    const bool modnet_want = cvar_f(c.cvars.modnet, 0.0f) > 0.5f;
+    if (modnet_want != c.modnet.enabled) {
+        if (modnet_want) {
+            modnet_enable();
+        } else {
+            modnet_disable();
+        }
+        c.modnet = modnet_got_status();
+        c.modnet.next_rescan_t = 0.0;
+    }
+
+    if (!plugin_enabled()) {
+        return;
+    }
+
+    // modnet rescan cadence (Q1) + immediate request from SV_Spawn_f.
+    if (c.modnet.enabled) {
+        const double rescan_sec = cvar_f(c.cvars.modnet_rescan_sec, 5.0f);
+        const double period = rescan_sec > 1.0 ? rescan_sec : 1.0;
+        if (c.modnet.next_rescan_t <= 0.0) {
+            c.modnet.next_rescan_t = now_real + period;
+        }
+        if (modnet_rescan_requested() || now_real >= c.modnet.next_rescan_t) {
+            modnet_rescan();
+            c.modnet = modnet_got_status();
+            c.modnet.next_rescan_t = now_real + period;
+        }
     }
 
     if (frame_ms > 0.0) {

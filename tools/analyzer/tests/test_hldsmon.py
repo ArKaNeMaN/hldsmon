@@ -713,5 +713,219 @@ class TestDigestFocusPoints(unittest.TestCase):
         self.assertEqual(digest["focus_point_count"], 0)
 
 
+class TestModnetKnownType(unittest.TestCase):
+    def test_known_types_include_modnet(self):
+        self.assertIn("modnet", hldsmon.KNOWN_TYPES)
+
+    def test_modnet_without_schema_fields_is_tolerated(self):
+        records = [
+            {"type": "modnet", "t": "bad", "module": 5, "so": None,
+             "in_kbps": "x", "conn_fail": True},
+            {"type": "server", "t": 1.0},
+        ]
+        series = hldsmon.modnet_series(records)
+        self.assertEqual(set(series), {"5||0"})
+        self.assertEqual(series["5||0"]["t"], [None])
+        self.assertEqual(series["5||0"]["conn_fail"], [None])
+        self.assertEqual(series["5||0"]["in_kbps"], [None])
+        self.assertEqual(hldsmon.correlate_modnet(records), [])
+        summary = hldsmon.modnet_summary(records)
+        self.assertEqual(summary["5"]["in_bytes"], 0)
+        self.assertIsNone(summary["5"]["peak_in_kbps"])
+
+
+class TestModnetSeries(unittest.TestCase):
+    def setUp(self):
+        self.records = hldsmon.parse_records([fixture("modnet.jsonl")])
+        self.series = hldsmon.modnet_series(self.records)
+
+    def test_keys_split_by_module_and_so(self):
+        self.assertEqual(set(self.series), {
+            "easy_http_amxx_i386|easy_http_amxx_i386.so|0",
+            "sockets_amxx_i386|sockets_amxx_i386.so|0",
+        })
+
+    def test_easy_http_arrays_and_gap_as_zero(self):
+        entry = self.series["easy_http_amxx_i386|easy_http_amxx_i386.so|0"]
+        # No sample at 3001/3003..: a quiet interval adds nothing (gap == zero).
+        self.assertEqual(entry["t"], [3000.0, 3002.0, 3010.0])
+        self.assertEqual(entry["conns"], [1, 0, 0])
+        self.assertEqual(entry["conn_fail"], [0, 0, 3])
+        self.assertEqual(entry["connect_attempts"], [1, 0, 3])
+        self.assertEqual(entry["dns_calls"], [1, 0, 1])
+        self.assertEqual(entry["in_bytes"], [1024, 204800, 0])
+        self.assertEqual(entry["out_bytes"], [2048, 102400, 0])
+        self.assertEqual(entry["in_kbps"], [1.0, 200.0, 0.0])
+        self.assertEqual(entry["out_kbps"], [2.0, 100.0, 0.0])
+
+    def test_sockets_arrays(self):
+        entry = self.series["sockets_amxx_i386|sockets_amxx_i386.so|0"]
+        self.assertEqual(entry["t"], [3001.0, 3100.0])
+        self.assertEqual(entry["conn_fail"], [2, 0])
+        self.assertEqual(entry["in_bytes"], [0, 4096])
+        self.assertEqual(entry["in_kbps"], [0.0, 4.0])
+
+    def test_parallel_array_lengths(self):
+        for entry in self.series.values():
+            lengths = {len(values) for values in entry.values()}
+            self.assertEqual(len(lengths), 1)
+
+    def test_missing_fields_become_none(self):
+        series = hldsmon.modnet_series([
+            {"type": "modnet", "t": 1.0, "module": "m", "so": "m.so",
+             "in_bytes": 10},
+        ])
+        self.assertEqual(series["m|m.so|0"]["in_bytes"], [10])
+        self.assertEqual(series["m|m.so|0"]["conn_fail"], [None])
+        self.assertEqual(series["m|m.so|0"]["in_kbps"], [None])
+
+    def test_run_boundary_splits_series(self):
+        records = [
+            {"type": "modnet", "t": 1.0, "module": "m", "so": "m.so",
+             "in_bytes": 10},
+            {"type": "shutdown", "t": 2.0, "reason": "graceful"},
+            {"type": "modnet", "t": 3.0, "module": "m", "so": "m.so",
+             "in_bytes": 20},
+            {"type": "modnet", "t": 3.5, "module": "m", "so": "other.so",
+             "in_bytes": 5},
+        ]
+        series = hldsmon.modnet_series(records)
+        self.assertEqual(set(series),
+                         {"m|m.so|0", "m|m.so|1", "m|other.so|1"})
+        self.assertEqual(series["m|m.so|0"]["in_bytes"], [10])
+        self.assertEqual(series["m|m.so|1"]["in_bytes"], [20])
+        self.assertEqual(series["m|other.so|1"]["in_bytes"], [5])
+
+    def test_modnet_key_helper(self):
+        self.assertEqual(
+            hldsmon.modnet_key({"module": "a", "so": "a.so"}, 2), "a|a.so|2")
+        self.assertEqual(hldsmon.modnet_key({}, 0), "||0")
+
+
+class TestModnetSummary(unittest.TestCase):
+    def setUp(self):
+        self.records = hldsmon.parse_records([fixture("modnet.jsonl")])
+        self.summary = hldsmon.modnet_summary(self.records)
+
+    def test_modules_present(self):
+        self.assertEqual(set(self.summary),
+                         {"easy_http_amxx_i386", "sockets_amxx_i386"})
+
+    def test_easy_http_totals_and_peaks(self):
+        easy = self.summary["easy_http_amxx_i386"]
+        self.assertEqual(easy["in_bytes"], 205824)
+        self.assertEqual(easy["out_bytes"], 104448)
+        self.assertEqual(easy["conns"], 1)
+        self.assertEqual(easy["conn_fail"], 3)
+        self.assertEqual(easy["connect_attempts"], 4)
+        self.assertEqual(easy["dns_calls"], 2)
+        self.assertEqual(easy["peak_in_kbps"], 200.0)
+        self.assertEqual(easy["peak_out_kbps"], 100.0)
+
+    def test_sockets_totals_and_peaks(self):
+        sockets = self.summary["sockets_amxx_i386"]
+        self.assertEqual(sockets["in_bytes"], 4096)
+        self.assertEqual(sockets["out_bytes"], 8192)
+        self.assertEqual(sockets["conns"], 1)
+        self.assertEqual(sockets["conn_fail"], 2)
+        self.assertEqual(sockets["connect_attempts"], 4)
+        self.assertEqual(sockets["dns_calls"], 0)
+        self.assertEqual(sockets["peak_in_kbps"], 4.0)
+        self.assertEqual(sockets["peak_out_kbps"], 8.0)
+
+    def test_empty_records(self):
+        self.assertEqual(hldsmon.modnet_summary([]), {})
+        self.assertEqual(hldsmon.modnet_summary(GRACEFUL_RECORDS), {})
+
+    def test_deterministic(self):
+        self.assertEqual(hldsmon.modnet_summary(self.records),
+                         hldsmon.modnet_summary(self.records))
+
+
+class TestCorrelateModnet(unittest.TestCase):
+    def setUp(self):
+        self.records = hldsmon.parse_records([fixture("modnet.jsonl")])
+
+    def test_correlation_rows(self):
+        expected = [
+            {"event_t": 3001.5, "kind": "hitch",
+             "module": "easy_http_amxx_i386",
+             "so": "easy_http_amxx_i386.so", "metric": "in_kbps",
+             "value": 200.0},
+            {"event_t": 3001.5, "kind": "hitch",
+             "module": "easy_http_amxx_i386",
+             "so": "easy_http_amxx_i386.so", "metric": "out_kbps",
+             "value": 100.0},
+            {"event_t": 3001.5, "kind": "hitch",
+             "module": "sockets_amxx_i386",
+             "so": "sockets_amxx_i386.so", "metric": "conn_fail",
+             "value": 2},
+            {"event_t": 3010.5, "kind": "drop",
+             "module": "easy_http_amxx_i386",
+             "so": "easy_http_amxx_i386.so", "metric": "conn_fail",
+             "value": 3},
+        ]
+        self.assertEqual(hldsmon.correlate_modnet(self.records), expected)
+
+    def test_narrow_window_excludes_off_grid_samples(self):
+        self.assertEqual(
+            hldsmon.correlate_modnet(self.records, window_s=0.1), [])
+
+    def test_no_modnet_anomalies_yields_nothing(self):
+        records = [
+            {"type": "modnet", "t": 1.0, "module": "m", "so": "m.so",
+             "in_kbps": 1.0, "conn_fail": 0},
+            {"type": "drop", "t": 1.0, "id": 1, "reason": "Timeout"},
+        ]
+        self.assertEqual(hldsmon.correlate_modnet(records), [])
+
+    def test_deterministic(self):
+        self.assertEqual(hldsmon.correlate_modnet(self.records),
+                         hldsmon.correlate_modnet(self.records))
+
+    def test_empty_input(self):
+        self.assertEqual(hldsmon.correlate_modnet([]), [])
+
+
+class TestModnetDigestAndCli(unittest.TestCase):
+    def setUp(self):
+        self.records = hldsmon.parse_records([fixture("modnet.jsonl")])
+
+    def test_digest_modnet_block(self):
+        block = hldsmon.build_digest(self.records)["modnet"]
+        self.assertEqual(block["records"], 5)
+        self.assertEqual(block["in_bytes"], 209920)
+        self.assertEqual(block["out_bytes"], 112640)
+        self.assertEqual(block["conn_fail"], 5)
+        self.assertEqual(block["modules"], [
+            ["easy_http_amxx_i386", 205824, 104448, 3],
+            ["sockets_amxx_i386", 4096, 8192, 2],
+        ])
+
+    def test_digest_counts_by_type_has_modnet(self):
+        digest = hldsmon.build_digest(self.records)
+        self.assertEqual(digest["counts_by_type"]["modnet"], 5)
+
+    def test_digest_cli_deterministic(self):
+        first = run_cli("digest", fixture("modnet.jsonl"))[1]
+        second = run_cli("digest", fixture("modnet.jsonl"))[1]
+        self.assertEqual(first, second)
+        data = json.loads(first)
+        self.assertEqual(data["modnet"]["records"], 5)
+
+    def test_summary_cli_modnet_line(self):
+        code, out = run_cli("summary", fixture("modnet.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "Modnet: 5 records, modules: easy_http_amxx_i386, sockets_amxx_i386",
+            out)
+        self.assertEqual(run_cli("summary", fixture("modnet.jsonl"))[1], out)
+
+    def test_summary_cli_without_modnet(self):
+        code, out = run_cli("summary", fixture("truncated.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertIn("Modnet: 0 records, modules: (none)", out)
+
+
 if __name__ == "__main__":
     unittest.main()
