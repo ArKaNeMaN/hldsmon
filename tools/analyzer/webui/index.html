@@ -1,0 +1,3823 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>HldsMonitoring — Анализ телеметрии ReHLDS</title>
+<style>
+  /* ------------------------------------------------------------------ */
+  /*  Design tokens — all visual values trace back to this block.        */
+  /* ------------------------------------------------------------------ */
+  :root {
+    --bg:        #0b0f14;
+    --bg-2:      #0f1620;
+    --panel:     #131c27;
+    --panel-2:   #17222f;
+    --border:    #223141;
+    --border-2:  #2d4053;
+    --text:      #e7eef6;
+    --text-mut:  #93a4b8;
+    --text-dim:  #6b7d92;
+    --accent:    #4ea1ff;
+    --accent-2:  #7cbcff;
+    --accent-ink:#04121f;
+    --ok:        #34d399;
+    --warn:      #fbbf24;
+    --err:       #f87171;
+    --violet:    #c084fc;
+    --pink:      #f472b6;
+
+    --r-sm: 6px;
+    --r-md: 10px;
+    --r-lg: 14px;
+
+    --sp-1: 4px;
+    --sp-2: 8px;
+    --sp-3: 12px;
+    --sp-4: 16px;
+    --sp-5: 24px;
+    --sp-6: 32px;
+    --sp-7: 48px;
+
+    --shadow-1: 0 1px 2px rgba(0,0,0,.4);
+    --shadow-2: 0 8px 30px rgba(0,0,0,.35);
+    --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --t-fast: 120ms ease;
+
+    /* measured height of .topbar; updated on load/resize so sticky panels sit flush under it */
+    --topbar-h: 56px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1100px 520px at 82% -12%, rgba(78,161,255,.10), transparent 60%),
+      radial-gradient(760px 420px at -8% 8%, rgba(52,211,153,.06), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  a { color: var(--accent-2); }
+
+  /* ---------------------------------------------------------------- */
+  /*  Top bar                                                          */
+  /* ---------------------------------------------------------------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 40;
+    display: flex; align-items: center; gap: var(--sp-4);
+    flex-wrap: wrap;
+    padding: var(--sp-3) var(--sp-5);
+    background: rgba(11,15,20,.82);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+  .brand-mark {
+    width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px;
+    display: grid; place-items: center;
+    background: linear-gradient(145deg, #16324b, #0e1c2b);
+    border: 1px solid var(--border-2);
+  }
+  .brand-mark svg { width: 20px; height: 20px; display: block; }
+  .brand-txt { min-width: 0; }
+  .brand-title { font-weight: 650; letter-spacing: .2px; line-height: 1.15; }
+  .brand-sub { font-size: 11.5px; color: var(--text-dim); }
+  .topbar-spacer { flex: 1 1 auto; }
+  .toolbar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--text-mut);
+    padding: 4px 9px; border: 1px solid var(--border);
+    border-radius: 999px; background: var(--panel);
+    white-space: nowrap;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); flex: 0 0 auto; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52,211,153,.15); }
+  .dot.err { background: var(--err); box-shadow: 0 0 0 3px rgba(248,113,113,.15); }
+
+  /* ---------------------------------------------------------------- */
+  /*  Buttons                                                          */
+  /* ---------------------------------------------------------------- */
+  .btn {
+    font: inherit; font-size: 13px; font-weight: 550;
+    color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border-2);
+    padding: 7px 12px; border-radius: var(--r-sm);
+    cursor: pointer; transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
+    display: inline-flex; align-items: center; gap: 7px;
+    white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { background: #1d2a39; border-color: #3a526a; }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn:disabled { opacity: .42; cursor: not-allowed; }
+  .btn.primary {
+    background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+    font-weight: 650;
+  }
+  .btn.primary:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); }
+  .btn.ghost { background: transparent; border-color: var(--border); color: var(--text-mut); }
+  .btn.ghost:hover:not(:disabled) { color: var(--text); border-color: var(--border-2); }
+  .btn.sm { padding: 5px 9px; font-size: 12px; }
+  .btn .spinner {
+    width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+    animation: spin .7s linear infinite;
+  }
+  .btn.primary .spinner { border-color: rgba(4,18,31,.35); border-top-color: var(--accent-ink); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------------------------------------------------------------- */
+  /*  Layout                                                           */
+  /* ---------------------------------------------------------------- */
+  main { max-width: 1220px; margin: 0 auto; padding: var(--sp-5); display: grid; gap: var(--sp-5); }
+  .panel {
+    background: linear-gradient(180deg, var(--panel), #101926);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-1);
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; gap: var(--sp-3);
+    flex-wrap: wrap;
+    padding: var(--sp-4) var(--sp-5);
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(255,255,255,.015), transparent);
+  }
+  .panel-head h2 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .2px; }
+  .panel-head .count-pill {
+    font-size: 11.5px; color: var(--text-mut); background: var(--bg-2);
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px;
+  }
+  .panel-head .head-spacer { flex: 1 1 auto; }
+  .panel-body { padding: var(--sp-5); }
+  .panel-toggle {
+    display: inline-flex; align-items: center; gap: var(--sp-2);
+    background: none; border: 0; margin: 0; padding: 0;
+    color: inherit; font: inherit; text-align: left;
+    cursor: pointer; border-radius: var(--r-sm); min-width: 0;
+  }
+  .panel-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .panel-toggle .chevron { color: var(--text-dim); font-size: 12px; width: 12px; text-align: center; flex: 0 0 auto; }
+  .panel-toggle:hover h2 { color: var(--accent-2); }
+  .panel.collapsed .panel-head { border-bottom: 0; }
+  .panel.collapsed .panel-body { display: none; }
+
+  /* sticky period panel: pins right under the sticky topbar (z-index below 40),
+     with a solid background so charts scroll beneath it */
+  .panel-sticky {
+    position: sticky;
+    top: var(--topbar-h, 56px);
+    z-index: 30;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--border-2);
+    box-shadow: 0 12px 24px -12px rgba(0,0,0,.7), var(--shadow-1);
+  }
+
+  /* player session chips (combined panel: drill into one session) */
+  .player-sessions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 2px; }
+  .player-sessions[hidden] { display: none; }
+  .player-sessions-label {
+    font-size: 11.5px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: .5px;
+  }
+  .session-chip {
+    font: inherit; font-size: 11.5px; color: var(--text-mut);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: 999px; padding: 3px 9px; cursor: pointer;
+    transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast);
+  }
+  .session-chip:hover { color: var(--text); border-color: var(--accent); }
+  .session-chip.active { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+  .muted { color: var(--text-mut); }
+  .dim { color: var(--text-dim); }
+  .empty {
+    color: var(--text-dim); font-style: normal; padding: var(--sp-4) 0;
+    display: flex; align-items: center; gap: var(--sp-3);
+  }
+  .empty::before { content: ""; width: 3px; height: 16px; background: var(--border-2); border-radius: 2px; }
+
+  /* ---------------------------------------------------------------- */
+  /*  Upload                                                           */
+  /* ---------------------------------------------------------------- */
+  .upload-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: var(--sp-5); }
+  @media (max-width: 820px) { .upload-grid { grid-template-columns: 1fr; } }
+
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: var(--sp-2); text-align: center;
+    padding: var(--sp-6) var(--sp-4);
+    border: 1.5px dashed var(--border-2); border-radius: var(--r-md);
+    background: var(--bg-2); cursor: pointer;
+    transition: border-color var(--t-fast), background var(--t-fast);
+  }
+  .dropzone:hover { border-color: var(--accent); background: #101a26; }
+  .dropzone:focus-within { border-color: var(--accent); outline: 2px solid rgba(78,161,255,.35); outline-offset: 2px; }
+  .dropzone.drag { border-color: var(--accent); background: #0e1c2b; border-style: solid; }
+  .dropzone svg { width: 34px; height: 34px; color: var(--accent); }
+  .dz-title { font-weight: 600; }
+  .dz-hint { font-size: 12px; color: var(--text-dim); }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+
+  .file-list { display: flex; flex-direction: column; gap: var(--sp-2); }
+  .file-list-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
+  .file-list-head .label { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--text-dim); }
+  .file-items { display: flex; flex-direction: column; gap: 6px; max-height: 190px; overflow-y: auto; }
+  .file-item {
+    display: flex; align-items: center; gap: var(--sp-2);
+    padding: 6px 10px; background: var(--bg-2);
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    font-size: 12.5px;
+  }
+  .file-item .fi-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+  .file-item .fi-size { color: var(--text-dim); font-size: 11.5px; }
+  .file-item .fi-x {
+    border: 0; background: transparent; color: var(--text-dim); cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 2px 4px; border-radius: 4px;
+  }
+  .file-item .fi-x:hover { color: var(--err); background: rgba(248,113,113,.1); }
+
+  .actions-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-top: var(--sp-4); }
+  .status { font-size: 13px; display: flex; align-items: center; gap: 7px; min-height: 20px; }
+  .status.error { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .status.info { color: var(--text-mut); }
+
+  /* ---------------------------------------------------------------- */
+  /*  FTP live-tail                                                    */
+  /* ---------------------------------------------------------------- */
+  .ftp-grid {
+    display: grid; gap: var(--sp-3);
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    align-items: end;
+  }
+  .ftp-grid .field.wide { grid-column: 1 / -1; }
+  .ftp-grid .field input {
+    font: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 6px 9px; width: 100%; min-width: 0;
+  }
+  .ftp-grid .field input[type="text"], .ftp-grid .field input[type="password"] { font-family: var(--mono); }
+  .ftp-grid .field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .ftp-row-check { display: flex; align-items: center; gap: var(--sp-2); font-size: 12.5px; color: var(--text-mut); padding: 7px 0; }
+  .ftp-row-check input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .ftp-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-4); }
+  .ftp-auto { display: flex; align-items: center; gap: var(--sp-2); margin-left: auto; font-size: 12.5px; color: var(--text-mut); }
+  .ftp-auto input[type="number"] {
+    width: 72px; font: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 5px 7px;
+  }
+  #ftpStatus { margin-top: var(--sp-3); }
+  .ftp-progress { margin-top: var(--sp-3); }
+  .ftp-progress[hidden] { display: none; }
+  .ftp-progress-track { height: 8px; border-radius: 999px; background: var(--bg-2); border: 1px solid var(--border-2); overflow: hidden; }
+  .ftp-progress-fill { height: 100%; width: 0%; border-radius: 999px; background: var(--accent); transition: width .2s ease; }
+  .ftp-progress.indeterminate .ftp-progress-fill { width: 35%; animation: ftpIndet 1.1s ease-in-out infinite; }
+  .ftp-progress.analyzing .ftp-progress-fill { background: var(--warn); }
+  @keyframes ftpIndet { 0% { margin-left: 0%; } 50% { margin-left: 65%; } 100% { margin-left: 0%; } }
+  .ftp-progress-label { margin-top: 6px; font-size: 12.5px; color: var(--text-mut); font-variant-numeric: tabular-nums; }
+
+  /* ---------------------------------------------------------------- */
+  /*  Summary cards                                                    */
+  /* ---------------------------------------------------------------- */
+  #results { display: grid; gap: var(--sp-5); }
+  .cards {
+    display: grid; gap: var(--sp-3);
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  }
+  .card {
+    background: linear-gradient(180deg, var(--panel), #0f1722);
+    border: 1px solid var(--border); border-radius: var(--r-md);
+    padding: var(--sp-4);
+    position: relative; overflow: hidden;
+  }
+  .card::after {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent); opacity: .55;
+  }
+  .card.accent-ok::after { background: var(--ok); }
+  .card.accent-warn::after { background: var(--warn); }
+  .card.accent-err::after { background: var(--err); }
+  .card .k { font-size: 11.5px; text-transform: uppercase; letter-spacing: .7px; color: var(--text-dim); }
+  .card .v { font-size: 24px; font-weight: 680; margin-top: 6px; letter-spacing: .3px; font-variant-numeric: tabular-nums; }
+  .card .v.sm { font-size: 15px; font-weight: 600; }
+  .card .s { font-size: 11.5px; color: var(--text-mut); margin-top: 3px; }
+
+  /* ---------------------------------------------------------------- */
+  /*  Type bars                                                        */
+  /* ---------------------------------------------------------------- */
+  .bars { display: flex; flex-direction: column; gap: var(--sp-3); }
+  .bar-row { display: grid; grid-template-columns: 118px 1fr 72px; align-items: center; gap: var(--sp-3); }
+  @media (max-width: 520px) { .bar-row { grid-template-columns: 88px 1fr 56px; gap: var(--sp-2); } }
+  .bar-label { font-size: 12.5px; font-family: var(--mono); color: var(--text-mut); overflow: hidden; text-overflow: ellipsis; }
+  .bar-track { height: 10px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #6ec2ff); border-radius: 999px; transition: width .35s ease; }
+  .bar-val { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+
+  /* ---------------------------------------------------------------- */
+  /*  Charts                                                           */
+  /* ---------------------------------------------------------------- */
+  .charts { display: grid; gap: var(--sp-5); }
+  .chart { position: relative; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg-2); overflow: hidden; }
+  .chart-head { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--border); }
+  .chart-title { font-size: 13px; font-weight: 620; }
+  .chart-title .unit { color: var(--text-dim); font-weight: 450; font-size: 12px; }
+  .legend { display: flex; gap: var(--sp-3); flex-wrap: wrap; margin-left: auto; }
+  .legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-mut); }
+  .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+  .chart-plot { position: relative; overflow-x: auto; }
+  .chart-svg { width: 100%; min-width: 560px; height: auto; aspect-ratio: 820 / 240; display: block; }
+  .chart-svg .grid line { stroke: var(--border); stroke-width: 1; }
+  .chart-svg .grid line.base { stroke: var(--border-2); }
+  .chart-svg .grid text { fill: var(--text-dim); font-size: 11.5px; font-family: var(--mono); }
+  .chart-svg .axis text { fill: var(--text-mut); font-size: 11.5px; font-family: var(--mono); }
+  .chart-svg .spark { fill: none; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-svg .hover-line { stroke: var(--text-mut); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; }
+  .chart-svg .hover-dot { opacity: 0; stroke: var(--bg-2); stroke-width: 1.5; }
+  .chart-tip {
+    position: absolute; top: 6px; left: 0; pointer-events: none;
+    background: rgba(6,11,17,.96); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 7px 9px; font-size: 11.5px;
+    box-shadow: var(--shadow-2); transform: translateX(-50%);
+    opacity: 0; transition: opacity 90ms ease; max-width: calc(100% - 12px); z-index: 5;
+  }
+  .chart-tip .tt-time { color: var(--text-mut); font-family: var(--mono); font-size: 10.5px; margin-bottom: 4px; white-space: nowrap; }
+  .chart-tip .tt-row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+  .chart-tip .tt-row .swatch { width: 9px; height: 9px; border-radius: 2px; flex: 0 0 auto; }
+  .chart-tip .tt-row .tt-name { color: var(--text-mut); }
+  .chart-tip .tt-row .tt-val { margin-left: auto; font-weight: 600; padding-left: 10px; white-space: nowrap; }
+  .chart-svg .bars rect { fill-opacity: .85; }
+  .ds-legend { display: flex; flex-wrap: wrap; gap: 6px var(--sp-3); align-items: center; }
+  .ds-legend .hint { font-size: 11.5px; color: var(--text-dim); }
+
+  /* compact «Справка» under the combined chart: metric -> one-line note */
+  .metric-help { margin-top: var(--sp-4); border-top: 1px solid var(--border); padding-top: var(--sp-3); }
+  .metric-help[hidden] { display: none; }
+  .metric-help-list { display: grid; gap: 5px 18px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .metric-help-row { display: flex; gap: var(--sp-3); align-items: baseline; font-size: 12px; line-height: 1.4; }
+  .metric-help-key { flex: 0 0 auto; min-width: 92px; font-family: var(--mono); color: var(--text-mut); }
+  .metric-help-note { color: var(--text-dim); }
+
+  /* brief highlight when «фокус» scrolls to the combined panel */
+  .panel.flash { animation: panelFlash 1.5s ease; }
+  @keyframes panelFlash {
+    0%   { box-shadow: 0 0 0 2px var(--accent), var(--shadow-2); }
+    100% { box-shadow: var(--shadow-1); }
+  }
+  @media (prefers-reduced-motion: reduce) { .panel.flash { animation: none; box-shadow: 0 0 0 2px var(--accent); } }
+  .focus-ivl { font-family: var(--mono); }
+
+  /* ---------------------------------------------------------------- */
+  /*  Tables                                                           */
+  /* ---------------------------------------------------------------- */
+  .controls { display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+  .field select, .field input[type="search"], .field input[type="text"], .field input[type="datetime-local"] {
+    font: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 6px 9px; min-width: 160px;
+  }
+  .field input[type="text"] { min-width: 190px; font-family: var(--mono); }
+  .field select:focus, .field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .period-hint { font-size: 12px; color: var(--text-dim); margin-top: var(--sp-3); }
+  .period-hint.active { color: var(--accent-2); }
+
+  /* period mini-timeline (brush) */
+  .period-timeline { margin-bottom: var(--sp-4); }
+  .period-timeline-empty { font-size: 12px; color: var(--text-dim); padding: var(--sp-2) 0; }
+  .period-brush { width: 100%; height: 44px; display: block; touch-action: none; overflow: visible; }
+  .period-brush .period-track { fill: var(--bg-2); stroke: var(--border-2); stroke-width: 1; }
+  .period-brush .period-dim { fill: rgba(11,15,20,.62); }
+  .period-brush .period-sel { fill: rgba(78,161,255,.22); stroke: var(--accent); stroke-width: 1; cursor: grab; }
+  .period-brush .period-sel:active { cursor: grabbing; }
+  .period-brush .period-brush-handle { cursor: ew-resize; }
+  .period-brush .handle-hit { fill: transparent; pointer-events: all; }
+  .period-brush .handle-bar { fill: var(--accent); }
+  .period-brush .handle-grip { stroke: var(--accent-ink); stroke-width: 1; stroke-linecap: round; }
+  .period-brush .period-brush-handle:hover .handle-bar { fill: var(--accent-2); }
+  .period-brush .period-brush-handle:focus { outline: none; }
+  .period-brush .period-brush-handle:focus .handle-bar { fill: var(--accent-2); stroke: var(--text); stroke-width: 1.5; }
+  .period-timeline-label { font-size: 12px; color: var(--text-mut); font-variant-numeric: tabular-nums; margin-top: 4px; font-family: var(--mono); }
+  .period-presets { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+  .period-presets-label { font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+
+  /* period "follow" (live end): checkbox + live pill + live brush styling */
+  .period-follow { display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+  .period-follow-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--text-mut); cursor: pointer; user-select: none;
+    text-transform: uppercase; letter-spacing: .5px;
+  }
+  .period-follow-toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
+  .period-follow-toggle:has(input:disabled) { opacity: .42; cursor: not-allowed; }
+  .period-live {
+    display: none; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; color: var(--ok);
+    background: rgba(52,211,153,.08); border: 1px solid rgba(52,211,153,.4);
+    border-radius: 999px; padding: 2px 9px;
+  }
+  .period-live.on { display: inline-flex; }
+  .period-live .live-dot { position: relative; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+  .period-live .live-dot::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background: var(--ok); opacity: .7;
+    animation: livePulse 1.6s ease-out infinite;
+  }
+  @keyframes livePulse {
+    0%   { transform: scale(1);   opacity: .7; }
+    100% { transform: scale(2.6); opacity: 0;  }
+  }
+  @media (prefers-reduced-motion: reduce) { .period-live .live-dot::after { animation: none; opacity: 0; } }
+  /* brush: while following, the right edge is the live (tracking) end */
+  .period-brush .period-end-dot { display: none; fill: var(--ok); }
+  .period-brush.follow .period-end-dot { display: block; }
+  .period-brush.follow .period-sel { stroke: var(--accent-2); }
+  .period-brush.follow .period-brush-handle.end .handle-bar { fill: var(--ok); filter: drop-shadow(0 0 4px rgba(52,211,153,.7)); }
+  .table-wrap { overflow-x: auto; margin-top: var(--sp-4); border: 1px solid var(--border); border-radius: var(--r-md); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  thead th {
+    position: sticky; top: 0;
+    background: var(--panel-2); color: var(--text-mut);
+    text-align: left; font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .5px;
+    padding: 9px var(--sp-3); border-bottom: 1px solid var(--border-2);
+    white-space: nowrap;
+  }
+  tbody td { padding: 8px var(--sp-3); border-bottom: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:nth-child(even) { background: rgba(255,255,255,.014); }
+  tbody tr:hover { background: rgba(78,161,255,.05); }
+  td.mono, th.mono { font-family: var(--mono); }
+  td.num { text-align: right; }
+  .tag {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    border: 1px solid var(--border-2); background: var(--bg-2); color: var(--text-mut);
+  }
+  .tag.cat-timeout  { color: #fca5a5; border-color: rgba(248,113,113,.4); background: rgba(248,113,113,.08); }
+  .tag.cat-overflow { color: #fdba74; border-color: rgba(251,146,60,.4);  background: rgba(251,146,60,.08); }
+  .tag.cat-user     { color: #86efac; border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+  .tag.crash        { color: var(--err); border-color: rgba(248,113,113,.5); background: rgba(248,113,113,.1); }
+  .pager {
+    display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+    margin-top: var(--sp-3); color: var(--text-mut); font-size: 12px;
+  }
+  .pager .pager-size {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px;
+  }
+  .pager .pager-size select {
+    font: inherit; font-size: 12px; color: var(--text); text-transform: none; letter-spacing: 0;
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 4px 7px;
+  }
+  .pager .pager-size select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .pager .pager-label { font-variant-numeric: tabular-nums; }
+  .pager .btn.sm { padding: 4px 10px; line-height: 1; }
+
+  /* period / events / navigation extras */
+  .info-line {
+    display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+    font-size: 12.5px; color: var(--text-mut);
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: var(--r-md); padding: 9px var(--sp-4);
+  }
+  .info-line .pill { color: var(--text); }
+  .badge.bad-ok   { color: #86efac; border-color: rgba(52,211,153,.4); background: rgba(52,211,153,.08); }
+  .badge.bad-err  { color: #fca5a5; border-color: rgba(248,113,113,.45); background: rgba(248,113,113,.1); }
+  .badge.bad-mut  { color: var(--text-mut); }
+  .evt-toggle {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--text-mut); cursor: pointer; user-select: none;
+  }
+  .evt-toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
+  .band-legend { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+  .band-legend .swatch { width: 11px; height: 11px; border-radius: 3px; }
+  .head-tools { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-left: auto; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.row-active { background: rgba(78,161,255,.14) !important; box-shadow: inset 3px 0 0 var(--accent); }
+  .row-id { font-family: var(--mono); }
+  .flags { display: inline-flex; gap: 4px; }
+
+  .anoms { display: flex; flex-direction: column; gap: var(--sp-2); }
+  .anom {
+    display: flex; gap: var(--sp-3); align-items: flex-start;
+    padding: var(--sp-3); border-radius: var(--r-sm);
+    background: rgba(251,191,36,.06); border: 1px solid rgba(251,191,36,.22);
+    font-size: 13px;
+  }
+  .anom svg { width: 16px; height: 16px; color: var(--warn); flex: 0 0 auto; margin-top: 2px; }
+  .anom.info { background: rgba(78,161,255,.06); border-color: rgba(78,161,255,.22); }
+  .anom.info svg { color: var(--accent); }
+
+  footer { max-width: 1220px; margin: 0 auto; padding: var(--sp-5); color: var(--text-dim); font-size: 12px; display: flex; gap: var(--sp-4); flex-wrap: wrap; align-items: center; }
+
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; z-index: 90;
+    display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-end;
+  }
+  .toast {
+    background: var(--panel-2); border: 1px solid var(--border-2); border-left: 3px solid var(--accent);
+    border-radius: var(--r-sm); padding: 10px 14px; font-size: 13px; box-shadow: var(--shadow-2);
+    max-width: 340px; animation: toast-in 160ms ease;
+  }
+  .toast.error { border-left-color: var(--err); }
+  .toast.ok { border-left-color: var(--ok); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  @media (max-width: 640px) {
+    main { padding: var(--sp-3); gap: var(--sp-4); }
+    .topbar { padding: var(--sp-2) var(--sp-3); }
+    .panel-body { padding: var(--sp-4); }
+    .brand-sub { display: none; }
+  }
+</style>
+</head>
+<body>
+<noscript><div style="padding:24px;color:#f87171">Для работы интерфейса требуется JavaScript.</div></noscript>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#4ea1ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 17l4-6 3 3 4-8 3 5 4-3"/><path d="M3 21h18"/>
+      </svg>
+    </span>
+    <span class="brand-txt">
+      <div class="brand-title">HldsMonitoring</div>
+      <div class="brand-sub">анализ телеметрии ReHLDS · офлайн</div>
+    </span>
+  </div>
+
+  <div class="topbar-spacer"></div>
+
+  <div class="toolbar" role="group" aria-label="Экспорт">
+    <span id="logEndBadge" class="badge" hidden></span>
+    <span id="modeBadge" class="badge" hidden></span>
+    <button class="btn sm ghost" id="btnServer" disabled data-type="server">CSV: сервер</button>
+    <button class="btn sm ghost" id="btnClient" disabled data-type="client">CSV: клиенты</button>
+    <button class="btn sm ghost" id="btnDrop"   disabled data-type="drop">CSV: drops</button>
+    <button class="btn sm ghost" id="btnAll"    disabled data-type="">CSV: всё</button>
+  </div>
+</header>
+
+<main>
+  <!-- ===================== Upload ===================== -->
+  <section class="panel" id="uploadPanel">
+    <div class="panel-head">
+      <h2>Исходные данные</h2>
+      <span class="count-pill">JSONL · несколько файлов</span>
+      <div class="head-spacer"></div>
+      <span class="badge" id="healthBadge"><span class="dot" id="healthDot"></span><span id="healthText">проверка сервера…</span></span>
+    </div>
+    <div class="panel-body">
+      <div class="upload-grid">
+        <div>
+          <label class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Выбрать файлы телеметрии: перетащите или нажмите Enter">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+            </svg>
+            <span class="dz-title">Перетащите файлы сюда</span>
+            <span class="dz-hint">или нажмите, чтобы выбрать · .jsonl .json .txt .log</span>
+            <input type="file" id="fileInput" class="visually-hidden" multiple accept=".jsonl,.json,.txt,.log">
+          </label>
+
+          <div class="actions-row">
+            <button class="btn primary" id="btnAnalyze" disabled>
+              <span class="label">Анализ</span>
+            </button>
+            <button class="btn" id="btnDemo" type="button">Показать демо-данные</button>
+            <button class="btn ghost" id="btnClear" type="button" hidden>Очистить результаты</button>
+          </div>
+          <div id="status" class="status info" role="status" aria-live="polite" style="margin-top:10px"></div>
+        </div>
+
+        <div class="file-list">
+          <div class="file-list-head">
+            <span class="label">Выбранные файлы</span>
+            <span class="dim" id="fileSummary">0 файлов</span>
+          </div>
+          <div class="file-items" id="fileItems"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== FTP live tail ===================== -->
+  <section class="panel" id="ftpPanel">
+    <div class="panel-head">
+      <h2>Источник: FTP</h2>
+      <span class="count-pill">живой хвост · инкрементально</span>
+      <div class="head-spacer"></div>
+      <button class="btn sm ghost" id="ftpToggle" type="button" aria-expanded="false" aria-controls="ftpBody">Показать</button>
+    </div>
+    <div class="panel-body" id="ftpBody" hidden>
+      <div class="ftp-grid">
+        <div class="field">
+          <label for="ftpHost">Хост</label>
+          <input type="text" id="ftpHost" placeholder="ftp.example.com" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="ftpPort">Порт</label>
+          <input type="number" id="ftpPort" value="21" min="1" max="65535">
+        </div>
+        <div class="field">
+          <label for="ftpUser">Пользователь</label>
+          <input type="text" id="ftpUser" placeholder="anonymous" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="ftpPassword">Пароль</label>
+          <input type="password" id="ftpPassword" placeholder="••••••" autocomplete="new-password">
+        </div>
+        <div class="field wide">
+          <label for="ftpPath">Путь к файлу телеметрии</label>
+          <input type="text" id="ftpPath" placeholder="/cstrike/addons/metamod/hldsmon/logs/hldsmon-{date}.jsonl" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>Соединение</label>
+          <label class="ftp-row-check"><input type="checkbox" id="ftpTls"> TLS (FTPS)</label>
+        </div>
+      </div>
+      <div class="ftp-actions">
+        <button class="btn primary" id="ftpConnect" type="button">Подключить</button>
+        <button class="btn" id="ftpRefresh" type="button" disabled>Обновить сейчас</button>
+        <button class="btn ghost" id="ftpClose" type="button" disabled>Отключить</button>
+        <label class="evt-toggle" title="Сохранять хост, логин, пароль и путь в localStorage браузера (локальный инструмент)"><input type="checkbox" id="ftpRemember" checked> сохранять креды</label>
+        <div class="ftp-auto">
+          <label class="evt-toggle"><input type="checkbox" id="ftpAuto"> авто-обновление</label>
+          <label for="ftpInterval">интервал, с</label>
+          <input type="number" id="ftpInterval" value="5" min="1" max="3600">
+        </div>
+      </div>
+      <div class="ftp-progress" id="ftpProgress" hidden>
+        <div class="ftp-progress-track"><div class="ftp-progress-fill" id="ftpProgressFill"></div></div>
+        <div class="ftp-progress-label" id="ftpProgressLabel"></div>
+      </div>
+      <div id="ftpStatus" class="status info" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <!-- ===================== Results ===================== -->
+  <div id="results" hidden></div>
+</main>
+
+<footer>
+  <span>HldsMonitoring web-ui · v1</span>
+  <span class="dim">Данные обрабатываются локально. Внешние запросы не выполняются.</span>
+  <span class="head-spacer" style="flex:1"></span>
+  <button class="btn sm ghost" id="btnCollapseAll" type="button">Свернуть всё</button>
+  <button class="btn sm ghost" id="btnExpandAll" type="button">Развернуть всё</button>
+  <button class="btn sm ghost" id="btnSelfTest" type="button">Самопроверка рендера</button>
+</footer>
+
+<div id="toast" aria-live="polite"></div>
+
+<script>
+"use strict";
+/* =====================================================================
+   HldsMonitoring — offline dashboard.
+   Single file, no dependencies. Implements the frozen /api contract.
+   ===================================================================== */
+
+/* ---------- tiny DOM helpers ---------- */
+const $  = (sel, root) => (root || document).querySelector(sel);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+function svgEl(name, attrs) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", name);
+  if (attrs) for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+/* ---------- formatting ---------- */
+const nfRu = new Intl.NumberFormat("ru-RU");
+const nfRu2 = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function isNum(v) { return typeof v === "number" && isFinite(v); }
+function fmtInt(v) {
+  if (!isNum(v)) return "—";
+  return nfRu.format(Math.round(v));
+}
+let _fmtCache = null;
+function fmtFloat(v, d) {
+  if (!isNum(v)) return "—";
+  if (d == null) return nfRu2.format(v);
+  if (!_fmtCache) _fmtCache = {};
+  if (!_fmtCache[d]) _fmtCache[d] = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: d, maximumFractionDigits: d });
+  return _fmtCache[d].format(v);
+}
+function fmtDuration(s) {
+  if (!isNum(s)) return "—";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const parts = [];
+  if (h) parts.push(h + "ч");
+  if (m || h) parts.push(m + "м");
+  parts.push(sec + "с");
+  return parts.join(" ");
+}
+function fmtIso(epoch) {
+  if (!isNum(epoch)) return "—";
+  return new Date(epoch * 1000).toISOString().replace(".000", "").replace("T", " ").replace("Z", " UTC");
+}
+function fmtClock(epoch) {
+  if (!isNum(epoch)) return "—";
+  return new Date(epoch * 1000).toISOString().slice(11, 19);
+}
+function fmtMbFromKb(kb) { return isNum(kb) ? fmtFloat(kb / 1024, 1) + " МБ" : "—"; }
+function fmtBool(v) {
+  if (v === true) return "да";
+  if (v === false) return "нет";
+  if (v == null || v === "") return "—";
+  return String(v);
+}
+function humanBytes(n) {
+  if (!isNum(n)) return "—";
+  const u = ["Б", "КБ", "МБ", "ГБ"];
+  let i = 0, x = n;
+  while (x >= 1024 && i < u.length - 1) { x /= 1024; i++; }
+  return fmtFloat(x, i === 0 ? 0 : 1) + " " + u[i];
+}
+
+/* ---------- state ---------- */
+/* bulky event sections collapsed on first render; a user toggle overrides it afterwards */
+const DEFAULT_COLLAPSED = { "p:Отключения (drops)": true, "p:Аномалии": true };
+const state = {
+  files: [],        // File objects
+  body: null,       // raw concatenated JSONL text used for the last analyze
+  result: null,     // last rendered result object
+  view: null,       // period-filtered view derived from result
+  demo: false,
+  urls: [],         // live Object URLs to revoke
+  period: { from: null, to: null },  // active period filter (epoch seconds)
+  showEvents: true,                  // draw exclusion-window bands on charts
+  selectedClient: null,              // ONE global selection: "player:<key>" or a session key (string)
+  dropReason: "",                    // persisted reason filter (drops table + chart)
+  dropSearch: "",                    // persisted search text (drops table)
+  allSeries: ["fps", "frame_ms_avg", "cpu_pct", "players"], // combined chart selection
+  allNormalize: true,                // combined chart normalized to 0–100%
+  playerMetrics: [],                 // overlay: chosen client metric keys (single global set, persisted)
+  datasetsHelpOpen: false,           // combined panel «Справка» list shown/hidden
+  page: { clients: 1, drops: 1 },    // current page per table
+  pageSize: { clients: 25, drops: 25 }, // rows per page (0 = «все»)
+  collapsed: Object.assign({}, DEFAULT_COLLAPSED), // panel key -> collapsed flag
+};
+
+/* set by buildAllPanel; lets other controls (drop rows, the global client
+   selector) refresh the combined panel's chips + metric checkboxes without a full re-render. */
+let refreshAllPanelUI = null;
+
+/* ---------- period parsing + filtered view ---------- */
+function parseTimeInput(str) {
+  const s = (str || "").trim();
+  if (!s) return null;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+  const ms = Date.parse(s);
+  if (!isNaN(ms)) return ms / 1000;
+  return NaN;
+}
+function inRangeF(v, lo, hi) { return isNum(v) && v >= lo && v <= hi; }
+function sliceByIdx(arr, idx) {
+  if (!Array.isArray(arr)) return idx.map(() => null);
+  return idx.map(i => arr[i]);
+}
+function seriesIndices(t, lo, hi) {
+  const out = [];
+  if (!Array.isArray(t)) return out;
+  for (let i = 0; i < t.length; i++) if (inRangeF(t[i], lo, hi)) out.push(i);
+  return out;
+}
+function anyNum(arr) { return Array.isArray(arr) && arr.some(isNum); }
+function rangeOf(arr) {
+  let lo = null, hi = null;
+  for (const v of (Array.isArray(arr) ? arr : [])) {
+    if (!isNum(v)) continue;
+    if (lo == null || v < lo) lo = v;
+    if (hi == null || v > hi) hi = v;
+  }
+  return { start: lo, end: hi };
+}
+function aggregateSeries(cs) {
+  const t = (cs && Array.isArray(cs.t)) ? cs.t : [];
+  const stat = (name) => {
+    const arr = (cs && Array.isArray(cs[name])) ? cs[name] : [];
+    let n = 0, sum = 0, max = null;
+    for (let i = 0; i < t.length; i++) {
+      const v = arr[i];
+      if (isNum(v)) { n++; sum += v; if (max == null || v > max) max = v; }
+    }
+    return { avg: n ? sum / n : null, max: max };
+  };
+  const ping = stat("ping"), loss = stat("loss"), choke = stat("choke"), fill = stat("rel_fill");
+  return {
+    samples: t.length,
+    ping_avg: ping.avg, ping_max: ping.max,
+    loss_avg: loss.avg, loss_max: loss.max,
+    choke_avg: choke.avg, choke_max: choke.max,
+    rel_fill_max: fill.max,
+  };
+}
+function identityColumns(ident) {
+  ident = ident || {};
+  return {
+    name: ident.name || "", authid: ident.authid || "",
+    steamid64: ident.steamid64 || "", ip: ident.ip || "",
+    port: isNum(ident.port) ? ident.port : null,
+    slot: isNum(ident.slot) ? ident.slot : null,
+    userid: isNum(ident.userid) ? ident.userid : null,
+    conn_s: isNum(ident.conn_s) ? ident.conn_s : null,
+    fake: ident.fake === true, proxy: ident.proxy === true,
+  };
+}
+
+const NON_IDENTIFYING_AUTHIDS = { "": 1, "BOT": 1, "STEAM_ID_LAN": 1, "STEAM_ID_PENDING": 1, "VALVE_ID_LAN": 1, "UNKNOWN": 1 };
+function playerKeyOf(id) {
+  id = id || {};
+  if (id.steamid64) return id.steamid64;
+  const auth = id.authid;
+  if (auth && !NON_IDENTIFYING_AUTHIDS[auth]) return auth;
+  return id.session || null;
+}
+function buildPlayerGroups(identities) {
+  identities = identities || {};
+  const groups = {};
+  for (const s of Object.keys(identities)) {
+    const id = identities[s] || {};
+    const k = playerKeyOf(id);
+    if (!k) continue;
+    let g = groups[k];
+    if (!g) g = groups[k] = { player: k, steamid64: "", authid: "", name: "", sessions: [], first_t: null, last_t: null };
+    if (id.steamid64) g.steamid64 = id.steamid64;
+    if (id.authid) g.authid = id.authid;
+    if (id.name) g.name = id.name;
+    g.sessions.push(s);
+    if (isNum(id.first_t) && (g.first_t == null || id.first_t < g.first_t)) g.first_t = id.first_t;
+    if (isNum(id.last_t) && (g.last_t == null || id.last_t > g.last_t)) g.last_t = id.last_t;
+  }
+  for (const k in groups) {
+    groups[k].sessions.sort((a, b) => {
+      const fa = isNum(identities[a] && identities[a].first_t) ? identities[a].first_t : Infinity;
+      const fb = isNum(identities[b] && identities[b].first_t) ? identities[b].first_t : Infinity;
+      return fa - fb || String(a).localeCompare(String(b));
+    });
+  }
+  return groups;
+}
+
+/* mergeSessions: union the keys across a player's per-session parallel series
+   and concatenate each array in session order (missing value -> null). Sessions
+   are non-overlapping and already sorted by first_t, so `t` stays ascending. */
+function mergeSessions(listOfSeries) {
+  const list = (listOfSeries || []).filter(s => s && typeof s === "object");
+  const keys = {};
+  for (const s of list) for (const k in s) keys[k] = true;
+  const out = {};
+  for (const k in keys) {
+    const arr = [];
+    for (const s of list) {
+      const n = Array.isArray(s.t) ? s.t.length : 0;
+      const src = Array.isArray(s[k]) ? s[k] : null;
+      for (let i = 0; i < n; i++) arr.push(src && src[i] !== undefined ? src[i] : null);
+    }
+    out[k] = arr;
+  }
+  return out;
+}
+
+/* computeView: derive the period-filtered render model from a raw result. */
+function computeView(result) {
+  result = result || {};
+  const from = state.period.from, to = state.period.to;
+  const lo = isNum(from) ? from : -Infinity;
+  const hi = isNum(to) ? to : Infinity;
+  const active = isNum(from) || isNum(to);
+
+  const rawSeries = result.series || {};
+  const sIdx = seriesIndices(rawSeries.t, lo, hi);
+  const series = {};
+  for (const k in rawSeries) series[k] = sliceByIdx(rawSeries[k], sIdx);
+
+  const rawCS = result.client_series || {};
+  const clientSeries = {};
+  for (const id in rawCS) {
+    const c = rawCS[id] || {};
+    const idx = seriesIndices(c.t, lo, hi);
+    const o = {};
+    for (const k in c) o[k] = sliceByIdx(c[k], idx);
+    clientSeries[id] = o;
+  }
+
+  const drops = (Array.isArray(result.drops) ? result.drops : [])
+    .filter(d => !active || inRangeF(d.t, lo, hi));
+
+  const events = (Array.isArray(result.events) ? result.events : [])
+    .filter(w => {
+      if (!active) return true;
+      const s = isNum(w.start) ? w.start : -Infinity;
+      const e = isNum(w.end) ? w.end : Infinity;
+      return s <= hi && e >= lo;
+    });
+
+  const identities = result.client_identities || {};
+  const sessions = new Set(Object.keys(clientSeries));
+  Object.keys(identities).forEach(k => sessions.add(k));
+  // fall back to pre-aggregated clients when the analyzer provided no series
+  if (!Object.keys(clientSeries).length && Array.isArray(result.clients)) {
+    result.clients.forEach(c => { if (c && c.session != null) sessions.add(String(c.session)); });
+  }
+  const links = sessionLinks(result);
+  const clients = [];
+  sessions.forEach(session => {
+    const cs = clientSeries[session];
+    const idn = identities[session] || {};
+    const agg = cs ? aggregateSeries(cs) : (findAggregate(result.clients, session) || aggregateSeries({}));
+    const link = links[String(session)];
+    clients.push(Object.assign(
+      { session: session, run: isNum(idn.run) ? idn.run : null, id: idn.id != null ? idn.id : null },
+      identityColumns(idn),
+      { first_t: idn.first_t, last_t: idn.last_t, linkCount: link ? link.count : 1, player: link ? link.player : null },
+      agg));
+  });
+  const multiRun = clients.some(c => isNum(c.run) && c.run > 0);
+  clients.forEach(c => { c.multiRun = multiRun; });
+  clients.sort((a, b) => {
+    const ra = isNum(a.run) ? a.run : 0, rb = isNum(b.run) ? b.run : 0;
+    if (ra !== rb) return ra - rb;
+    const sa = isNum(a.slot) ? a.slot : Infinity, sb = isNum(b.slot) ? b.slot : Infinity;
+    if (sa !== sb) return sa - sb;
+    const ia = isNum(a.id) ? a.id : Infinity, ib = isNum(b.id) ? b.id : Infinity;
+    if (ia !== ib) return ia - ib;
+    return String(a.session).localeCompare(String(b.session));
+  });
+
+  const sT = series.t || [];
+  const sRange = rangeOf(sT);
+  const tRange = {
+    start: sRange.start != null ? sRange.start : (active && isNum(from) ? from : null),
+    end: sRange.end != null ? sRange.end : (active && isNum(to) ? to : null),
+  };
+  // fullRange = the WHOLE log range from the unfiltered server series (brush domain).
+  const fullS = rangeOf(rawSeries.t || []);
+  const fullRange = { start: fullS.start, end: fullS.end };
+  let clientSamples = 0;
+  Object.keys(clientSeries).forEach(id => { clientSamples += (clientSeries[id].t || []).length; });
+
+  // player-level (by SteamID): merge a player's sessions into one series
+  const playerGroups = (result && result.sessions) || {};
+  const players = [];
+  for (const pk in playerGroups) {
+    const g = playerGroups[pk] || {};
+    const sessions = (Array.isArray(g.sessions) ? g.sessions : []).map(sk => {
+      const idn = identities[sk] || {};
+      const sid = String(sk);
+      const cs = clientSeries[sid];
+      return {
+        session: sid,
+        slot: isNum(idn.slot) ? idn.slot : null,
+        id: idn.id != null ? idn.id : null,
+        userid: isNum(idn.userid) ? idn.userid : null,
+        run: isNum(idn.run) ? idn.run : null,
+        name: idn.name || "",
+        first_t: idn.first_t,
+        last_t: idn.last_t,
+        samples: isNum(idn.samples) ? idn.samples : ((cs && cs.t) ? cs.t.length : 0),
+        fake: idn.fake === true,
+        proxy: idn.proxy === true,
+      };
+    });
+    sessions.sort((a, b) => {
+      const fa = isNum(a.first_t) ? a.first_t : Infinity;
+      const fb = isNum(b.first_t) ? b.first_t : Infinity;
+      return fa - fb || String(a.session).localeCompare(String(b.session));
+    });
+    const merged = mergeSessions(sessions.map(s => clientSeries[s.session]));
+    let firstT = isNum(g.first_t) ? g.first_t : null;
+    let lastT = isNum(g.last_t) ? g.last_t : null;
+    let samples = 0;
+    for (const s of sessions) {
+      samples += isNum(s.samples) ? s.samples : 0;
+      if (isNum(s.first_t) && (firstT == null || s.first_t < firstT)) firstT = s.first_t;
+      if (isNum(s.last_t) && (lastT == null || s.last_t > lastT)) lastT = s.last_t;
+    }
+    // merged `series` above is built in chronological order (first_t); only the
+    // DISPLAY list is re-sorted by userid (chips/options), so the overlay stays continuous.
+    sessions.sort(byUserId);
+    players.push({
+      player: pk,
+      steamid64: g.steamid64 || "",
+      authid: g.authid || "",
+      name: g.name || "",
+      sessions,
+      series: merged,
+      first_t: firstT,
+      last_t: lastT,
+      samples,
+    });
+  }
+  players.sort((a, b) => {
+    const fa = isNum(a.first_t) ? a.first_t : Infinity;
+    const fb = isNum(b.first_t) ? b.first_t : Infinity;
+    return fa - fb || String(a.player).localeCompare(String(b.player));
+  });
+
+  return {
+    result, series, clientSeries, drops, events, clients, identities, players,
+    active, lo, hi, tRange, fullRange,
+    serverSamples: sIdx.length, clientSamples,
+  };
+}
+function findAggregate(clients, session) {
+  if (!Array.isArray(clients)) return null;
+  const hit = clients.find(c => c && String(c.session) === String(session));
+  return hit || null;
+}
+function sessionLinks(result) {
+  const out = {};
+  const groups = (result && result.sessions) || {};
+  for (const pk in groups) {
+    const g = groups[pk] || {};
+    const list = Array.isArray(g.sessions) ? g.sessions : [];
+    if (list.length > 1) for (const s of list) out[String(s)] = { count: list.length, player: pk };
+  }
+  return out;
+}
+
+
+let toastSeq = 0;
+function toast(msg, kind) {
+  const t = el("div", "toast" + (kind ? " " + kind : ""), msg);
+  $("#toast").appendChild(t);
+  const id = ++toastSeq;
+  setTimeout(() => { if (t.parentNode) t.remove(); }, 4200 + (id % 3) * 300);
+}
+
+/* =====================================================================
+   Upload / file handling
+   ===================================================================== */
+const ACCEPT_RE = /\.(jsonl|json|txt|log)$/i;
+
+function addFiles(fileList) {
+  const incoming = Array.from(fileList || []);
+  const accepted = [];
+  for (const f of incoming) {
+    if (!ACCEPT_RE.test(f.name)) { toast("Пропущен файл «" + f.name + "»: недопустимый формат", "error"); continue; }
+    if (!state.files.some(existing => existing.name === f.name && existing.size === f.size)) accepted.push(f);
+  }
+  if (accepted.length) {
+    state.files = state.files.concat(accepted);
+    renderFileList();
+    setStatus("Выбрано файлов: " + state.files.length + ". Нажмите «Анализ».", "info");
+  }
+}
+function removeFile(idx) {
+  state.files.splice(idx, 1);
+  renderFileList();
+  setStatus(state.files.length ? "Выбрано файлов: " + state.files.length + "." : "Файлы не выбраны.", "info");
+}
+function renderFileList() {
+  const box = $("#fileItems");
+  box.textContent = "";
+  if (!state.files.length) {
+    box.appendChild(el("div", "empty", "файлы не выбраны"));
+  } else {
+    state.files.forEach((f, i) => {
+      const row = el("div", "file-item");
+      row.appendChild(el("span", "fi-name", f.name));
+      row.appendChild(el("span", "fi-size", humanBytes(f.size)));
+      const x = el("button", "fi-x", "\u00D7");
+      x.type = "button";
+      x.title = "Убрать файл";
+      x.setAttribute("aria-label", "Убрать файл " + f.name);
+      x.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); removeFile(i); });
+      row.appendChild(x);
+      box.appendChild(row);
+    });
+  }
+  $("#fileSummary").textContent = state.files.length + " файл(ов)";
+  $("#btnAnalyze").disabled = state.files.length === 0;
+}
+
+/* =====================================================================
+   API calls
+   ===================================================================== */
+async function readAllFiles(files) {
+  const texts = [];
+  for (const f of files) texts.push(await f.text());
+  // concat with a trailing "\n" between files
+  return texts.map(t => t.replace(/\r\n/g, "\n").replace(/\n+$/, "")).join("\n") + "\n";
+}
+
+async function fetchAnalyze() {
+  if (!state.files.length) { setStatus("Сначала выберите файлы.", "error"); return; }
+  setLoading(true);
+  setStatus("Чтение файлов и анализ…", "info");
+  try {
+    const body = await readAllFiles(state.files);
+    const names = state.files.map(f => f.name);
+    const url = "/api/analyze?files=" + names.map(encodeURIComponent).join(",");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: body,
+    });
+    let data;
+    try { data = await res.json(); }
+    catch (e) { throw new Error("Некорректный ответ сервера (не JSON)."); }
+    if (!res.ok || !data || data.ok !== true) {
+      throw new Error((data && data.error) ? data.error : ("HTTP " + res.status));
+    }
+    revokeUrls();
+    state.body = body;
+    state.demo = false;
+    state.period = { from: null, to: null };
+    state.selectedClient = null;
+    render(data);
+    setStatus("Готово: " + fmtInt(data.records_count) + " записей из " + names.length + " файл(ов).", "ok");
+  } catch (err) {
+    setStatus("Ошибка анализа: " + (err && err.message ? err.message : String(err)), "error");
+    toast("Ошибка анализа: " + (err && err.message ? err.message : String(err)), "error");
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function downloadCsv(type) {
+  if (state.demo || !state.body) {
+    toast("Экспорт CSV доступен только при работе с сервером.", "error");
+    return;
+  }
+  const label = type ? type : "все";
+  try {
+    const url = "/api/export" + (type ? ("?type=" + encodeURIComponent(type)) : "");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: state.body,
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    state.urls.push(objUrl);
+    const a = el("a");
+    a.href = objUrl;
+    a.download = "hldsmon_" + (type || "all") + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+    toast("Экспорт CSV (" + label + ") запущен", "ok");
+  } catch (err) {
+    toast("Ошибка экспорта: " + (err && err.message ? err.message : String(err)), "error");
+  }
+}
+
+function revokeUrls() {
+  state.urls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) { /* ignore */ } });
+  state.urls = [];
+}
+
+/* =====================================================================
+   FTP live-tail — credentials are only ever sent in the POST JSON body.
+   ===================================================================== */
+const ftp = {
+  session: null,       // opaque server-side session id
+  path: "",            // resolved remote path (display only)
+  auto: false,
+  timer: null,
+  intervalMs: 5000,
+  lastError: null,
+  busy: false,
+  progressTimer: null,
+};
+
+function setFtpStatus(msg, kind) {
+  const s = $("#ftpStatus");
+  if (!s) return;
+  s.className = "status " + (kind || "info");
+  s.textContent = msg || "";
+}
+
+function ftpNewJob() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "job-" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
+}
+
+function ftpProgressLabel(text) {
+  const l = $("#ftpProgressLabel");
+  if (l) l.textContent = text || "";
+}
+
+function ftpSetProgress(pct, done, total) {
+  const box = $("#ftpProgress");
+  const fill = $("#ftpProgressFill");
+  if (!box || !fill) return;
+  if (pct == null || !isFinite(pct)) {
+    box.classList.add("indeterminate");
+    return;
+  }
+  box.classList.remove("indeterminate", "analyzing");
+  fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (done != null && total != null && total > 0) {
+    ftpProgressLabel("Загрузка: " + pct.toFixed(0) + "% · " + humanBytes(done) + " / " + humanBytes(total));
+  } else if (done != null) {
+    ftpProgressLabel("Загрузка: " + humanBytes(done));
+  }
+}
+
+function ftpProgressAnalyzing() {
+  const box = $("#ftpProgress");
+  if (box) { box.hidden = false; box.classList.add("indeterminate", "analyzing"); }
+  ftpProgressLabel("Разбор данных…");
+}
+
+function ftpProgressStop() {
+  if (ftp.progressTimer) { clearInterval(ftp.progressTimer); ftp.progressTimer = null; }
+  const box = $("#ftpProgress");
+  if (box) box.hidden = true;
+}
+
+function ftpProgressStart(job, label) {
+  ftpProgressStop();
+  const box = $("#ftpProgress");
+  if (box) { box.hidden = false; box.classList.remove("analyzing"); }
+  ftpSetProgress(null);
+  ftpProgressLabel(label || "Загрузка…");
+  ftp.progressTimer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/ftp/progress?id=" + encodeURIComponent(job));
+      const data = await res.json();
+      const p = data && data.progress;
+      if (p && !p.finished) {
+        if (p.phase === "parse") ftpProgressAnalyzing();
+        else ftpSetProgress(p.pct, p.done, p.total);
+      }
+    } catch (e) { /* progress is best-effort */ }
+  }, 300);
+}
+
+function ftpFormSpec() {
+  return {
+    host: $("#ftpHost").value.trim(),
+    port: parseInt($("#ftpPort").value, 10) || 21,
+    user: $("#ftpUser").value,
+    password: $("#ftpPassword").value,
+    path: $("#ftpPath").value.trim(),
+    tls: $("#ftpTls").checked,
+  };
+}
+
+function ftpLogEndSuffix() {
+  const t = logEndText(state.result && state.result.log_end);
+  return t ? (" · завершение: " + t.label) : "";
+}
+
+const FTP_PREFS_KEY = "hldsmon.ftp.v1";
+
+function ftpPrefsStore() {
+  try { return window.localStorage; } catch (e) { return null; }
+}
+
+function ftpLoadPrefs() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  let prefs = null;
+  try { prefs = JSON.parse(store.getItem(FTP_PREFS_KEY) || "null"); } catch (e) { prefs = null; }
+  if (!prefs || typeof prefs !== "object") return;
+  const set = (id, v) => { const el = $("#" + id); if (el && v != null) el.value = v; };
+  set("ftpHost", prefs.host);
+  set("ftpPort", prefs.port);
+  set("ftpUser", prefs.user);
+  set("ftpPassword", prefs.password);
+  set("ftpPath", prefs.path);
+  set("ftpInterval", prefs.interval);
+  if ($("#ftpTls")) $("#ftpTls").checked = !!prefs.tls;
+  if ($("#ftpRemember")) $("#ftpRemember").checked = prefs.remember !== false;
+}
+
+function ftpSavePrefs() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  const remember = $("#ftpRemember") ? $("#ftpRemember").checked : true;
+  try {
+    if (!remember) { store.removeItem(FTP_PREFS_KEY); return; }
+    store.setItem(FTP_PREFS_KEY, JSON.stringify({
+      host: $("#ftpHost").value.trim(),
+      port: $("#ftpPort").value,
+      user: $("#ftpUser").value,
+      password: $("#ftpPassword").value,
+      path: $("#ftpPath").value.trim(),
+      tls: $("#ftpTls").checked,
+      interval: $("#ftpInterval").value,
+      remember: true,
+    }));
+  } catch (e) { /* storage may be unavailable */ }
+}
+
+function ftpPrefsChanged() { ftpSavePrefs(); }
+
+/* ---------- collapsed-panel persistence (survives page reload) ---------- */
+const COLLAPSED_KEY = "hldsmon.ui.collapsed.v1";
+
+function collapsedLoad() {
+  const store = ftpPrefsStore();
+  if (!store) return null;
+  try {
+    const raw = store.getItem(COLLAPSED_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === "object") ? obj : null;
+  } catch (e) { return null; }
+}
+
+function collapsedSave() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  try { store.setItem(COLLAPSED_KEY, JSON.stringify(state.collapsed)); }
+  catch (e) { /* storage may be unavailable */ }
+}
+
+/* ---------- dataset-display persistence (combined panel; survives reload) ---------- */
+const DATASETS_KEY = "hldsmon.ui.datasets.v1";
+
+function datasetsLoad() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  let d = null;
+  try { d = JSON.parse(store.getItem(DATASETS_KEY) || "null"); } catch (e) { d = null; }
+  if (!d || typeof d !== "object") return;
+  if (Array.isArray(d.allSeries)) {
+    const chosen = d.allSeries.filter(k => ALL_DATASET_KEYS.indexOf(k) !== -1);
+    state.allSeries = ALL_DATASET_KEYS.filter(k => chosen.indexOf(k) !== -1);
+  }
+  if (typeof d.allNormalize === "boolean") state.allNormalize = d.allNormalize;
+  if (typeof d.showEvents === "boolean") state.showEvents = d.showEvents;
+  if (typeof d.datasetsHelpOpen === "boolean") state.datasetsHelpOpen = d.datasetsHelpOpen;
+  if (Array.isArray(d.playerMetrics)) {
+    state.playerMetrics = d.playerMetrics.filter(m => PLAYER_METRICS.some(pm => pm.key === m));
+  }
+}
+
+function datasetsSave() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  try {
+    store.setItem(DATASETS_KEY, JSON.stringify({
+      allSeries: state.allSeries.slice(),
+      allNormalize: state.allNormalize,
+      showEvents: state.showEvents,
+      datasetsHelpOpen: state.datasetsHelpOpen,
+      playerMetrics: state.playerMetrics.slice(),
+    }));
+  } catch (e) { /* storage may be unavailable */ }
+}
+
+async function ftpPost(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data;
+  try { data = await res.json(); }
+  catch (e) { throw new Error("Некорректный ответ сервера (не JSON)."); }
+  if (!res.ok || !data || data.ok !== true) {
+    throw new Error((data && data.error) ? data.error : ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function setFtpControls() {
+  const on = !!ftp.session;
+  const connect = $("#ftpConnect");
+  connect.disabled = ftp.busy;
+  connect.textContent = (ftp.busy && !on) ? "Подключение…" : "Подключить";
+  $("#ftpRefresh").disabled = !on || ftp.busy;
+  $("#ftpClose").disabled = !on || ftp.busy;
+  $("#ftpAuto").disabled = !on;
+  $("#ftpInterval").disabled = !on;
+  if (!on && $("#ftpAuto").checked) ftpStopAuto();
+}
+
+async function ftpConnect() {
+  if (ftp.busy) return;
+  const spec = ftpFormSpec();
+  if (!spec.host) { setFtpStatus("Укажите хост.", "error"); return; }
+  if (!spec.path) { setFtpStatus("Укажите путь к файлу.", "error"); return; }
+  const previous = ftp.session;
+  ftp.busy = true;
+  setFtpControls();
+  setFtpStatus("Подключение и загрузка файла…", "info");
+  const job = ftpNewJob();
+  spec.job = job;
+  ftpProgressStart(job, "Загрузка файла…");
+  try {
+    if (previous) { await ftpSendClose(previous); ftpStopAuto(); }
+    const data = await ftpPost("/api/ftp/connect", spec);
+    ftp.session = data.session;
+    ftp.path = (data.ftp && data.ftp.path) ? data.ftp.path : spec.path;
+    ftp.lastError = null;
+    if (!$("#ftpRemember") || !$("#ftpRemember").checked) $("#ftpPassword").value = "";
+    ftpSavePrefs();
+    state.demo = false;
+    state.body = null;
+    state.period = { from: null, to: null };
+    state.selectedClient = null;
+    render(data);
+    setFtpStatus("Подключено: " + ftp.path + " · " + fmtInt(data.ftp.records) +
+      " записей (" + humanBytes(data.ftp.bytes) + ")" + ftpLogEndSuffix(), "ok");
+  } catch (err) {
+    ftp.session = null;
+    setFtpStatus("Ошибка подключения: " + (err && err.message ? err.message : String(err)), "error");
+    toast("FTP: " + (err && err.message ? err.message : String(err)), "error");
+  } finally {
+    ftpProgressStop();
+    ftp.busy = false;
+    setFtpControls();
+  }
+}
+
+function isUiInteracting() {
+  const ae = document.activeElement;
+  if (!ae) return false;
+  const t = ae.tagName;
+  return t === "SELECT" || t === "INPUT" || t === "TEXTAREA" || ae.isContentEditable === true;
+}
+
+async function ftpRefresh(manual) {
+  // Auto-refresh must not rebuild the DOM mid-interaction: an open <select> would
+  // close and typing would be disrupted. Skip this tick; the next one resumes and
+  // no bytes are lost (the server-side FTP session keeps its offset).
+  if (!manual && isUiInteracting()) return;
+  if (ftp.busy || !ftp.session) return;
+  ftp.busy = true;
+  if (manual) setFtpControls();
+  if (manual) ftpProgressStart(ftp.session, "Обновление…");
+  try {
+    const data = await ftpPost("/api/ftp/refresh", { session: ftp.session });
+    ftp.lastError = null;
+    render(data);
+    const f = data.ftp || {};
+    const now = new Date().toISOString().slice(11, 19);
+    setFtpStatus("Обновлено " + now + " UTC · +" + humanBytes(f.new_bytes) +
+      " / +" + fmtInt(f.new_records) + " записей · всего " + fmtInt(f.records) +
+      " записей (" + humanBytes(f.bytes) + ")" + ftpLogEndSuffix(), "ok");
+  } catch (err) {
+    const msg = (err && err.message ? err.message : String(err));
+    if (ftp.lastError !== msg) { ftp.lastError = msg; toast("FTP-обновление: " + msg, "error"); }
+    setFtpStatus("Ошибка обновления: " + msg + " · показаны последние удачные данные", "error");
+    if (/unknown session/i.test(msg)) {
+      ftpStopAuto();
+      ftp.session = null;
+      setFtpControls();
+    }
+  } finally {
+    if (manual) ftpProgressStop();
+    ftp.busy = false;
+    if (manual) setFtpControls();
+  }
+}
+
+async function ftpSendClose(sessionId) {
+  try {
+    await fetch("/api/ftp/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: sessionId }),
+    });
+  } catch (e) { /* best effort */ }
+}
+
+function ftpDisconnect() {
+  const sid = ftp.session;
+  ftpStopAuto();
+  ftp.session = null;
+  $("#ftpPassword").value = "";
+  setFtpControls();
+  setFtpStatus("FTP-источник отключён.", "info");
+  if (sid) ftpSendClose(sid);
+}
+
+function ftpStopAuto() {
+  if (ftp.timer) { clearInterval(ftp.timer); ftp.timer = null; }
+  ftp.auto = false;
+  const cb = $("#ftpAuto");
+  if (cb) cb.checked = false;
+}
+
+function ftpStartAuto() {
+  ftpStopAuto();
+  ftp.auto = true;
+  ftp.timer = setInterval(() => { ftpRefresh(false); }, ftp.intervalMs);
+}
+
+function ftpIntervalChanged() {
+  const n = parseInt($("#ftpInterval").value, 10);
+  ftp.intervalMs = (isNum(n) && n >= 1 ? n : 5) * 1000;
+  if (ftp.auto) ftpStartAuto();
+}
+
+/* =====================================================================
+   UI state helpers
+   ===================================================================== */
+function setStatus(msg, kind) {
+  const s = $("#status");
+  s.className = "status " + (kind || "info");
+  s.textContent = msg || "";
+}
+function setLoading(on) {
+  const btn = $("#btnAnalyze");
+  btn.disabled = on || state.files.length === 0;
+  btn.textContent = "";
+  if (on) {
+    btn.appendChild(el("span", "spinner"));
+    btn.appendChild(el("span", "label", "Анализ…"));
+  } else {
+    btn.appendChild(el("span", "label", "Анализ"));
+  }
+}
+function setExportEnabled(on) {
+  ["#btnServer", "#btnClient", "#btnDrop", "#btnAll"].forEach(sel => { $(sel).disabled = !on; });
+}
+function setModeBadge(demo) {
+  const b = $("#modeBadge");
+  if (demo) { b.hidden = false; b.textContent = "демо-режим"; }
+  else { b.hidden = true; }
+}
+
+/* =====================================================================
+   Renderers — each returns an element (so the self-test can build them
+   off-screen without touching the page).
+   ===================================================================== */
+
+/* ----- summary cards ----- */
+function buildSummary(result, view) {
+  const cardWrap = el("div", "cards");
+  const d = result.digest || {};
+  const period = d.period || {};
+  const players = Array.isArray(d.players) ? d.players : [];
+  const active = !!(view && view.active);
+  const tRange = (view && view.tRange) || { start: null, end: null };
+  const dur = (tRange.start != null && tRange.end != null) ? (tRange.end - tRange.start) : null;
+  const shownRecords = active
+    ? ((view ? view.serverSamples + view.clientSamples + view.drops.length : 0))
+    : result.records_count;
+  const dropCount = active && view ? view.drops.length : d.drop_count;
+
+  const add = (k, v, s, cls, small) => {
+    const c = el("div", "card" + (cls ? " " + cls : ""));
+    c.appendChild(el("div", "k", k));
+    c.appendChild(el("div", "v" + (small ? " sm" : ""), v));
+    if (s) c.appendChild(el("div", "s", s));
+    cardWrap.appendChild(c);
+  };
+
+  add("Записей", fmtInt(result.records_count),
+    active ? "в периоде: " + fmtInt(shownRecords) : null);
+  add(
+    "Период",
+    (tRange.start != null ? fmtIso(tRange.start) : "—"),
+    (tRange.end != null ? "→ " + fmtIso(tRange.end) : "нет данных") + (active ? " · фильтр" : ""),
+    null, true
+  );
+  add("Длительность", fmtDuration(dur), dur != null ? "секунд: " + fmtInt(dur) : null);
+  add("Игроков", fmtInt(players.length), players.length ? "ID: " + players.slice(0, 8).join(", ") + (players.length > 8 ? "…" : "") : "0 игроков", players.length ? null : "accent-warn");
+  add("Drop'ов", fmtInt(dropCount), active ? "из " + fmtInt(d.drop_count) + " всего" : null, (dropCount > 0 ? "accent-err" : "accent-ok"));
+  add("Hitch-строк", fmtInt(d.hitch_lines), null, (d.hitch_lines > 0 ? "accent-warn" : null));
+  add("Lag spikes", fmtInt(d.lag_spikes), null, (d.lag_spikes > 0 ? "accent-warn" : null));
+  return cardWrap;
+}
+
+/* buildGlobalClientPicker: the ONE global client selector. It lives in the sticky
+   «Период» panel so it stays visible while scrolling. One <optgroup> per player with a
+   «весь игрок (N сессий)» option plus one <option> per session; sessions with no player
+   group fall under «Прочие сессии». Sets state.selectedClient (defaulting to the first
+   player, else the first session) and keeps the dependent UI in sync on change. */
+function buildGlobalClientPicker(view) {
+  const picker = el("select");
+  picker.id = "clientPicker";
+  picker.appendChild(new Option("—", ""));
+  const players = (view && Array.isArray(view.players)) ? view.players : [];
+  const covered = {};
+  for (const p of players) {
+    const og = document.createElement("optgroup");
+    const auth = p.steamid64 || p.authid || p.player || "—";
+    og.label = (p.name || "без имени") + " (" + auth + ")";
+    og.appendChild(new Option("весь игрок (" + p.sessions.length + " сессий)", "player:" + p.player));
+    for (const s of p.sessions.slice().sort(byUserId)) {
+      covered[String(s.session)] = true;
+      og.appendChild(new Option(sessionOptionLabel(s), String(s.session)));
+    }
+    picker.appendChild(og);
+  }
+  // sessions with no player group (no identifying authid) as a fallback group
+  const rest = ((view && view.clients) || []).filter(c => !covered[String(c.session)]);
+  if (rest.length) {
+    const og = document.createElement("optgroup");
+    og.label = "Прочие сессии";
+    for (const c of rest.slice().sort(byUserId)) og.appendChild(new Option(sessionOptionLabel(c), String(c.session)));
+    picker.appendChild(og);
+  }
+
+  // validate the global selection; fall back to the first player, else the first session
+  const exists = (v) => {
+    if (v == null) return false;
+    const s = String(v);
+    if (s.indexOf("player:") === 0) return players.some(p => String(p.player) === s.slice(7));
+    return !!(view && view.clientSeries && view.clientSeries[s] != null);
+  };
+  let sel = state.selectedClient;
+  if (!exists(sel)) {
+    if (players.length) sel = "player:" + players[0].player;
+    else sel = (view && view.clients && view.clients.length) ? String(view.clients[0].session) : null;
+  }
+  state.selectedClient = sel;
+  if (sel != null) picker.value = String(sel);
+
+  picker.addEventListener("change", () => {
+    state.selectedClient = picker.value || null;
+    if (refreshAllPanelUI) refreshAllPanelUI();       // refresh chips + metric boxes + sync
+    const ah = $("#allChart");
+    if (ah) fillAllChart(ah, state.view || view);
+    const host = $("#clientCharts");
+    if (host) renderClientCharts(host, state.view || view, state.selectedClient);
+    markSessionChips();
+  });
+  return picker;
+}
+
+/* ----- period selector ----- */
+function buildPeriodPanel(result) {
+  const view = state.view || computeView(result);
+  const d = (result && result.digest) || {};
+  const p = d.period || {};
+  const controls = el("div", "controls");
+
+  const fromField = el("div", "field");
+  fromField.appendChild(el("label", null, "С (ISO или epoch)"));
+  const fromInput = el("input");
+  fromInput.type = "text"; fromInput.id = "periodFrom";
+  fromInput.placeholder = "2024-04-05 06:07:58 / 1712297278";
+  fromInput.value = state.period.from != null ? fmtIso(state.period.from) : "";
+  fromField.appendChild(fromInput);
+
+  const toField = el("div", "field");
+  toField.appendChild(el("label", null, "По (ISO или epoch)"));
+  const toInput = el("input");
+  toInput.type = "text"; toInput.id = "periodTo";
+  toInput.placeholder = "2024-04-05 06:08:58 / 1712297338";
+  toInput.value = state.period.to != null ? fmtIso(state.period.to) : "";
+  toField.appendChild(toInput);
+
+  controls.appendChild(fromField);
+  controls.appendChild(toField);
+
+  const applyBtn = el("button", "btn primary sm", "Применить");
+  applyBtn.type = "button";
+  const resetBtn = el("button", "btn ghost sm", "Сбросить");
+  resetBtn.type = "button";
+  applyBtn.addEventListener("click", () => applyPeriod(fromInput.value, toInput.value));
+  resetBtn.addEventListener("click", () => applyPeriodValues(null, null));
+  controls.appendChild(applyBtn);
+  controls.appendChild(resetBtn);
+  controls.appendChild(buildPeriodPresets(view));
+  controls.appendChild(buildPeriodFollow(view));
+
+  // the ONE global client selector, grouped with the timeline/presets and kept visible
+  const clientField = el("div", "field");
+  clientField.appendChild(el("label", null, "Клиент"));
+  clientField.appendChild(buildGlobalClientPicker(view));
+  controls.appendChild(clientField);
+
+  const frag = document.createDocumentFragment();
+
+  // draggable mini-timeline above the manual inputs
+  frag.appendChild(buildPeriodTimeline(view, {
+    onLive: (from, to) => { fromInput.value = fmtIso(from); toInput.value = fmtIso(to); },
+    onCommit: (from, to) => applyPeriodValues(from, to),
+  }));
+  frag.appendChild(controls);
+
+  const hint = el("div", "period-hint" + (state.period.from != null || state.period.to != null ? " active" : ""));
+  if (state.period.from != null || state.period.to != null) {
+    hint.textContent = "Активен фильтр по периоду: " +
+      (state.period.from != null ? fmtIso(state.period.from) : "начало") + " → " +
+      (state.period.to != null ? fmtIso(state.period.to) : "конец");
+  } else if (isNum(p.start) && isNum(p.end)) {
+    hint.textContent = "Полный диапазон данных: " + fmtIso(p.start) + " → " + fmtIso(p.end) +
+      "  ·  пустые поля = без фильтра";
+  } else {
+    hint.textContent = "Введите границы (ISO или epoch) и нажмите «Применить». Пустые поля = без фильтра.";
+  }
+  frag.appendChild(hint);
+
+  const panelEl = panel("Период", state.period.from != null || state.period.to != null ? "фильтр активен" : "полный диапазон", frag);
+  panelEl.classList.add("panel-sticky");
+  return panelEl;
+}
+
+/* buildPeriodPresets: quick period buttons next to the inputs (disabled when the log is shorter). */
+function buildPeriodPresets(view) {
+  const wrap = el("div", "period-presets");
+  wrap.appendChild(el("span", "period-presets-label", "Быстро:"));
+  const fr = (view && view.fullRange) || {};
+  const fullStart = isNum(fr.start) ? fr.start : null;
+  const fullEnd = isNum(fr.end) ? fr.end : null;
+  const dur = (fullStart != null && fullEnd != null) ? (fullEnd - fullStart) : null;
+  const defs = [
+    { label: "Весь лог", secs: null },
+    { label: "5 мин", secs: 300 },
+    { label: "30 мин", secs: 1800 },
+    { label: "1 ч", secs: 3600 },
+  ];
+  for (const def of defs) {
+    const b = el("button", "btn ghost sm", def.label);
+    b.type = "button";
+    let from = null, to = null, ok = true;
+    if (def.secs == null) {
+      if (dur == null || dur <= 0) ok = false;   // no data -> whole-log preset is a no-op
+    } else if (dur == null || dur < def.secs) {
+      ok = false;                                // log shorter than the preset window
+    } else {
+      from = fullEnd - def.secs; to = null;      // follow: the end rolls with new data
+    }
+    if (!ok) {
+      b.disabled = true;
+      b.title = "Лог короче, чем " + def.label;
+    } else {
+      b.addEventListener("click", () => applyPeriodValues(from, to));
+    }
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
+/* buildPeriodFollow: «Слежение» — pin the right edge to the newest sample.
+   No new state field: following == the period has NO upper bound (state.period.to == null). */
+function buildPeriodFollow(view) {
+  const fr = (view && view.fullRange) || {};
+  const fullStart = isNum(fr.start) ? fr.start : null;
+  const fullEnd = isNum(fr.end) ? fr.end : null;
+  const hasData = fullStart != null && fullEnd != null && fullEnd > fullStart;
+  const follow = !isNum(state.period.to);
+
+  const wrap = el("div", "period-follow");
+
+  const label = el("label", "period-follow-toggle");
+  const cb = el("input");
+  cb.type = "checkbox"; cb.id = "periodFollow";
+  cb.checked = follow && hasData;
+  cb.disabled = !hasData;
+  cb.title = "Держать правую границу на самом новом сэмпле — новые данные подхватываются при обновлении";
+  cb.addEventListener("change", () => {
+    if (cb.checked) applyPeriodValues(state.period.from, null);        // follow ON
+    else applyPeriodValues(state.period.from, fullEnd);                // freeze at the current end
+  });
+  label.appendChild(cb);
+  label.appendChild(el("span", null, "Слежение"));
+  wrap.appendChild(label);
+
+  const live = el("span", "period-live" + (follow && hasData ? " on" : ""));
+  live.title = "Правая граница следует за новыми данными";
+  live.appendChild(el("span", "live-dot"));
+  live.appendChild(el("span", null, "в реальном времени"));
+  wrap.appendChild(live);
+
+  return wrap;
+}
+
+/* buildPeriodTimeline: draggable brush spanning the FULL log range. */
+function buildPeriodTimeline(view, cb) {
+  cb = cb || {};
+  const wrap = el("div", "period-timeline");
+  const fr = (view && view.fullRange) || {};
+  const fullStart = isNum(fr.start) ? fr.start : null;
+  const fullEnd = isNum(fr.end) ? fr.end : null;
+  if (fullStart == null || fullEnd == null || fullEnd <= fullStart) {
+    wrap.appendChild(el("div", "period-timeline-empty", "Недостаточно данных для таймлайна периода"));
+    return wrap;
+  }
+
+  const ts = (view.result && view.result.series && view.result.series.t) || [];
+  let sample = 1;
+  if (ts.length > 1 && isNum(ts[0]) && isNum(ts[1]) && ts[1] > ts[0]) sample = ts[1] - ts[0];
+
+  const VW = 720, VH = 44, tx0 = 12, tx1 = VW - 12;
+  const span = fullEnd - fullStart;
+  const t2x = t => tx0 + ((t - fullStart) / span) * (tx1 - tx0);
+  const x2t = x => fullStart + ((x - tx0) / (tx1 - tx0)) * span;
+  const clampT = t => Math.max(fullStart, Math.min(fullEnd, t));
+  const follow = !isNum(state.period.to);   // no upper bound == tracking the newest sample
+
+  const svg = svgEl("svg", {
+    class: "period-brush", viewBox: "0 0 " + VW + " " + VH,
+    preserveAspectRatio: "none", "aria-label": "Выбор периода",
+  });
+  if (follow) svg.classList.add("follow");
+
+  // track, dimmed out-of-selection areas, highlighted selection
+  svg.appendChild(svgEl("rect", { class: "period-track", x: tx0, y: 14, width: tx1 - tx0, height: 16, rx: 4 }));
+  const dimL = svgEl("rect", { class: "period-dim", x: tx0, y: 14, width: 0, height: 16 });
+  const dimR = svgEl("rect", { class: "period-dim", x: tx0, y: 14, width: 0, height: 16 });
+  svg.appendChild(dimL); svg.appendChild(dimR);
+  const selRect = svgEl("rect", { class: "period-sel", x: tx0, y: 10, width: tx1 - tx0, height: 24, rx: 4 });
+  svg.appendChild(selRect);
+
+  function mkHandle(label) {
+    const g = svgEl("g", { class: "period-brush-handle", tabindex: "0", role: "slider",
+      "aria-label": label, "aria-orientation": "horizontal" });
+    g.appendChild(svgEl("rect", { class: "handle-hit", x: -12, y: 4, width: 24, height: 36, rx: 4 }));
+    g.appendChild(svgEl("rect", { class: "handle-bar", x: -2.5, y: 6, width: 5, height: 32, rx: 2.5 }));
+    g.appendChild(svgEl("line", { class: "handle-grip", x1: -0.5, y1: 15, x2: -0.5, y2: 29 }));
+    g.appendChild(svgEl("line", { class: "handle-grip", x1: 0.5, y1: 15, x2: 0.5, y2: 29 }));
+    return g;
+  }
+  const hLeft = mkHandle("Начало периода");
+  const hRight = mkHandle("Конец периода");
+  hRight.classList.add("end");
+  svg.appendChild(hLeft); svg.appendChild(hRight);
+  // live-end dot drawn on top of the right handle while following
+  const endDot = svgEl("circle", { class: "period-end-dot", cx: 0, cy: 8, r: 3.2 });
+  svg.appendChild(endDot);
+
+  const labelEl = el("div", "period-timeline-label");
+  wrap.appendChild(svg);
+  wrap.appendChild(labelEl);
+
+  let curFrom = isNum(state.period.from) ? clampT(state.period.from) : fullStart;
+  let curTo = isNum(state.period.to) ? clampT(state.period.to) : fullEnd;
+  if (curTo < curFrom) { const tmp = curFrom; curFrom = curTo; curTo = tmp; }
+
+  function redraw() {
+    const xf = t2x(curFrom), xt = t2x(curTo);
+    dimL.setAttribute("width", Math.max(0, xf - tx0));
+    dimR.setAttribute("x", xt);
+    dimR.setAttribute("width", Math.max(0, tx1 - xt));
+    selRect.setAttribute("x", xf);
+    selRect.setAttribute("width", Math.max(0.5, xt - xf));
+    hLeft.setAttribute("transform", "translate(" + xf + ",0)");
+    hRight.setAttribute("transform", "translate(" + xt + ",0)");
+    endDot.setAttribute("transform", "translate(" + xt + ",0)");
+    labelEl.textContent = fmtIso(curFrom) + " — " + fmtIso(curTo);
+  }
+  function setSel(from, to, live) {
+    curFrom = clampT(from); curTo = clampT(to);
+    if (curFrom > curTo) { const tmp = curFrom; curFrom = curTo; curTo = tmp; }
+    redraw();
+    if (live && cb.onLive) cb.onLive(curFrom, curTo);
+  }
+  // atEnd: commit came from the right handle (drag/keyboard) -> snap the end back to follow.
+  function commit(atEnd) {
+    let from = curFrom, to = curTo;
+    if (atEnd && fullEnd != null) {
+      const snap = Math.max(1.5 * sample, 0.02 * (fullEnd - fullStart));
+      if (to >= fullEnd - snap) to = null;   // near the end -> no upper bound (follow ON)
+    }
+    if (cb.onCommit) cb.onCommit(from, to);
+  }
+
+  function pointerTime(ev) {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return fullStart;
+    const vx = ((ev.clientX - rect.left) / rect.width) * VW;
+    return clampT(x2t(vx));
+  }
+
+  let dragging = null;
+  function begin(ev, mode) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    dragging = { mode: mode, id: ev.pointerId };
+    if (mode === "move") dragging.offset = pointerTime(ev) - curFrom;
+    try { svg.setPointerCapture(ev.pointerId); } catch (e) { /* capture unsupported */ }
+  }
+  hLeft.addEventListener("pointerdown", e => begin(e, "from"));
+  hRight.addEventListener("pointerdown", e => begin(e, "to"));
+  selRect.addEventListener("pointerdown", e => begin(e, "move"));
+  svg.addEventListener("pointermove", ev => {
+    if (!dragging || ev.pointerId !== dragging.id) return;
+    ev.preventDefault();
+    const t = pointerTime(ev);
+    if (dragging.mode === "from") setSel(Math.min(t, curTo - sample), curTo, true);
+    else if (dragging.mode === "to") setSel(curFrom, Math.max(t, curFrom + sample), true);
+    else {
+      const s = curTo - curFrom;
+      let f = t - dragging.offset;
+      f = Math.max(fullStart, Math.min(fullEnd - s, f));
+      setSel(f, f + s, true);
+    }
+  });
+  function finish(ev) {
+    if (!dragging || (ev && ev.pointerId !== dragging.id)) return;
+    const mode = dragging.mode;
+    dragging = null;
+    try { svg.releasePointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    commit(mode === "to");
+  }
+  svg.addEventListener("pointerup", finish);
+  svg.addEventListener("pointercancel", finish);
+
+  function keyNudge(which, dir) {
+    if (which === "from") setSel(Math.min(curFrom + dir * sample, curTo - sample), curTo, true);
+    else setSel(curFrom, Math.max(curTo + dir * sample, curFrom + sample), true);
+  }
+  function onKey(which) {
+    return (e) => {
+      if (e.key === "ArrowLeft") { e.preventDefault(); keyNudge(which, -1); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); keyNudge(which, 1); }
+      else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); commit(which === "to"); }
+    };
+  }
+  function onKeyUp(which) {
+    return (e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") commit(which === "to"); };
+  }
+  hLeft.addEventListener("keydown", onKey("from"));
+  hRight.addEventListener("keydown", onKey("to"));
+  hLeft.addEventListener("keyup", onKeyUp("from"));
+  hRight.addEventListener("keyup", onKeyUp("to"));
+
+  redraw();
+  return wrap;
+}
+
+function applyPeriod(fromStr, toStr) {
+  const from = parseTimeInput(fromStr);
+  const to = parseTimeInput(toStr);
+  if (Number.isNaN(from) || Number.isNaN(to)) {
+    toast("Некорректная дата/время. Используйте ISO или epoch (секунды).", "error");
+    return;
+  }
+  if (from != null && to != null && from > to) {
+    toast("«С» позже, чем «По» — границы перепутаны.", "error");
+    return;
+  }
+  applyPeriodValues(from, to);
+}
+
+/* applyPeriodValues: the single funnel used by «Применить», the presets and the brush. */
+function applyPeriodValues(from, to) {
+  state.period = { from: from, to: to };
+  render(state.result);
+}
+
+/* ----- anomalies counter line ----- */
+function buildInfoLine(result) {
+  const line = el("div", "info-line");
+  const n = Array.isArray(result.anomalies) ? result.anomalies.length : 0;
+  const m = Array.isArray(result.anomalies_excluded) ? result.anomalies_excluded.length : 0;
+  line.appendChild(el("span", "pill", "Аномалии: " + fmtInt(n) + "; исключено событиями: " + fmtInt(m)));
+  const end = logEndText(result.log_end);
+  if (end) {
+    const tag = el("span", "badge " + end.cls, "завершение: " + end.label);
+    line.appendChild(tag);
+  }
+  return line;
+}
+function logEndText(v) {
+  if (v === "graceful") return { label: "graceful", cls: "bad-ok" };
+  if (v === "crash") return { label: "краш", cls: "bad-err" };
+  if (v === "unknown") return { label: "неизвестно", cls: "bad-mut" };
+  return null;
+}
+
+/* ----- events legend + toggle (shared by chart panels) ----- */
+function applyShowEvents() {
+  $$("input[data-events-toggle]").forEach(cb => { cb.checked = state.showEvents; });
+  const sh = $("#serverCharts");
+  if (sh && state.view) fillCharts(sh, state.view.series, state.view.events);
+  const ch = $("#clientCharts");
+  if (ch && state.view) renderClientCharts(ch, state.view, state.selectedClient);
+  refreshDropsChart();
+  const ah = $("#allChart");
+  if (ah && state.view) fillAllChart(ah, state.view);
+}
+
+function buildEventTools() {
+  const wrap = el("div", "head-tools");
+  const label = el("label", "evt-toggle");
+  const cb = el("input");
+  cb.type = "checkbox"; cb.checked = state.showEvents; cb.id = "chkEvents";
+  cb.setAttribute("data-events-toggle", "");
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode(" показывать события"));
+  cb.addEventListener("change", () => {
+    state.showEvents = cb.checked;
+    applyShowEvents();
+  });
+  wrap.appendChild(label);
+
+  const legend = el("div", "band-legend");
+  ["mapchange", "shutdown", "crash", "warmup"].forEach(kind => {
+    const it = el("span", "legend-item");
+    const sw = el("i", "swatch");
+    sw.style.background = BAND_COLORS[kind];
+    it.appendChild(sw);
+    it.appendChild(document.createTextNode(BAND_LABELS[kind]));
+    legend.appendChild(it);
+  });
+  wrap.appendChild(legend);
+  return wrap;
+}
+
+
+/* ----- counts by type ----- */
+function buildTypes(counts) {
+  const wrap = el("div", "bars");
+  const entries = Object.keys(counts || {})
+    .map(k => [k, counts[k]])
+    .filter(e => isNum(e[1]) && e[1] > 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (!entries.length) {
+    wrap.appendChild(el("div", "empty", "нет записей"));
+    return wrap;
+  }
+  const max = Math.max.apply(null, entries.map(e => e[1]));
+  for (const [name, cnt] of entries) {
+    const row = el("div", "bar-row");
+    row.appendChild(el("div", "bar-label", name));
+    const track = el("div", "bar-track");
+    const fill = el("div", "bar-fill");
+    fill.style.width = Math.max(2, (cnt / max) * 100) + "%";
+    track.appendChild(fill);
+    row.appendChild(track);
+    row.appendChild(el("div", "bar-val", fmtInt(cnt)));
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+/* ----- anomalies ----- */
+function buildAnomalies(list) {
+  const wrap = el("div", "anoms");
+  if (!Array.isArray(list) || !list.length) {
+    wrap.appendChild(el("div", "empty", "не обнаружено"));
+    return wrap;
+  }
+  for (const text of list) {
+    const a = el("div", "anom");
+    a.appendChild(svgEl("svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" }));
+    const svg = a.firstChild;
+    const p1 = svgEl("path", { d: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" });
+    const p2 = svgEl("path", { d: "M12 9v4" });
+    const p3 = svgEl("path", { d: "M12 17h.01" });
+    svg.appendChild(p1); svg.appendChild(p2); svg.appendChild(p3);
+    a.appendChild(el("div", null, String(text)));
+    wrap.appendChild(a);
+  }
+  return wrap;
+}
+
+/* ----- focus events (result.focus_points; kind-tagged, extensible) ----- */
+const FOCUS_KIND_LABELS = { idle_hang: "зависание клиента" };
+function focusKindLabel(kind) {
+  const k = kind == null ? "" : String(kind);
+  return FOCUS_KIND_LABELS[k] || (k || "событие");
+}
+function focusOnPoint(fp) {
+  if (!fp) return;
+  if (fp.player) state.selectedClient = "player:" + fp.player;
+  else if (fp.session != null) state.selectedClient = String(fp.session);
+  else state.selectedClient = null;
+  state.period = {
+    from: isNum(fp.start_t) ? fp.start_t - 10 : null,
+    to: isNum(fp.end_t) ? fp.end_t + 10 : null,
+  };
+  render(state.result);
+  const panelEl = $("#allDatasetsPanel");
+  if (panelEl) {
+    if (panelEl.scrollIntoView) panelEl.scrollIntoView({ behavior: "smooth", block: "start" });
+    panelEl.classList.add("flash");
+    setTimeout(() => panelEl.classList.remove("flash"), 1600);
+  }
+}
+function buildFocusPanel(view, result) {
+  const fps = Array.isArray(result && result.focus_points) ? result.focus_points : [];
+  const wrap = el("div");
+  if (!fps.length) {
+    wrap.appendChild(el("div", "empty", "событий нет"));
+    return panel("События", "0", wrap);
+  }
+  const tableWrap = el("div", "table-wrap");
+  const table = el("table");
+  const thead = el("thead");
+  const hr = el("tr");
+  [["тип", null], ["игрок", null], ["SteamID", "mono"], ["интервал", "mono"],
+   ["длит.", "num"], ["peak idle", "num"], ["дроп", null], ["", null]]
+    .forEach(([label, cls]) => hr.appendChild(el("th", cls, label)));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tb = el("tbody");
+  for (const fp of fps) {
+    const tr = el("tr");
+    tr.appendChild(el("td", null, focusKindLabel(fp.kind)));
+    tr.appendChild(el("td", null, fp.name ? String(fp.name) : (fp.player ? String(fp.player) : "—")));
+    tr.appendChild(el("td", "mono", fp.steamid64 || fp.player || "—"));
+    tr.appendChild(el("td", "mono focus-ivl",
+      (isNum(fp.start_t) ? fmtIso(fp.start_t) : "—") + " → " + (isNum(fp.end_t) ? fmtIso(fp.end_t) : "—")));
+    tr.appendChild(el("td", "num", fmtDuration(fp.duration_s)));
+    tr.appendChild(el("td", "num", isNum(fp.peak_idle_ms) ? fmtFloat(fp.peak_idle_ms / 1000, 1) + " с" : "—"));
+    const tdDrop = el("td");
+    if (fp.drop_after === true) tdDrop.appendChild(el("span", "tag crash", "дроп"));
+    else tdDrop.textContent = "—";
+    tr.appendChild(tdDrop);
+    const tdAct = el("td");
+    const b = el("button", "btn sm", "фокус");
+    b.type = "button";
+    b.title = "Показать период вокруг события и выбрать игрока";
+    b.addEventListener("click", () => focusOnPoint(fp));
+    tdAct.appendChild(b);
+    tr.appendChild(tdAct);
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  tableWrap.appendChild(table);
+  wrap.appendChild(tableWrap);
+  return panel("События", fmtInt(fps.length), wrap);
+}
+
+/* ----- drops filtering (shared by the table and the time chart) ----- */
+function dropsMatch(r, reason, q) {
+  if (reason && r.reason !== reason) return false;
+  if (!q) return true;
+  const hay = [r.reason, r.category, r.observed_via, r.id, r.gen, r.session,
+    r.userid, r.name, r.authid, r.steamid64, r.ip, r.slot]
+    .map(v => v == null ? "" : String(v)).join(" ").toLowerCase();
+  return hay.indexOf(q) !== -1;
+}
+function filteredDrops(drops) {
+  const reason = state.dropReason;
+  const q = (state.dropSearch || "").trim().toLowerCase();
+  return (Array.isArray(drops) ? drops : [])
+    .filter(r => dropsMatch(r, reason, q))
+    .sort((a, b) => {
+      const ta = isNum(a.t) ? a.t : Infinity;
+      const tb = isNum(b.t) ? b.t : Infinity;
+      return ta - tb;
+    });
+}
+function dropReasons(drops) {
+  return Array.from(new Set((Array.isArray(drops) ? drops : []).map(r => r.reason).filter(Boolean))).sort();
+}
+function buildReasonSelect(id, drops) {
+  const sel = el("select");
+  sel.id = id;
+  sel.setAttribute("data-drop-reason", "");
+  sel.appendChild(new Option("все причины", ""));
+  const reasons = dropReasons(drops);
+  for (const r of reasons) sel.appendChild(new Option(r, r));
+  // keep a persisted reason filter when the current (period-filtered) rows have no match:
+  // re-add the chosen reason as an option instead of discarding the user's filter
+  if (state.dropReason && reasons.indexOf(state.dropReason) === -1) {
+    sel.appendChild(new Option(state.dropReason, state.dropReason));
+  }
+  sel.value = state.dropReason;
+  sel.addEventListener("change", () => onDropReasonChange(sel));
+  return sel;
+}
+function onDropReasonChange(source) {
+  state.dropReason = source.value;
+  state.page.drops = 1;
+  $$("select[data-drop-reason]").forEach(sel => { if (sel !== source) sel.value = state.dropReason; });
+  refreshDropViews();
+}
+function onDropSearchChange(source) {
+  state.dropSearch = source.value;
+  state.page.drops = 1;
+  refreshDropViews();
+}
+function refreshDropViews() {
+  const tableHost = $("#dropTableHost");
+  const pagerHost = $("#dropPagerHost");
+  if (tableHost && state.view) fillDropTable(tableHost, pagerHost, state.view.drops);
+  refreshDropsChart();
+}
+
+/* ----- pagination (shared by the clients and drops tables) ----- */
+function makePaginator(rows, key, onChange) {
+  const list = Array.isArray(rows) ? rows : [];
+  const total = list.length;
+  let size = state.pageSize[key];
+  if (size == null) size = 25;
+  if (size < 0) size = 0;
+  const pageCount = size > 0 ? Math.max(1, Math.ceil(total / size)) : 1;
+  let page = state.page[key] || 1;
+  if (page < 1) page = 1;
+  if (page > pageCount) page = pageCount;
+  state.page[key] = page;
+  const start = size > 0 ? (page - 1) * size : 0;
+  const end = size > 0 ? Math.min(total, start + size) : total;
+  const slice = list.slice(start, end);
+
+  const wrap = el("div", "pager");
+  const sizeLabel = el("label", "pager-size");
+  sizeLabel.appendChild(document.createTextNode("на странице"));
+  const sel = el("select");
+  [["25", 25], ["50", 50], ["100", 100], ["все", 0]].forEach(([text, val]) => {
+    const o = new Option(text, String(val));
+    if (val === size) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", () => {
+    state.pageSize[key] = parseInt(sel.value, 10) || 0;
+    state.page[key] = 1;
+    onChange();
+  });
+  sizeLabel.appendChild(sel);
+  wrap.appendChild(sizeLabel);
+
+  const prev = el("button", "btn sm ghost", "‹");
+  prev.type = "button";
+  prev.title = "Предыдущая страница";
+  prev.disabled = page <= 1;
+  prev.addEventListener("click", () => { state.page[key] = page - 1; onChange(); });
+  wrap.appendChild(prev);
+
+  const label = el("span", "pager-label",
+    "показано " + (total ? start + 1 : 0) + "–" + end + " из " + total + " · стр. " + page + "/" + pageCount);
+  wrap.appendChild(label);
+
+  const next = el("button", "btn sm ghost", "›");
+  next.type = "button";
+  next.title = "Следующая страница";
+  next.disabled = page >= pageCount;
+  next.addEventListener("click", () => { state.page[key] = page + 1; onChange(); });
+  wrap.appendChild(next);
+
+  return { wrap, slice };
+}
+
+/* ----- drops table host + pager (re-renderable on filter / page change) ----- */
+function fillDropTable(tableHost, pagerHost, rows) {
+  if (!tableHost) return;
+  const pg = makePaginator(filteredDrops(rows), "drops", () => fillDropTable(tableHost, pagerHost, rows));
+  tableHost.textContent = "";
+  tableHost.appendChild(buildDropsTable(pg.slice));
+  if (pagerHost) {
+    pagerHost.textContent = "";
+    pagerHost.appendChild(pg.wrap);
+  }
+}
+
+/* ----- drops table (with controls) ----- */
+function buildDropsPanel(drops) {
+  const frag = document.createDocumentFragment();
+  const rows = Array.isArray(drops) ? drops : [];
+
+  // controls
+  const controls = el("div", "controls");
+  const reasonField = el("div", "field");
+  reasonField.appendChild(el("label", null, "Причина"));
+  reasonField.appendChild(buildReasonSelect("dropReasonFilter", rows));
+
+  const searchField = el("div", "field");
+  searchField.appendChild(el("label", null, "Поиск"));
+  const search = el("input");
+  search.type = "search";
+  search.placeholder = "reason / category / id…";
+  search.id = "dropSearch";
+  search.value = state.dropSearch || "";
+  search.addEventListener("input", () => onDropSearchChange(search));
+  searchField.appendChild(search);
+
+  controls.appendChild(reasonField);
+  controls.appendChild(searchField);
+  const spacer = el("div", "head-spacer");
+  spacer.style.flex = "1";
+  controls.appendChild(spacer);
+  const dl = el("button", "btn sm", "Скачать CSV");
+  dl.type = "button";
+  dl.addEventListener("click", () => downloadCsv("drop"));
+  controls.appendChild(dl);
+  frag.appendChild(controls);
+
+  const tableHost = el("div");
+  tableHost.id = "dropTableHost";
+  frag.appendChild(tableHost);
+
+  const pagerHost = el("div");
+  pagerHost.id = "dropPagerHost";
+  frag.appendChild(pagerHost);
+
+  fillDropTable(tableHost, pagerHost, rows);
+
+  return frag;
+}
+function buildDropsTable(rows) {
+  if (!rows.length) {
+    const e = el("div", "empty", "нет данных");
+    return e;
+  }
+  const wrap = el("div", "table-wrap");
+  const table = el("table");
+  const thead = el("thead");
+  const hr = el("tr");
+  [["Время", "mono"], ["ID", "mono"], ["ник", null], ["SteamID", "mono"],
+   ["IP", "mono"], ["слот", "num"], ["reason", null], ["category", null],
+   ["простой", "num"], ["был в игре", null],
+   ["crash", null], ["observed_via", "mono"], ["gen", "mono"], ["" , null]]
+    .forEach(([label, cls]) => {
+      const th = el("th", cls, label);
+      hr.appendChild(th);
+    });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tb = el("tbody");
+  for (const r of rows) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "mono", fmtIso(r.t)));
+    tr.appendChild(el("td", "mono", r.id == null ? "—" : String(r.id)));
+    tr.appendChild(el("td", null, r.name ? String(r.name) : "—"));
+    const sid = r.steamid64 || r.authid || "";
+    tr.appendChild(el("td", "mono", sid || "—"));
+    const ipTxt = r.ip ? (r.ip + (r.port != null ? ":" + r.port : "")) : "—";
+    tr.appendChild(el("td", "mono", ipTxt));
+    tr.appendChild(el("td", "num", r.slot == null ? "—" : String(r.slot)));
+    tr.appendChild(el("td", null, r.reason == null ? "—" : String(r.reason)));
+    const tdCat = el("td");
+    const cat = r.category == null ? "" : String(r.category);
+    const tag = el("span", "tag" + (cat ? " cat-" + cat.replace(/[^a-z0-9_-]/gi, "") : ""), cat || "—");
+    tdCat.appendChild(tag);
+    tr.appendChild(tdCat);
+    const idleMs = r.netchan && isNum(r.netchan.idle_ms) ? r.netchan.idle_ms : null;
+    tr.appendChild(el("td", "num", idleMs == null ? "—" : fmtFloat(idleMs / 1000, 1) + " с"));
+    tr.appendChild(el("td", null, fmtBool(r.client && r.client.fully_connected)));
+    const tdCrash = el("td");
+    if (r.crash === true) tdCrash.appendChild(el("span", "tag crash", "да"));
+    else tdCrash.textContent = fmtBool(r.crash);
+    tr.appendChild(tdCrash);
+    tr.appendChild(el("td", "mono", r.observed_via == null ? "—" : String(r.observed_via)));
+    tr.appendChild(el("td", "mono", r.gen == null ? "—" : String(r.gen)));
+    const tdAct = el("td");
+    const go = el("button", "btn sm ghost", "→ клиент");
+    go.type = "button";
+    go.disabled = !r.session;
+    go.addEventListener("click", (e) => { e.stopPropagation(); selectClient(r.session, tr); });
+    tdAct.appendChild(go);
+    tr.appendChild(tdAct);
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+/* ----- drops over time (count bars; shares the drops filter) ----- */
+const DROP_BUCKET_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400, 172800];
+function niceBucketStep(span) {
+  const target = Math.max(1, span / 40);
+  for (const s of DROP_BUCKET_STEPS) if (s >= target) return s;
+  return DROP_BUCKET_STEPS[DROP_BUCKET_STEPS.length - 1];
+}
+function buildDropBins(drops, lo, hi) {
+  if (!drops.length || !isNum(lo) || !isNum(hi) || hi <= lo) return null;
+  const step = niceBucketStep(hi - lo);
+  const n = Math.max(1, Math.min(240, Math.ceil((hi - lo) / step)));
+  const counts = new Array(n).fill(0);
+  const centers = new Array(n);
+  for (let i = 0; i < n; i++) centers[i] = lo + (i + 0.5) * step;
+  for (const d of drops) {
+    if (!isNum(d.t)) continue;
+    let i = Math.floor((d.t - lo) / step);
+    if (i < 0) i = 0; else if (i >= n) i = n - 1;
+    counts[i]++;
+  }
+  return { step: step, lo: lo, centers: centers, counts: counts };
+}
+function buildDropsChart(view) {
+  const drops = filteredDrops(view && view.drops);
+  if (!drops.length) return el("div", "empty", "нет отключений");
+  const tRange = (view && view.tRange) || {};
+  let lo = tRange.start, hi = tRange.end;
+  if (!isNum(lo) || !isNum(hi) || hi <= lo) {
+    const r = rangeOf(drops.map(d => d.t));
+    lo = r.start; hi = r.end;
+  }
+  const bin = buildDropBins(drops, lo, hi);
+  if (!bin || !bin.counts.some(c => c > 0)) return el("div", "empty", "нет отключений");
+  const spec = {
+    title: "Отключения по времени", unit: "шт", fmt: v => fmtInt(v),
+    zeroBase: true, bars: true, bucketStep: bin.step,
+    lines: [{ name: "drops", color: COLORS.max, values: bin.counts }],
+  };
+  return buildChart(bin.centers, spec, { events: (view && view.events) || [], showEvents: state.showEvents });
+}
+function fillDropsChart(host, view) {
+  if (!host) return;
+  host.textContent = "";
+  host.appendChild(buildDropsChart(view));
+}
+function refreshDropsChart() {
+  const host = $("#dropsChart");
+  if (host && state.view) fillDropsChart(host, state.view);
+}
+function buildDropsChartPanel(view) {
+  const host = el("div");
+  host.id = "dropsChart";
+  fillDropsChart(host, view);
+  const field = el("div", "field");
+  field.appendChild(el("label", null, "Причина"));
+  field.appendChild(buildReasonSelect("dropReasonCompact", view.drops));
+  const tools = el("div", "head-tools");
+  tools.appendChild(field);
+  return panel("Отключения по времени", fmtInt(filteredDrops(view.drops).length) + " шт.", host, tools);
+}
+
+/* ----- clients table ----- */
+/* display ordering: numeric userid ascending (missing last), then run, slot, session. */
+function byUserId(a, b) {
+  const ua = isNum(a && a.userid) ? a.userid : Infinity;
+  const ub = isNum(b && b.userid) ? b.userid : Infinity;
+  if (ua !== ub) return ua - ub;
+  const ra = isNum(a && a.run) ? a.run : Infinity;
+  const rb = isNum(b && b.run) ? b.run : Infinity;
+  if (ra !== rb) return ra - rb;
+  const sa = isNum(a && a.slot) ? a.slot : Infinity;
+  const sb = isNum(b && b.slot) ? b.slot : Infinity;
+  if (sa !== sb) return sa - sb;
+  return String(a && a.session).localeCompare(String(b && b.session));
+}
+function buildClientsTable(clients) {
+  const rows = Array.isArray(clients) ? clients.slice() : [];
+  rows.sort(byUserId);
+  if (!rows.length) {
+    return el("div", "empty", "нет данных");
+  }
+  const wrap = el("div", "table-wrap");
+  const table = el("table");
+  const cols = [
+    ["слот", "num"], ["id", "num"], ["userid", "num"], ["ник", null],
+    ["SteamID", "mono"], ["IP:порт", "mono"], ["ping avg", "num"],
+    ["ping max", "num"], ["loss avg", "num"], ["loss max", "num"],
+    ["choke avg", "num"], ["choke max", "num"], ["fill max", "num"],
+    ["samples", "num"], ["длит.", "num"], ["флаги", null],
+  ];
+  const thead = el("thead");
+  const hr = el("tr");
+  cols.forEach(([label, cls]) => hr.appendChild(el("th", cls, label)));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tb = el("tbody");
+  for (const c of rows) {
+    const tr = el("tr", "clickable");
+    tr.title = "Показать графики клиента";
+    tr.appendChild(el("td", "num", c.slot == null ? "—" : String(c.slot)));
+    tr.appendChild(el("td", "num mono", c.id == null ? "—" : String(c.id)));
+    tr.appendChild(el("td", "num mono", c.userid == null ? "—" : String(c.userid)));
+    tr.appendChild(el("td", null, c.name ? String(c.name) : "—"));
+    const sid = c.steamid64 || c.authid || "";
+    const tdSid = el("td", "mono");
+    tdSid.appendChild(document.createTextNode(sid || "—"));
+    if (isNum(c.linkCount) && c.linkCount > 1) {
+      const marker = el("span", "tag", "сессий: " + c.linkCount);
+      marker.style.marginLeft = "6px";
+      if (c.player) marker.title = "Тот же игрок в нескольких запусках: " + c.player;
+      tdSid.appendChild(marker);
+    }
+    tr.appendChild(tdSid);
+    const ipTxt = c.ip ? (c.ip + (c.port != null ? ":" + c.port : "")) : "—";
+    tr.appendChild(el("td", "mono", ipTxt));
+    [["ping_avg"], ["ping_max"], ["loss_avg"], ["loss_max"], ["choke_avg"], ["choke_max"], ["rel_fill_max"]]
+      .forEach(([f]) => tr.appendChild(el("td", "num", fmtFloat(c[f], 2))));
+    tr.appendChild(el("td", "num mono", fmtInt(c.samples)));
+    tr.appendChild(el("td", "num", fmtDuration(c.conn_s)));
+    const tdFlags = el("td");
+    const flags = el("span", "flags");
+    if (c.fake) flags.appendChild(el("span", "tag", "bot"));
+    if (c.proxy) flags.appendChild(el("span", "tag", "proxy"));
+    if (!flags.children.length) flags.textContent = "—";
+    tdFlags.appendChild(flags);
+    tr.appendChild(tdFlags);
+    tr.addEventListener("click", () => selectClient(c.session, tr));
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function buildClientsPanel(view) {
+  const frag = document.createDocumentFragment();
+  const tableHost = el("div");
+  tableHost.id = "clientTableHost";
+  const pagerHost = el("div");
+  pagerHost.id = "clientPagerHost";
+  frag.appendChild(tableHost);
+  frag.appendChild(pagerHost);
+
+  const renderTable = () => {
+    const rows = Array.isArray(view.clients) ? view.clients : [];
+    const pg = makePaginator(rows, "clients", renderTable);
+    tableHost.textContent = "";
+    tableHost.appendChild(buildClientsTable(pg.slice));
+    pagerHost.textContent = "";
+    pagerHost.appendChild(pg.wrap);
+  };
+  renderTable();
+
+  return panel("Клиенты", (Array.isArray(view.clients) ? view.clients.length : 0) + " шт.", frag);
+}
+
+/* ----- charts panel / per-client picker ----- */
+function buildChartsPanel(view) {
+  const wrap = el("div", "charts");
+  wrap.id = "serverCharts";
+  fillCharts(wrap, view.series, view.events);
+  return panel("Динамика по времени", null, wrap, buildEventTools());
+}
+
+/* player-level labels (player = merged identity across sessions) */
+function playerLabel(p) {
+  const auth = p.steamid64 || p.authid || "—";
+  const n = Array.isArray(p.sessions) ? p.sessions.length : 0;
+  return (p.name || "без имени") + " (" + auth + ") · сессий: " + n;
+}
+/* compact chip label: #slot name · uid N · запуск R */
+function sessionChipLabel(s) {
+  const slot = s.slot == null ? "?" : s.slot;
+  const name = s.name || "без имени";
+  const uid = s.userid == null ? "—" : s.userid;
+  let label = "#" + slot + " " + name + " · uid " + uid;
+  if (isNum(s.run)) label += " · запуск " + (s.run + 1);
+  return label;
+}
+/* compact <option> label: #slot uid N · запуск R (grouped under the player) */
+function sessionOptionLabel(s) {
+  const slot = s.slot == null ? "?" : s.slot;
+  const uid = s.userid == null ? "—" : s.userid;
+  let label = "#" + slot + " · uid " + uid;
+  if (isNum(s.run)) label += " · запуск " + (s.run + 1);
+  return label;
+}
+/* reflect the current state.selectedClient on the rendered session chips */
+function markSessionChips() {
+  $$("#playerSessions .session-chip").forEach(b => {
+    b.classList.toggle("active", b.dataset.session != null && String(state.selectedClient) === String(b.dataset.session));
+  });
+}
+
+function buildPerClientPanel(view) {
+  const host = el("div");
+  host.id = "clientCharts";
+  renderClientCharts(host, view, state.selectedClient);
+
+  const p = panel("Клиент: графики", view.clients.length + " клиент(ов)", host);
+  p.id = "perClientPanel";
+  return p;
+}
+
+function selectClient(target, highlightEl) {
+  if (target == null) return;
+  const view = state.view;
+  const tid = String(target);
+  const isPlayer = tid.indexOf("player:") === 0;
+  let ok = false;
+  if (isPlayer) {
+    const key = tid.slice(7);
+    ok = !!(view && Array.isArray(view.players) && view.players.some(p => String(p.player) === key));
+  } else {
+    ok = !!(view && view.clientSeries && view.clientSeries[tid] != null);
+  }
+  if (!ok) {
+    toast("Нет данных " + (isPlayer ? "игрока " : "сессии ") + tid, "error");
+    return;
+  }
+  state.selectedClient = tid;
+  syncClientPickers();
+  if (refreshAllPanelUI) refreshAllPanelUI();        // refresh combined chips + metric boxes
+  const host = $("#clientCharts");
+  if (host) renderClientCharts(host, view, tid);
+  const ah = $("#allChart");
+  if (ah) fillAllChart(ah, view);
+  markSessionChips();
+  const section = $("#perClientPanel");
+  if (section && section.scrollIntoView) section.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (highlightEl) {
+    $$(".row-active").forEach(n => n.classList.remove("row-active"));
+    highlightEl.classList.add("row-active");
+  }
+}
+
+function setLogEndBadge(v) {
+  const b = $("#logEndBadge");
+  if (!b) return;
+  const t = logEndText(v);
+  if (!t) { b.hidden = true; return; }
+  b.hidden = false;
+  b.className = "badge " + t.cls;
+  b.textContent = "завершение: " + t.label;
+}
+
+/* =====================================================================
+   Charts — plain SVG
+   ===================================================================== */
+const CH_W = 820, CH_H = 240;
+const CH_M = { l: 58, r: 16, t: 16, b: 30 };
+const PLOT_W = CH_W - CH_M.l - CH_M.r;
+const PLOT_H = CH_H - CH_M.t - CH_M.b;
+
+const COLORS = {
+  min: "#60a5fa", avg: "#fbbf24", max: "#f87171",
+  fps: "#4ea1ff", cpu: "#fbbf24", rss: "#f472b6",
+  players: "#4ea1ff", real: "#34d399",
+  inK: "#34d399", outK: "#c084fc",
+  ping: "#4ea1ff", loss: "#f87171", choke: "#fbbf24",
+  fill: "#c084fc", dseq: "#34d399", dloss: "#f472b6",
+  edicts: "#fb923c", idle: "#94a3b8",
+  trafficIn: "#22d3ee", trafficOut: "#fb923c",
+};
+
+/* combined "all datasets" chart: one distinct color + unit + formatter per key */
+const ALL_COLORS = {
+  fps: "#4ea1ff", frame_ms_min: "#22d3ee", frame_ms_avg: "#fbbf24",
+  frame_ms_max: "#f87171", cpu_pct: "#f472b6", rss_kb: "#c084fc",
+  players: "#34d399", real_players: "#a3e635", edicts: "#fb923c",
+  in_kbps: "#2dd4bf", out_kbps: "#e879f9",
+};
+const ALL_DATASETS = [
+  { key: "fps", label: "FPS", unit: "", dec: 1 },
+  { key: "frame_ms_min", label: "кадр min", unit: "мс", dec: 1 },
+  { key: "frame_ms_avg", label: "кадр avg", unit: "мс", dec: 1 },
+  { key: "frame_ms_max", label: "кадр max", unit: "мс", dec: 1 },
+  { key: "cpu_pct", label: "CPU", unit: "%", dec: 1 },
+  { key: "rss_kb", label: "RSS", unit: "МБ", dec: 0, values: s => (s.rss_kb || []).map(v => isNum(v) ? v / 1024 : null) },
+  { key: "players", label: "игроки", unit: "", dec: 0 },
+  { key: "real_players", label: "реальные игроки", unit: "", dec: 0 },
+  { key: "edicts", label: "edicts", unit: "", dec: 0 },
+  { key: "in_kbps", label: "трафик in", unit: "KB/s", dec: 0 },
+  { key: "out_kbps", label: "трафик out", unit: "KB/s", dec: 0 },
+];
+for (const d of ALL_DATASETS) {
+  d.color = ALL_COLORS[d.key];
+  if (!d.values) d.values = s => s[d.key];
+}
+const ALL_DATASET_KEYS = ALL_DATASETS.map(d => d.key);
+
+/* player (client) metric catalogue for the combined-chart overlay */
+const PLAYER_METRICS = [
+  { key: "ping", label: "ping", unit: "мс", dec: 1, color: COLORS.ping },
+  { key: "loss", label: "loss", unit: "%", dec: 1, color: COLORS.loss },
+  { key: "choke", label: "choke", unit: "%", dec: 1, color: COLORS.choke },
+  { key: "rel_fill", label: "fill", unit: "%", dec: 1, color: COLORS.fill },
+  { key: "idle_ms", label: "idle", unit: "мс", dec: 0, color: COLORS.idle },
+  { key: "delta_seq", label: "Δseq", unit: "", dec: 0, color: COLORS.dseq },
+  { key: "dloss", label: "Δloss", unit: "", dec: 0, color: COLORS.dloss },
+  { key: "flow_in_kbps", label: "трафик in", unit: "KB/s", dec: 0, color: COLORS.trafficIn },
+  { key: "flow_out_kbps", label: "трафик out", unit: "KB/s", dec: 0, color: COLORS.trafficOut },
+];
+
+/* short Russian one-line note per metric key (tooltips + the «Справка» list).
+   covers every ALL_DATASETS key AND every PLAYER_METRICS key. */
+const METRIC_NOTES = {
+  fps: "Кадров сервера в секунду",
+  frame_ms_min: "Время кадра сервера: минимум, мс",
+  frame_ms_avg: "Время кадра сервера: среднее, мс",
+  frame_ms_max: "Время кадра сервера: максимум, мс",
+  cpu_pct: "Загрузка CPU процесса сервера, %",
+  rss_kb: "Память процесса (МБ)",
+  players: "Подключено игроков (всего)",
+  real_players: "Реальных игроков (без ботов/прокси)",
+  edicts: "Число сущностей (edicts)",
+  in_kbps: "Входящий трафик сервера (KB/s)",
+  out_kbps: "Исходящий трафик сервера (KB/s)",
+  ping: "Задержка клиента, мс",
+  loss: "Потери пакетов у клиента, %",
+  choke: "Choke — пакеты, не отправленные из-за лимита rate, %",
+  rel_fill: "Заполнение reliable-канала клиента, %",
+  idle_ms: "Простой клиента: мс с последнего пакета (растёт → зависание/сеть)",
+  delta_seq: "Пропуск sequence-номеров (потери/джиттер)",
+  dloss: "Прирост loss с прошлого сэмпла",
+  flow_in_kbps: "Трафик клиента входящий (KB/s)",
+  flow_out_kbps: "Трафик клиента исходящий (KB/s)",
+};
+function playerMetricDef(key) {
+  for (const m of PLAYER_METRICS) if (m.key === key) return m;
+  return null;
+}
+/* client metrics actually present (numeric) in one session's parallel series */
+function availablePlayerMetrics(cs) {
+  if (!cs) return [];
+  return PLAYER_METRICS.filter(m => anyNum(cs[m.key]));
+}
+
+/* exclusion-window band colors (kind -> fill) */
+const BAND_COLORS = {
+  mapchange: "#fbbf24",   // amber
+  shutdown:  "#f87171",   // red
+  crash:     "#b91c1c",   // dark red
+  warmup:    "#6b7d92",   // gray
+};
+const BAND_LABELS = {
+  mapchange: "смена карты", shutdown: "выключение",
+  crash: "краш", warmup: "прогрев",
+};
+
+function buildCharts(series, opts) {
+  opts = opts || {};
+  const events = opts.events || (state.view && state.view.events) || [];
+  const showEvents = opts.showEvents != null ? opts.showEvents : state.showEvents;
+  const wrap = el("div", "charts");
+  if (!series || !Array.isArray(series.t) || !series.t.length) {
+    wrap.appendChild(el("div", "empty", "нет серверных сэмплов"));
+    return wrap;
+  }
+  const specs = [
+    { title: "FPS", unit: "", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "FPS", color: COLORS.fps, values: series.fps }] },
+    { title: "Кадр, мс", unit: "frame_ms", fmt: v => fmtFloat(v, 1),
+      lines: [
+        { name: "min", color: COLORS.min, values: series.frame_ms_min },
+        { name: "avg", color: COLORS.avg, values: series.frame_ms_avg },
+        { name: "max", color: COLORS.max, values: series.frame_ms_max },
+      ] },
+    { title: "CPU", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "CPU %", color: COLORS.cpu, values: series.cpu_pct }] },
+    { title: "RSS", unit: "МБ", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [{ name: "RSS, МБ", color: COLORS.rss, values: (series.rss_kb || []).map(v => isNum(v) ? v / 1024 : null) }] },
+    { title: "Игроки", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [
+        { name: "players", color: COLORS.players, values: series.players },
+        { name: "real", color: COLORS.real, values: series.real_players },
+      ] },
+    { title: "Трафик", unit: "KB/s", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [
+        { name: "in", color: COLORS.inK, values: series.in_kbps },
+        { name: "out", color: COLORS.outK, values: series.out_kbps },
+      ] },
+  ];
+  for (const spec of specs) {
+    if (!spec.lines.some(l => Array.isArray(l.values) && l.values.some(isNum))) continue;
+    wrap.appendChild(buildChart(series.t, spec, { events: events, showEvents: showEvents }));
+  }
+  if (!wrap.children.length) wrap.appendChild(el("div", "empty", "нет данных для графиков"));
+  return wrap;
+}
+
+/* fillCharts: (re)build the server charts into an existing .charts host. */
+function fillCharts(host, series, events) {
+  host.textContent = "";
+  const built = buildCharts(series, { events: events, showEvents: state.showEvents });
+  while (built.firstChild) host.appendChild(built.firstChild);
+}
+
+/* client-chart specs from one client's parallel series */
+function buildClientCharts(cs, opts) {
+  const wrap = el("div", "charts");
+  if (!cs || !Array.isArray(cs.t) || !cs.t.length) {
+    wrap.appendChild(el("div", "empty", "нет данных клиента за выбранный период"));
+    return wrap;
+  }
+  const specs = [
+    { title: "Ping", unit: "мс", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "ping", color: COLORS.ping, values: cs.ping }] },
+    { title: "Loss", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "loss", color: COLORS.loss, values: cs.loss }] },
+    { title: "Choke", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "choke", color: COLORS.choke, values: cs.choke }] },
+    { title: "Reliable fill", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
+      lines: [{ name: "rel_fill", color: COLORS.fill, values: cs.rel_fill }] },
+  ];
+  if (anyNum(cs.idle_ms)) specs.push(
+    { title: "Простой, мс", unit: "мс", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [{ name: "idle_ms", color: COLORS.idle, values: cs.idle_ms }] });
+  if (anyNum(cs.delta_seq)) specs.push(
+    { title: "Δ sequence", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [{ name: "delta_seq", color: COLORS.dseq, values: cs.delta_seq }] });
+  if (anyNum(cs.dloss)) specs.push(
+    { title: "Δ loss", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [{ name: "dloss", color: COLORS.dloss, values: cs.dloss }] });
+  if (anyNum(cs.flow_in_kbps) || anyNum(cs.flow_out_kbps)) specs.push(
+    { title: "Трафик, KB/s", unit: "KB/s", fmt: v => fmtFloat(v, 0), zeroBase: true,
+      lines: [
+        { name: "in", color: COLORS.inK, values: cs.flow_in_kbps },
+        { name: "out", color: COLORS.outK, values: cs.flow_out_kbps },
+      ] });
+
+  for (const spec of specs) {
+    if (!spec.lines.some(l => Array.isArray(l.values) && l.values.some(isNum))) continue;
+    wrap.appendChild(buildChart(cs.t, spec, opts));
+  }
+  if (!wrap.children.length) wrap.appendChild(el("div", "empty", "нет данных клиента за выбранный период"));
+  return wrap;
+}
+
+function renderClientCharts(host, view, id) {
+  host.textContent = "";
+  if (id == null) { host.appendChild(el("div", "empty", "клиент не выбран")); return; }
+  const sid = String(id);
+  let cs = null;
+  if (sid.indexOf("player:") === 0) {
+    const key = sid.slice(7);
+    const p = (view && Array.isArray(view.players)) ? view.players.find(pp => String(pp.player) === key) : null;
+    cs = p ? p.series : null;
+  } else {
+    cs = (view && view.clientSeries) ? view.clientSeries[sid] : null;
+  }
+  const built = buildClientCharts(cs, { events: (view && view.events) || [], showEvents: state.showEvents });
+  while (built.firstChild) host.appendChild(built.firstChild);
+}
+
+/* ----- combined chart: overlay a toggleable subset of server datasets ----- */
+/* step-resample a client series onto the server time axis (last sample <= t).
+   Past the client's LAST sample the result is null (no step-hold tail), so a
+   disconnected player's line stops instead of drawing a flat static line. */
+function alignToServerTime(clientT, values, t) {
+  const n = Array.isArray(t) ? t.length : 0;
+  const out = new Array(n).fill(null);
+  if (!Array.isArray(clientT) || !clientT.length || !Array.isArray(values)) return out;
+  let lastT = null;
+  for (let k = clientT.length - 1; k >= 0; k--) {
+    if (isNum(clientT[k])) { lastT = clientT[k]; break; }
+  }
+  if (lastT == null) return out;
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    const ts = t[i];
+    if (!isNum(ts)) continue;
+    if (ts > lastT) continue;   // beyond the client's last sample -> line stops
+    while (j < clientT.length) {
+      const ct = clientT[j];
+      if (isNum(ct) && ct > ts) break;
+      j++;
+    }
+    if (j > 0) out[i] = values[j - 1];
+  }
+  return out;
+}
+
+/* resolve the ONE global selection (state.selectedClient) to a player object.
+   "player:<key>" -> that player; a session key -> the player owning that session. */
+function selectedPlayer(view) {
+  view = view || state.view;
+  if (!view || !Array.isArray(view.players)) return null;
+  if (state.selectedClient == null) return null;
+  const sid = String(state.selectedClient);
+  if (sid.indexOf("player:") === 0) {
+    const key = sid.slice(7);
+    return view.players.find(p => String(p.player) === key) || null;
+  }
+  return view.players.find(p => (Array.isArray(p.sessions) ? p.sessions : []).some(s => String(s.session) === sid)) || null;
+}
+
+/* keep the ONE global #clientPicker reflecting state.selectedClient. */
+function syncClientPickers() {
+  const cp = $("#clientPicker");
+  if (cp) cp.value = state.selectedClient != null ? String(state.selectedClient) : "";
+}
+
+function buildAllChart(view) {
+  view = view || state.view;
+  const series = (view && view.series) || {};
+  const t = Array.isArray(series.t) ? series.t : [];
+  const chosen = ALL_DATASETS.filter(d => state.allSeries.indexOf(d.key) !== -1);
+  if (!chosen.length) return el("div", "empty", "выберите хотя бы один датасет");
+  const lines = [];
+  for (const d of chosen) {
+    const values = d.values(series);
+    if (!Array.isArray(values) || !values.some(isNum)) continue;
+    lines.push({ name: d.label, color: d.color, values: values, fmt: v => fmtFloat(v, d.dec), unit: d.unit });
+  }
+  /* overlay the globally-selected player's chosen client metrics, resampled to server time */
+  const pl = selectedPlayer(view);
+  const cs = pl ? pl.series : null;
+  const mkeys = state.playerMetrics;
+  if (cs && mkeys.length) {
+    const pname = (pl && pl.name) || String(pl.player);
+    for (const key of mkeys) {
+      const m = playerMetricDef(key);
+      if (!m || !anyNum(cs[key])) continue;
+      lines.push({ name: pname + " " + m.label, color: m.color,
+        values: alignToServerTime(cs.t, cs[key], t),
+        fmt: v => fmtFloat(v, m.dec), unit: m.unit });
+    }
+  }
+  if (!t.length || !lines.length) return el("div", "empty", "нет данных");
+  const normalize = state.allNormalize;
+  const spec = {
+    title: "Все датасеты",
+    unit: normalize ? "относительно (0–100%)" : "сырые значения",
+    fmt: normalize ? (v => fmtInt(v * 100)) : (v => fmtFloat(v, 1)),
+    zeroBase: !normalize,
+    lines: lines,
+  };
+  return buildChart(t, spec, { events: (view && view.events) || [], showEvents: state.showEvents, normalize: normalize });
+}
+function fillAllChart(host, view) {
+  if (!host) return;
+  host.textContent = "";
+  host.appendChild(buildAllChart(view));
+}
+function buildAllPanel(view) {
+  const host = el("div");
+  host.id = "allChart";
+
+  /* players (by SteamID) + validate the ONE global selection before the first paint */
+  const players = (view && Array.isArray(view.players)) ? view.players : [];
+  const playerByKey = {};
+  for (const p of players) playerByKey[String(p.player)] = p;
+
+  if (state.selectedClient != null) {
+    const sid = String(state.selectedClient);
+    const ok = (sid.indexOf("player:") === 0)
+      ? !!playerByKey[sid.slice(7)]
+      : !!(view && view.clientSeries && view.clientSeries[sid] != null);
+    if (!ok) state.selectedClient = null;   // gone after re-analyze / refresh
+  }
+  if (state.selectedClient == null) {
+    if (players.length) state.selectedClient = "player:" + players[0].player;
+    else if (view && view.clients && view.clients.length) state.selectedClient = String(view.clients[0].session);
+  }
+
+  fillAllChart(host, view);
+
+  /* ---- server dataset toggles (title = metric note) ---- */
+  const legend = el("div", "ds-legend");
+  for (const d of ALL_DATASETS) {
+    const lab = el("label", "evt-toggle");
+    if (METRIC_NOTES[d.key]) lab.title = METRIC_NOTES[d.key];
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.checked = state.allSeries.indexOf(d.key) !== -1;
+    cb.addEventListener("change", () => {
+      const i = state.allSeries.indexOf(d.key);
+      if (cb.checked && i === -1) state.allSeries.push(d.key);
+      else if (!cb.checked && i !== -1) state.allSeries.splice(i, 1);
+      datasetsSave();
+      fillAllChart(host, state.view);
+    });
+    const sw = el("i", "swatch");
+    sw.style.background = d.color;
+    if (METRIC_NOTES[d.key]) sw.title = METRIC_NOTES[d.key];
+    lab.appendChild(cb);
+    lab.appendChild(sw);
+    lab.appendChild(document.createTextNode(" " + d.label));
+    legend.appendChild(lab);
+  }
+
+  const tools = el("div", "head-tools");
+  tools.appendChild(legend);
+
+  /* ---- the ONE global client selector lives in the sticky «Период» panel
+     (buildGlobalClientPicker); here we keep only the selected player's session chips ---- */
+  /* sessions of the selected player: one chip per session -> drill into it */
+  const sWrap = el("div", "player-sessions");
+  sWrap.id = "playerSessions";
+  function renderPlayerSessions() {
+    sWrap.textContent = "";
+    const p = selectedPlayer(state.view || view);
+    if (!p || !p.sessions.length) { sWrap.hidden = true; return; }
+    sWrap.hidden = false;
+    sWrap.appendChild(el("span", "player-sessions-label", "Сессии:"));
+    for (const s of p.sessions.slice().sort(byUserId)) {
+      const btn = el("button", "session-chip", sessionChipLabel(s));
+      btn.type = "button";
+      btn.dataset.session = String(s.session);
+      btn.title = (isNum(s.first_t) ? fmtIso(s.first_t) : "—") + " → " + (isNum(s.last_t) ? fmtIso(s.last_t) : "—");
+      btn.addEventListener("click", () => selectClient(s.session, btn));
+      sWrap.appendChild(btn);
+    }
+    markSessionChips();
+  }
+  tools.appendChild(sWrap);
+
+  /* ---- per-metric checkboxes for the selected player (PER-PLAYER set, title = note) ---- */
+  const pmWrap = el("div", "ds-legend");
+  pmWrap.id = "playerMetrics";
+  function renderPlayerMetrics() {
+    pmWrap.textContent = "";
+    const p = selectedPlayer(state.view || view);
+    if (!p) {
+      pmWrap.appendChild(el("span", "hint", "выберите игрока"));
+      return;
+    }
+    const c = p.series;
+    for (const m of PLAYER_METRICS) {
+      if (!c || !anyNum(c[m.key])) continue;
+      const lab = el("label", "evt-toggle");
+      if (METRIC_NOTES[m.key]) lab.title = METRIC_NOTES[m.key];
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = state.playerMetrics.indexOf(m.key) !== -1;
+      cb.addEventListener("change", () => {
+        const arr = state.playerMetrics;
+        const i = arr.indexOf(m.key);
+        if (cb.checked && i === -1) arr.push(m.key);
+        else if (!cb.checked && i !== -1) arr.splice(i, 1);
+        datasetsSave();
+        fillAllChart(host, state.view);
+      });
+      const sw = el("i", "swatch");
+      sw.style.background = m.color;
+      if (METRIC_NOTES[m.key]) sw.title = METRIC_NOTES[m.key];
+      lab.appendChild(cb);
+      lab.appendChild(sw);
+      lab.appendChild(document.createTextNode(" " + m.label));
+      pmWrap.appendChild(lab);
+    }
+  }
+  renderPlayerMetrics();
+  renderPlayerSessions();
+  tools.appendChild(pmWrap);
+
+  /* let drop rows / the global client picker refresh chips + metric boxes in place */
+  refreshAllPanelUI = () => {
+    renderPlayerMetrics();
+    renderPlayerSessions();
+    syncClientPickers();
+  };
+
+  const nLabel = el("label", "evt-toggle");
+  nLabel.title = "Нормировать каждый ряд к 0–100%, чтобы сравнить форму кривых";
+  const nCb = el("input");
+  nCb.type = "checkbox"; nCb.checked = state.allNormalize;
+  nCb.addEventListener("change", () => { state.allNormalize = nCb.checked; datasetsSave(); fillAllChart(host, state.view); });
+  nLabel.appendChild(nCb);
+  nLabel.appendChild(document.createTextNode(" нормализовать"));
+  tools.appendChild(nLabel);
+
+  const eLabel = el("label", "evt-toggle");
+  eLabel.title = "Рисовать полосы событий (смена карты, выключение, краш, прогрев)";
+  const eCb = el("input");
+  eCb.type = "checkbox"; eCb.checked = state.showEvents;
+  eCb.setAttribute("data-events-toggle", "");
+  eCb.addEventListener("change", () => { state.showEvents = eCb.checked; datasetsSave(); applyShowEvents(); });
+  eLabel.appendChild(eCb);
+  eLabel.appendChild(document.createTextNode(" показывать события"));
+  tools.appendChild(eLabel);
+
+  /* ---- «Справка»: compact metric -> note list (persisted open/closed) ---- */
+  const helpWrap = el("div", "metric-help");
+  helpWrap.hidden = !state.datasetsHelpOpen;
+  const helpList = el("div", "metric-help-list");
+  for (const d of ALL_DATASETS.concat(PLAYER_METRICS)) {
+    if (!METRIC_NOTES[d.key]) continue;
+    const row = el("div", "metric-help-row");
+    row.appendChild(el("span", "metric-help-key", d.label));
+    row.appendChild(el("span", "metric-help-note", METRIC_NOTES[d.key]));
+    helpList.appendChild(row);
+  }
+  helpWrap.appendChild(helpList);
+
+  const helpBtn = el("button", "btn sm ghost", "Справка");
+  helpBtn.type = "button";
+  helpBtn.title = "Показать примечания ко всем метрикам";
+  helpBtn.setAttribute("aria-expanded", state.datasetsHelpOpen ? "true" : "false");
+  helpBtn.addEventListener("click", () => {
+    state.datasetsHelpOpen = !state.datasetsHelpOpen;
+    helpWrap.hidden = !state.datasetsHelpOpen;
+    helpBtn.setAttribute("aria-expanded", state.datasetsHelpOpen ? "true" : "false");
+    datasetsSave();
+  });
+  tools.appendChild(helpBtn);
+
+  const bodyWrap = el("div");
+  bodyWrap.appendChild(host);
+  bodyWrap.appendChild(helpWrap);
+
+  const p = panel("Все датасеты", null, bodyWrap, tools);
+  p.id = "allDatasetsPanel";
+  return p;
+}
+
+function lineFmtValue(l, spec, v) {
+  const f = l.fmt || spec.fmt;
+  const u = l.unit != null ? l.unit : spec.unit;
+  const s = f(v);
+  return u ? s + " " + u : s;
+}
+
+function buildChart(t, spec, opts) {
+  opts = opts || {};
+  const events = Array.isArray(opts.events) ? opts.events : [];
+  const showEvents = opts.showEvents !== false;
+  const normalize = !!opts.normalize;
+  const bars = !!spec.bars;
+  const card = el("div", "chart");
+
+  /* head + legend */
+  const head = el("div", "chart-head");
+  const title = el("div", "chart-title");
+  title.appendChild(document.createTextNode(spec.title));
+  if (spec.unit) { const u = el("span", "unit", "  ·  " + spec.unit); title.appendChild(u); }
+  head.appendChild(title);
+  const legend = el("div", "legend");
+  for (const l of spec.lines) {
+    const it = el("span", "legend-item");
+    const sw = el("i", "swatch");
+    sw.style.background = l.color;
+    it.appendChild(sw);
+    it.appendChild(document.createTextNode(l.name));
+    legend.appendChild(it);
+  }
+  head.appendChild(legend);
+  card.appendChild(head);
+
+  const plot = el("div", "chart-plot");
+  card.appendChild(plot);
+
+  const n = t.length;
+  const svg = svgEl("svg", { viewBox: "0 0 " + CH_W + " " + CH_H, class: "chart-svg", role: "img", "aria-label": spec.title });
+  plot.appendChild(svg);
+
+  /* per-line plotted values (normalized independently; raw kept for the tooltip) */
+  const plotVals = spec.lines.map(l => {
+    const raw = l.values || [];
+    if (!normalize) return raw;
+    let mn = Infinity, mx = -Infinity;
+    for (const v of raw) if (isNum(v)) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (!isFinite(mn)) return raw.map(() => null);
+    if (mx === mn) return raw.map(v => isNum(v) ? 0.5 : null);
+    return raw.map(v => isNum(v) ? (v - mn) / (mx - mn) : null);
+  });
+
+  /* y range (from plotted values) */
+  let ymin = Infinity, ymax = -Infinity;
+  for (const vals of plotVals) {
+    for (const v of vals) { if (isNum(v)) { if (v < ymin) ymin = v; if (v > ymax) ymax = v; } }
+  }
+  if (!isFinite(ymin)) { ymin = 0; ymax = 1; }
+  if (normalize) { ymin = 0; ymax = 1; }
+  else if (bars) {
+    let mc = 0;
+    for (const vals of plotVals) for (const v of vals) if (isNum(v) && v > mc) mc = v;
+    ymin = 0; ymax = Math.max(1, Math.ceil(mc));
+  }
+  else if (ymin === ymax) { const p = Math.abs(ymin) * 0.1 || 1; ymin -= p; ymax += p; }
+  else { const p = (ymax - ymin) * 0.08; ymin -= p; ymax += p; }
+  if (spec.zeroBase && ymin > 0) ymin = 0;
+
+  const t0 = t[0], t1 = t[n - 1];
+  const sx = tt => (t1 > t0) ? (CH_M.l + ((tt - t0) / (t1 - t0)) * PLOT_W) : (CH_M.l + PLOT_W / 2);
+  const sy = v => CH_M.t + (1 - (v - ymin) / (ymax - ymin)) * PLOT_H;
+
+  /* event bands (behind grid + lines) */
+  if (showEvents && events.length) {
+    const bands = svgEl("g", { class: "event-bands" });
+    const lo = Math.min(t0, t1), hi = Math.max(t0, t1);
+    for (const w of events) {
+      if (!isNum(w.start) || !isNum(w.end)) continue;
+      const s = Math.max(w.start, lo), e = Math.min(w.end, hi);
+      if (e <= s) continue;
+      const x1 = sx(s), x2 = sx(e);
+      bands.appendChild(svgEl("rect", {
+        x: x1, y: CH_M.t, width: Math.max(0.5, x2 - x1), height: PLOT_H,
+        fill: BAND_COLORS[w.kind] || BAND_COLORS.warmup, "fill-opacity": "0.16",
+      }));
+    }
+    svg.appendChild(bands);
+  }
+
+  /* grid + y labels */
+  const grid = svgEl("g", { class: "grid" });
+  const TICKS = bars ? (ymax <= 6 ? Math.max(1, Math.round(ymax)) : 4) : 4;
+  for (let i = 0; i <= TICKS; i++) {
+    const val = ymin + (ymax - ymin) * (i / TICKS);
+    const y = sy(val);
+    const ln = svgEl("line", { x1: CH_M.l, y1: y, x2: CH_M.l + PLOT_W, y2: y });
+    if (i === 0) ln.setAttribute("class", "base");
+    grid.appendChild(ln);
+    const tx = svgEl("text", { x: CH_M.l - 9, y: y + 3.5, "text-anchor": "end" });
+    tx.textContent = spec.fmt(val);
+    grid.appendChild(tx);
+  }
+  svg.appendChild(grid);
+
+  /* x axis labels */
+  const axis = svgEl("g", { class: "axis" });
+  const xLabels = [
+    { x: CH_M.l, anchor: "start", txt: fmtClock(t0) },
+    { x: CH_M.l + PLOT_W / 2, anchor: "middle", txt: fmtClock((t0 + t1) / 2) },
+    { x: CH_M.l + PLOT_W, anchor: "end", txt: fmtClock(t1) },
+  ];
+  for (const xl of xLabels) {
+    const tx = svgEl("text", { x: xl.x, y: CH_H - 10, "text-anchor": xl.anchor });
+    tx.textContent = xl.txt;
+    axis.appendChild(tx);
+  }
+  svg.appendChild(axis);
+
+  /* x pixel coords */
+  const xs = new Array(n);
+  for (let i = 0; i < n; i++) xs[i] = sx(t[i]);
+
+  if (bars) {
+    /* count bars: width derived from the bucket spacing */
+    const spacing = (n > 1 && t1 > t0) ? ((t[1] - t[0]) / (t1 - t0)) * PLOT_W : PLOT_W;
+    const barW = Math.max(1.5, Math.min(spacing * 0.8, 46));
+    const barsG = svgEl("g", { class: "bars" });
+    const vals = plotVals[0] || [];
+    const baseY = sy(ymin);
+    for (let i = 0; i < n; i++) {
+      const v = vals[i];
+      if (!isNum(v) || v <= 0) continue;
+      const y = sy(v);
+      let bx = xs[i] - barW / 2;
+      if (bx < CH_M.l) bx = CH_M.l;
+      if (bx + barW > CH_M.l + PLOT_W) bx = CH_M.l + PLOT_W - barW;
+      barsG.appendChild(svgEl("rect", {
+        x: bx, y: y, width: barW, height: Math.max(0.5, baseY - y),
+        fill: spec.lines[0].color, rx: 1.5,
+      }));
+    }
+    svg.appendChild(barsG);
+  } else {
+    /* line paths (null breaks the line) */
+    const linesG = svgEl("g");
+    for (let li = 0; li < spec.lines.length; li++) {
+      const vals = plotVals[li] || [];
+      let d = "", pen = false;
+      for (let i = 0; i < n; i++) {
+        const v = vals[i];
+        if (!isNum(v)) { pen = false; continue; }
+        const x = xs[i], y = sy(v);
+        if (!pen) { d += "M" + x.toFixed(1) + " " + y.toFixed(1) + " "; pen = true; }
+        else { d += "L" + x.toFixed(1) + " " + y.toFixed(1) + " "; }
+      }
+      linesG.appendChild(svgEl("path", { class: "spark", d: d, stroke: spec.lines[li].color }));
+    }
+    svg.appendChild(linesG);
+  }
+
+  /* hover layer */
+  const hoverLine = svgEl("line", { class: "hover-line", x1: 0, y1: CH_M.t, x2: 0, y2: CH_M.t + PLOT_H });
+  svg.appendChild(hoverLine);
+  const dots = spec.lines.map(l => {
+    const c = svgEl("circle", { class: "hover-dot", r: 3.4, fill: l.color });
+    svg.appendChild(c);
+    return c;
+  });
+  const tip = el("div", "chart-tip");
+  card.appendChild(tip);
+
+  /* nearest index by time */
+  function nearestIndex(viewX) {
+    if (viewX <= CH_M.l) return 0;
+    if (viewX >= CH_M.l + PLOT_W) return n - 1;
+    const target = t0 + ((viewX - CH_M.l) / PLOT_W) * (t1 - t0);
+    let lo = 0, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (t[mid] < target) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(t[lo - 1] - target) <= Math.abs(t[lo] - target)) return lo - 1;
+    return lo;
+  }
+
+  function hideHover() {
+    hoverLine.style.opacity = "0";
+    dots.forEach(d => { d.style.opacity = "0"; });
+    tip.style.opacity = "0";
+  }
+
+  plot.addEventListener("mousemove", (ev) => {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
+    const frac = (ev.clientX - rect.left) / rect.width;
+    const viewX = frac * CH_W;
+    const idx = nearestIndex(viewX);
+    const x = xs[idx];
+
+    hoverLine.setAttribute("x1", x);
+    hoverLine.setAttribute("x2", x);
+    hoverLine.style.opacity = "0.7";
+
+    let linesHtml = "";
+    spec.lines.forEach((l, li) => {
+      const raw = (l.values || [])[idx];
+      const pv = (plotVals[li] || [])[idx];
+      const dot = dots[li];
+      if (isNum(raw) && isNum(pv)) {
+        dot.setAttribute("cx", x);
+        dot.setAttribute("cy", sy(pv));
+        dot.style.opacity = "1";
+        linesHtml += "<div class='tt-row'><i class='swatch' style='background:" + l.color + "'></i><span class='tt-name'>" + l.name + "</span><span class='tt-val'>" + lineFmtValue(l, spec, raw) + "</span></div>";
+      } else {
+        dot.style.opacity = "0";
+      }
+    });
+
+    let timeTxt = fmtIso(t[idx]);
+    if (bars) {
+      const bstep = isNum(spec.bucketStep) ? spec.bucketStep : (n > 1 ? (t[1] - t[0]) : 0);
+      timeTxt = fmtIso(t[idx] - bstep / 2) + " — " + fmtClock(t[idx] + bstep / 2);
+    }
+    tip.innerHTML = "<div class='tt-time'>" + timeTxt + "</div>" + linesHtml;
+    tip.style.opacity = "1";
+    // Clamp against the CARD (the tooltip's offset parent), using the measured width
+    // so a wide tooltip never overflows the card nor spawns a horizontal scrollbar.
+    const cardRect = card.getBoundingClientRect();
+    const tipW = tip.offsetWidth;
+    const pad = 6;
+    const min = tipW / 2 + pad;
+    const max = Math.max(min, cardRect.width - tipW / 2 - pad);
+    const left = (max <= min)
+      ? cardRect.width / 2
+      : Math.max(min, Math.min(max, ev.clientX - cardRect.left));
+    tip.style.left = left + "px";
+  });
+  plot.addEventListener("mouseleave", hideHover);
+
+  return card;
+}
+
+/* =====================================================================
+   Top-level render
+   ===================================================================== */
+/* syncTopbarHeight: keep --topbar-h in step with the topbar's measured height
+   (it can wrap / change with badges) so sticky panels sit flush beneath it. */
+function syncTopbarHeight() {
+  const tb = $(".topbar");
+  if (tb) document.documentElement.style.setProperty("--topbar-h", tb.offsetHeight + "px");
+}
+
+function render(result) {
+  if (!result) return;
+  // Capture keyboard focus before tearing the DOM down, restore it afterwards.
+  const focusId = document.activeElement && document.activeElement.id;
+  state.result = result;
+  const view = computeView(result);
+  state.view = view;
+  const results = $("#results");
+  results.hidden = false;
+  results.textContent = "";
+
+  const digest = result.digest || {};
+
+  setLogEndBadge(result.log_end);
+
+  // 1. summary (period-aware)
+  results.appendChild(buildSummary(result, view));
+
+  // 2. period selector
+  results.appendChild(buildPeriodPanel(result));
+
+  // 3. anomalies counter + log-end line
+  results.appendChild(buildInfoLine(result));
+
+  // 4. combined "all datasets" overlay chart — FIRST data panel
+  results.appendChild(buildAllPanel(view));
+
+  // 5. focus events (result.focus_points) — right after the combined panel
+  results.appendChild(buildFocusPanel(view, result));
+
+  // 6. counts by type
+  results.appendChild(panel("Записи по типам", String(digest.records != null ? digest.records : (result.records_count || 0)) + " всего", buildTypes(digest.counts_by_type)));
+
+  // 7. server charts (with event bands)
+  results.appendChild(buildChartsPanel(view));
+
+  // 8. per-client charts + picker
+  results.appendChild(buildPerClientPanel(view));
+
+  // 9. clients table (identity + period aggregates)
+  results.appendChild(buildClientsPanel(view));
+
+  // 10. drops over time (count bars) + drops table
+  results.appendChild(buildDropsChartPanel(view));
+  results.appendChild(panel("Отключения (drops)", fmtInt(view.drops.length) + " шт.", buildDropsPanel(view.drops)));
+
+  // 11. anomalies
+  results.appendChild(panel("Аномалии", null, buildAnomalies(result.anomalies)));
+
+  setModeBadge(!!state.demo);
+  setExportEnabled(!state.demo && !!state.body);
+  $("#btnClear").hidden = false;
+  syncTopbarHeight();
+
+  // Restore keyboard focus to the previously focused control (if it survived the rebuild).
+  if (focusId) {
+    const again = document.getElementById(focusId);
+    if (again) { try { again.focus(); } catch (e) { /* element may be gone */ } }
+  }
+}
+
+function panel(titleText, pillText, bodyEl, headExtra) {
+  const p = el("section", "panel");
+  const key = "p:" + titleText;
+  let collapsed = !!state.collapsed[key];
+  if (collapsed) p.classList.add("collapsed");
+
+  const head = el("div", "panel-head");
+
+  // clickable title control (chevron + h2 + count-pill); toggles the body only
+  const toggle = el("div", "panel-toggle");
+  toggle.setAttribute("role", "button");
+  toggle.tabIndex = 0;
+  toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  const chev = el("span", "chevron", collapsed ? "▸" : "▾");
+  const h2 = el("h2", null, titleText);
+  toggle.appendChild(chev);
+  toggle.appendChild(h2);
+  if (pillText) toggle.appendChild(el("span", "count-pill", pillText));
+  const toggleBody = () => {
+    collapsed = !collapsed;
+    p.classList.toggle("collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    chev.textContent = collapsed ? "▸" : "▾";
+    state.collapsed[key] = collapsed;   // persists across re-renders
+    collapsedSave();                    // persists across page reloads
+  };
+  toggle.addEventListener("click", toggleBody);
+  toggle.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleBody(); }
+  });
+  head.appendChild(toggle);
+
+  if (headExtra) {
+    if (Array.isArray(headExtra)) headExtra.forEach(n => { if (n) head.appendChild(n); });
+    else head.appendChild(headExtra);
+  }
+  p.appendChild(head);
+  const body = el("div", "panel-body");
+  body.appendChild(bodyEl);
+  p.appendChild(body);
+  return p;
+}
+
+/* =====================================================================
+   Demo dataset — rendered through the exact same path.
+   ===================================================================== */
+function makeDemo() {
+  const N = 60, t0 = 1712345678, dt = 1.0;
+  const N1 = 30, t1 = t0 + (N - 1) * dt + 5;
+  const run0End = t0 + (N - 1) * dt;
+  const run1End = t1 + (N1 - 1) * dt;
+  const t = [], frameMin = [], frameAvg = [], frameMax = [];
+  const fps = [], cpu = [], rss = [], players = [], real = [], edicts = [], inK = [], outK = [];
+  for (let i = 0; i < N; i++) {
+    const s = Math.sin(i / 6);
+    const s2 = Math.sin(i / 3 + 1);
+    t.push(t0 + i * dt);
+    const base = 3.0 + 0.6 * s2;
+    frameMin.push(+Math.max(1, base - 0.8).toFixed(2));
+    frameAvg.push(+(base + 0.6).toFixed(2));
+    frameMax.push(+(base + (i % 9 === 0 ? 44 + 10 * s2 : 3 + 2 * Math.abs(s))).toFixed(2));
+    fps.push(+(99 + s * 1.5).toFixed(1));
+    cpu.push(+(38 + 12 * s).toFixed(1));
+    rss.push(Math.round(118000 + i * 90 + 800 * Math.abs(s2)));
+    const p = Math.round(16 + 3 * s);
+    players.push(p);
+    real.push(p - 1);
+    edicts.push(Math.round(220 + 20 * Math.abs(s2)));
+    inK.push(+(760 + 120 * s).toFixed(1));
+    outK.push(+(1350 + 180 * s2).toFixed(1));
+  }
+
+  /* per-client parallel series (own timestamps, a few nulls) */
+  const mkSeries = (prof, count, tStart) => {
+    count = count || N;
+    tStart = tStart == null ? t0 : tStart;
+    const o = { t: [], ping: [], loss: [], choke: [], rel_fill: [], dloss: [], delta_seq: [], idle_ms: [], flow_in_kbps: [], flow_out_kbps: [] };
+    const flowIn = prof.flowIn != null ? prof.flowIn : 8;
+    const flowInAmp = prof.flowInAmp != null ? prof.flowInAmp : 3;
+    const flowOut = prof.flowOut != null ? prof.flowOut : 20;
+    const flowOutAmp = prof.flowOutAmp != null ? prof.flowOutAmp : 7;
+    for (let i = 0; i < count; i++) {
+      const s = Math.sin(i / 5 + prof.ph);
+      o.t.push(tStart + i * dt);
+      o.ping.push(+(prof.ping + prof.pingAmp * s + (i % 13 === 0 ? prof.spike : 0)).toFixed(1));
+      o.loss.push(+(prof.loss + prof.lossAmp * Math.abs(Math.sin(i / 7))).toFixed(1));
+      o.choke.push(+(Math.max(0, prof.choke + prof.chokeAmp * Math.abs(s))).toFixed(1));
+      let fill = prof.fill + (prof.fillGrow ? prof.fillGrow * (i / count) : 0) + 2 * Math.abs(s);
+      o.rel_fill.push(+Math.min(100, fill).toFixed(1));
+      o.dloss.push(i % 20 === 0 ? 1 : 0);
+      o.delta_seq.push(i % 9 === 0 ? (prof.gap || 3) : 0);
+      // idle_ms: baseline jitter, ramping up near the end for a client that goes silent.
+      const idleBase = prof.idleBase || 0;
+      let idle = idleBase + (i % 11 === 0 ? (prof.idleJitter || 0) : 0);
+      if (prof.idleEnd && i >= count - prof.idleRamp) {
+        const f = (i - (count - prof.idleRamp)) / prof.idleRamp;
+        idle = idleBase + (prof.idleEnd - idleBase) * f;
+      }
+      o.idle_ms.push(Math.round(idle));
+      o.flow_in_kbps.push(+(flowIn + flowInAmp * Math.abs(Math.sin(i / 6 + prof.ph))).toFixed(1));
+      o.flow_out_kbps.push(+(flowOut + flowOutAmp * Math.abs(Math.sin(i / 3 + prof.ph))).toFixed(1));
+    }
+    o.ping[Math.floor(count * 0.42)] = null;
+    return o;
+  };
+  const client_series = {
+    "0:u2": mkSeries({ ph: 0.0, ping: 42, pingAmp: 8, spike: 0, loss: 0.5, lossAmp: 1.2, choke: 0, chokeAmp: 0.4, fill: 2, gap: 1, idleBase: 15 }),
+    "0:u3": mkSeries({ ph: 1.3, ping: 88, pingAmp: 28, spike: 30, loss: 2.5, lossAmp: 5, choke: 0.8, chokeAmp: 2.5, fill: 8, gap: 4, idleBase: 30, idleEnd: 60000, idleRamp: 18 }),
+    "0:u4": mkSeries({ ph: 2.1, ping: 60, pingAmp: 12, spike: 5, loss: 1.0, lossAmp: 2, choke: 0.2, chokeAmp: 1, fill: 4, gap: 2, idleBase: 20 }),
+    "0:u5": mkSeries({ ph: 0.7, ping: 35, pingAmp: 6, spike: 0, loss: 0.2, lossAmp: 0.6, choke: 0, chokeAmp: 0.3, fill: 2, gap: 1, idleBase: 12 }),
+    "0:u6": mkSeries({ ph: 3.4, ping: 120, pingAmp: 40, spike: 60, loss: 5, lossAmp: 8, choke: 2, chokeAmp: 4, fill: 20, gap: 6, idleBase: 90, idleJitter: 40 }),
+    "0:u7": mkSeries({ ph: 4.2, ping: 132, pingAmp: 40, spike: 80, loss: 4, lossAmp: 9, choke: 3, chokeAmp: 6, fill: 30, fillGrow: 62, gap: 9, idleBase: 60, idleEnd: 900, idleRamp: 10 }),
+    "1:u101": mkSeries({ ph: 0.0, ping: 45, pingAmp: 10, spike: 12, loss: 0.6, lossAmp: 1.4, choke: 0, chokeAmp: 0.5, fill: 3, gap: 1, idleBase: 18 }, N1, t1),
+    "1:u102": mkSeries({ ph: 1.9, ping: 52, pingAmp: 14, spike: 8, loss: 1.2, lossAmp: 2.2, choke: 0.3, chokeAmp: 1.1, fill: 5, gap: 2, idleBase: 22 }, N1, t1),
+  };
+  const mkIdent = (session, run, slot, id, name, authid, s64, ip, port, userid, conn, fake, proxy, first, last, samples) =>
+    ({ session, run, id, slot, name, authid, steamid64: s64, ip, port, userid,
+       conn_s: conn, fake, proxy, first_t: first, last_t: last, samples });
+  const client_identities = {
+    "0:u2":  mkIdent("0:u2", 0, 0, 0, "PlayerOne",   "STEAM_0:0:1001", "76561197960266730", "10.0.0.11", 27005, 2,   3600, false, false, t0, run0End, N),
+    "0:u3":  mkIdent("0:u3", 0, 1, 1, "PlayerTwo",   "STEAM_0:1:1002", "76561197960266731", "10.0.0.12", 27006, 3,   1800, false, false, t0, run0End, N),
+    "0:u4":  mkIdent("0:u4", 0, 2, 2, "Bot",         "BOT",           "",                  "127.0.0.1", 27015, 4,   600,  true,  false, t0, run0End, N),
+    "0:u5":  mkIdent("0:u5", 0, 3, 3, "PlayerThree", "STEAM_0:0:1003", "76561197960266732", "10.0.0.13", 27007, 5,   2400, false, false, t0, run0End, N),
+    "0:u6":  mkIdent("0:u6", 0, 4, 4, "PlayerFour",  "STEAM_0:1:1004", "76561197960266733", "10.0.0.14", 27008, 6,   900,  false, false, t0, run0End, N),
+    "0:u7":  mkIdent("0:u7", 0, 5, 5, "Proxied",     "STEAM_0:1:1005", "76561197960266734", "10.0.0.15", 27009, 7,   1200, false, true,  t0, run0End, N),
+    "1:u101": mkIdent("1:u101", 1, 0, 0, "PlayerOne", "STEAM_0:0:1001", "76561197960266730", "10.0.0.21", 27105, 101, 900,  false, false, t1, run1End, N1),
+    "1:u102": mkIdent("1:u102", 1, 1, 1, "PlayerFive","STEAM_0:0:1006", "76561197960266735", "10.0.0.22", 27106, 102, 300,  false, false, t1, run1End, N1),
+  };
+
+  const clients = Object.keys(client_identities).map(s => {
+    const idn = client_identities[s];
+    const agg = aggregateSeries(client_series[s] || {});
+    return Object.assign({ session: s }, identityColumns(idn),
+      { run: idn.run, id: idn.id, first_t: idn.first_t, last_t: idn.last_t }, agg);
+  });
+
+  const dropDefs = [
+    { s: "0:u3", t: t0 + 8, reason: "Timeout", category: "timeout", idle: 1200, crash: false, fully: true },
+    { s: "0:u5", t: t0 + 17, reason: "Reliable channel overflowed", category: "overflow", idle: 400, crash: false, fully: true },
+    { s: "0:u7", t: t0 + 22, reason: "Timeout", category: "timeout", idle: 60000, crash: false, fully: true },
+    { s: "0:u4", t: t0 + 31, reason: "Client left", category: "user", idle: 30, crash: false, fully: true },
+    { s: "0:u6", t: t0 + 47, reason: "Fragmented packet", category: "malformed", idle: 0, crash: false, fully: true },
+    { s: "0:u7", t: t0 + 53, reason: "Reliable channel overflowed", category: "overflow", idle: 150, crash: true, fully: true },
+    { s: "1:u101", t: t1 + 5, reason: "Timeout", category: "timeout", idle: 60000, crash: false, fully: true },
+    { s: "1:u101", t: t1 + 18, reason: "Reliable channel overflowed", category: "overflow", idle: 200, crash: false, fully: true },
+  ];
+  const drops = dropDefs.map(d => {
+    const idn = client_identities[d.s] || {};
+    return {
+      t: d.t, iso: new Date(d.t * 1000).toISOString(),
+      id: idn.id != null ? idn.id : null,
+      session: d.s,
+      gen: idn.userid != null ? idn.userid : null,
+      reason: d.reason, category: d.category, crash: d.crash,
+      observed_via: "sv_dropclient",
+      netchan: { now_real: d.t, idle_ms: d.idle, sv_timeout: 60 },
+      client: { fully_connected: d.fully },
+      name: idn.name || "", authid: idn.authid || "", steamid64: idn.steamid64 || "",
+      ip: idn.ip || "", port: idn.port != null ? idn.port : null,
+      slot: idn.slot != null ? idn.slot : null,
+      userid: idn.userid != null ? idn.userid : null,
+      conn_s: idn.conn_s != null ? idn.conn_s : null,
+      fake: idn.fake === true, proxy: idn.proxy === true,
+    };
+  });
+
+  const events = [
+    { kind: "warmup", start: t0, end: t0 + 10, reason: "warmup" },
+    { kind: "mapchange", start: t0 + 22, end: t0 + 42, reason: "de_dust2" },
+    { kind: "shutdown", start: run0End - 3, end: run0End, reason: "graceful" },
+  ];
+  const anomalies_excluded = [
+    "shutdown: lag spikes: 2 всплеска задержки > 100 мс",
+    "mapchange: hitch cluster: 3 hitches (окно 10.0s)",
+  ];
+
+  /* focus events: one idle_hang for PlayerOne (session 0:u2), ~6 s long, in range.
+     client_series["0:u2"] already carries idle_ms, so focusing works offline. */
+  const focus_points = [
+    { kind: "idle_hang", session: "0:u2", player: "76561197960266730",
+      start_t: t0 + 40, end_t: t0 + 46, duration_s: 6, peak_idle_ms: 6200,
+      drop_after: true, slot: 0, userid: 2, name: "PlayerOne", steamid64: "76561197960266730" },
+  ];
+
+  const sessionCount = Object.keys(client_identities).length;
+  const counts = { server: N, client: 219, drop: drops.length, reject: 4, connect: 9, netcmd: 63, massdrop: 2, packet: N, hitch: 6, mapchange: 1, voice: 14 };
+  const records_count = Object.keys(counts).reduce((a, k) => a + counts[k], 0);
+
+  const digest = {
+    files: ["demo_a.jsonl", "demo_b.jsonl"],
+    records: records_count,
+    counts_by_type: counts,
+    period: { start: t[0], end: run1End, duration_s: run1End - t[0] },
+    players: [2, 3, 4, 5, 6, 7, 101, 102],
+    sessions: sessionCount,
+    drop_count: drops.length,
+    top_drop_reasons: [["Timeout", 3], ["Reliable channel overflowed", 3], ["Client left", 1], ["Fragmented packet", 1]],
+    hitch_lines: counts.hitch,
+    lag_spikes: 5,
+    log_end: "graceful",
+    anomalies_excluded: anomalies_excluded.length,
+  };
+
+  return {
+    ok: true, version: 1,
+    files: digest.files,
+    digest: digest,
+    series: {
+      t: t,
+      frame_ms_min: frameMin, frame_ms_avg: frameAvg, frame_ms_max: frameMax,
+      cpu_pct: cpu, rss_kb: rss,
+      players: players, real_players: real, edicts: edicts, fps: fps,
+      in_kbps: inK, out_kbps: outK,
+    },
+    clients: clients,
+    client_series: client_series,
+    client_identities: client_identities,
+    sessions: buildPlayerGroups(client_identities),
+    session_count: sessionCount,
+    drops: drops,
+    events: events,
+    log_end: "graceful",
+    anomalies: [
+      "hitch cluster: 6 hitches между " + fmtIso(t0 + 20) + " и " + fmtIso(t0 + 30) + " (окно 10.0s)",
+      "reliable channel fill: игрок 11 — rel_fill достиг 96% перед отключением",
+      "lag spikes: 5 всплесков задержки > 100 мс",
+    ],
+    anomalies_excluded: anomalies_excluded,
+    focus_points: focus_points,
+    records_count: records_count,
+  };
+}
+
+/* =====================================================================
+   Wiring
+   ===================================================================== */
+function init() {
+  // Restore persisted panel collapse choices, merged OVER the defaults.
+  state.collapsed = Object.assign({}, DEFAULT_COLLAPSED, collapsedLoad() || {});
+  // Restore persisted combined-panel dataset settings (selection / normalize / events / per-player metrics).
+  datasetsLoad();
+
+  renderFileList();
+
+  const dropzone = $("#dropzone");
+  const input = $("#fileInput");
+
+  input.addEventListener("change", () => { addFiles(input.files); input.value = ""; });
+
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  });
+
+  ["dragenter", "dragover"].forEach(evt => {
+    dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add("drag"); });
+  });
+  ["dragleave", "dragend"].forEach(evt => {
+    dropzone.addEventListener(evt, () => dropzone.classList.remove("drag"));
+  });
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("drag");
+    if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+  });
+  // better UX: allow dropping anywhere on the page
+  window.addEventListener("dragover", (e) => { e.preventDefault(); });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("drag");
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
+
+  $("#btnAnalyze").addEventListener("click", fetchAnalyze);
+  $("#btnDemo").addEventListener("click", () => {
+    revokeUrls();
+    state.body = null;
+    state.demo = true;
+    state.period = { from: null, to: null };
+    state.selectedClient = null;
+    render(makeDemo());
+    setStatus("Показаны демо-данные (без обращения к серверу).", "info");
+  });
+  $("#btnClear").addEventListener("click", () => {
+    revokeUrls();
+    state.result = null; state.body = null; state.demo = false;
+    state.view = null; state.period = { from: null, to: null };
+    state.selectedClient = null;
+    refreshAllPanelUI = null;
+    $("#results").hidden = true; $("#results").textContent = "";
+    $("#btnClear").hidden = true;
+    setExportEnabled(false);
+    setModeBadge(false);
+    setLogEndBadge(null);
+    setStatus("", "info");
+  });
+
+  $$("[data-type]").forEach(btn => {
+    btn.addEventListener("click", () => downloadCsv(btn.getAttribute("data-type")));
+  });
+  $("#btnSelfTest").addEventListener("click", selfTest);
+
+  const setAllPanelsCollapsed = (collapsed) => {
+    if (!state.result) return;
+    $$("#results .panel").forEach(p => {
+      const h2 = $("h2", p);
+      if (h2) state.collapsed["p:" + h2.textContent] = collapsed;
+    });
+    collapsedSave();
+    render(state.result);
+  };
+  $("#btnCollapseAll").addEventListener("click", () => setAllPanelsCollapsed(true));
+  $("#btnExpandAll").addEventListener("click", () => setAllPanelsCollapsed(false));
+
+  $("#ftpToggle").addEventListener("click", () => {
+    const body = $("#ftpBody");
+    const show = body.hidden;
+    body.hidden = !show;
+    $("#ftpToggle").textContent = show ? "Скрыть" : "Показать";
+    $("#ftpToggle").setAttribute("aria-expanded", show ? "true" : "false");
+  });
+  $("#ftpConnect").addEventListener("click", ftpConnect);
+  $("#ftpRefresh").addEventListener("click", () => ftpRefresh(true));
+  $("#ftpClose").addEventListener("click", ftpDisconnect);
+  $("#ftpAuto").addEventListener("change", () => {
+    if ($("#ftpAuto").checked) { ftpIntervalChanged(); ftpStartAuto(); }
+    else ftpStopAuto();
+  });
+  $("#ftpInterval").addEventListener("change", ftpIntervalChanged);
+  ["ftpHost", "ftpPort", "ftpUser", "ftpPassword", "ftpPath", "ftpInterval"].forEach((id) => {
+    const el = $("#" + id);
+    if (el) {
+      el.addEventListener("input", ftpPrefsChanged);
+      el.addEventListener("change", ftpPrefsChanged);
+    }
+  });
+  if ($("#ftpTls")) $("#ftpTls").addEventListener("change", ftpPrefsChanged);
+  if ($("#ftpRemember")) $("#ftpRemember").addEventListener("change", ftpSavePrefs);
+  ftpLoadPrefs();
+  ftpIntervalChanged();
+  setFtpControls();
+
+  checkHealth();
+  syncTopbarHeight();
+  window.addEventListener("resize", syncTopbarHeight);
+}
+
+async function checkHealth() {
+  const dot = $("#healthDot"), txt = $("#healthText"), badge = $("#healthBadge");
+  try {
+    const res = await fetch("/api/health", { method: "GET" });
+    const data = await res.json();
+    if (res.ok && data && data.ok) {
+      dot.className = "dot ok";
+      txt.textContent = "сервер v" + data.version;
+      badge.title = "Сервис: " + (data.service || "?");
+    } else {
+      throw new Error("bad health");
+    }
+  } catch (e) {
+    dot.className = "dot";
+    txt.textContent = "сервер недоступен";
+  }
+}
+
+/* ----- self-test: render each builder on the demo set, catch throws ----- */
+function selfTest() {
+  const demo = makeDemo();
+  const view = computeView(demo);
+  const checks = [
+    ["summary", () => buildSummary(demo, view)],
+    ["period", () => buildPeriodPanel(demo)],
+    ["info-line", () => buildInfoLine(demo)],
+    ["types", () => buildTypes(demo.digest.counts_by_type)],
+    ["charts+bands", () => buildCharts(demo.series, { events: demo.events, showEvents: true })],
+    ["charts-panel", () => buildChartsPanel(view)],
+    ["client-charts", () => buildClientCharts(demo.client_series["0:u7"], { events: demo.events, showEvents: true })],
+    ["per-client", () => buildPerClientPanel(view)],
+    ["player-groups", () => buildPlayerGroups(demo.client_identities)],
+    ["events-toggle", () => buildEventTools()],
+    ["anomalies", () => buildAnomalies(demo.anomalies)],
+    ["drops", () => buildDropsPanel(view.drops)],
+    ["drops-chart", () => buildDropsChart(view)],
+    ["all-chart", () => buildAllChart(view)],
+    ["all-panel", () => buildAllPanel(view)],
+    ["focus-panel", () => buildFocusPanel(view, demo)],
+    ["clients", () => buildClientsTable(view.clients)],
+    ["ftp-panel", () => { const p = $("#ftpPanel"); if (!p) throw new Error("нет #ftpPanel"); return p; }],
+  ];
+  const resultsList = [];
+  let failed = 0;
+  for (const [name, fn] of checks) {
+    try {
+      const node = fn();
+      const ok = !!node;
+      if (!ok) { failed++; resultsList.push("✗ " + name + ": пустой результат"); }
+      else resultsList.push("✓ " + name);
+    } catch (err) {
+      failed++;
+      resultsList.push("✗ " + name + ": " + (err && err.message ? err.message : String(err)));
+    }
+  }
+  const summary = "Самопроверка: " + (checks.length - failed) + "/" + checks.length + " ok";
+  if (window.console && console.log) console.log("[self-test]", summary, resultsList);
+  toast(summary + (failed ? (" · " + failed + " ошибок") : ""), failed ? "error" : "ok");
+  return { total: checks.length, failed: failed, results: resultsList };
+}
+
+document.addEventListener("DOMContentLoaded", init);
+// expose for manual console verification
+window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers };
+</script>
+</body>
+</html>

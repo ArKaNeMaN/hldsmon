@@ -1,0 +1,11 @@
+# Normalize text to LF in the repository (Linux-targeted project).
+* text=auto eol=lf
+
+# Windows batch files keep CRLF.
+*.bat text eol=crlf
+
+# Binary artifacts.
+*.so binary
+*.exe binary
+*.png binary
+*.o binary

@@ -1,0 +1,23 @@
+# build artifacts
+build/
+dist/
+tools/analyzer/build/
+tools/analyzer/dist/
+*.so
+*.o
+*.d
+*.spec
+
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# tooling / agent state (not for publication)
+.codegraph/
+.omo/
+
+# logs (runtime)
+addons/metamod/hldsmon/logs/
+*.jsonl

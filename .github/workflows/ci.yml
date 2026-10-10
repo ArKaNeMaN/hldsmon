@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Host core + analyzer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make test (host C++ core + Python analyzer)
+        run: make test
+
+  plugin:
+    name: Plugin .so (32-bit, glibc <= 2.17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014_i686 (CentOS 7 toolchain)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_i686 \
+            bash -lc 'for d in /opt/rh/devtoolset-*/enable; do source "$d" && break; done; make clean && make && make verify-exports'
+      - name: Assert GLIBC <= 2.17 and no dynamic libstdc++/libgcc
+        run: |
+          set -e
+          max=$(objdump -T HldsMonitoring_mm_i386.so | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
+          echo "max glibc symbol: $max"
+          if [ "$(printf '%s\nGLIBC_2.17\n' "$max" | sort -V | tail -1)" != "GLIBC_2.17" ]; then
+            echo "ERROR: requires $max (> GLIBC_2.17)" >&2; exit 1
+          fi
+          if readelf -d HldsMonitoring_mm_i386.so | grep NEEDED | grep -qE 'libstdc|libgcc'; then
+            echo "ERROR: dynamic libstdc++/libgcc dependency" >&2; exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-linux-i386
+          path: HldsMonitoring_mm_i386.so
+          if-no-files-found: error
+
+  analyzer-binaries:
+    name: Web UI binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+      - name: Build single-file web UI
+        shell: bash
+        run: |
+          cd tools/analyzer
+          if [ "$RUNNER_OS" = "Windows" ]; then SEP=";"; else SEP=":"; fi
+          python -m PyInstaller --noconfirm --clean --onefile --name hldsmon-webui \
+            --add-data "webui/index.html${SEP}webui" --hidden-import hldsmon webui.py
+          rm -rf build hldsmon-webui.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webui-${{ matrix.os }}
+          path: |
+            tools/analyzer/dist/hldsmon-webui
+            tools/analyzer/dist/hldsmon-webui.exe
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plugin, analyzer-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Rename binaries
+        run: |
+          mkdir -p upload
+          cp artifacts/plugin-linux-i386/HldsMonitoring_mm_i386.so upload/ || true
+          cp artifacts/webui-ubuntu-latest/hldsmon-webui upload/hldsmon-webui-linux-x86_64 || true
+          cp artifacts/webui-windows-latest/hldsmon-webui.exe upload/hldsmon-webui-windows-x86_64.exe || true
+          ls -la upload
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
