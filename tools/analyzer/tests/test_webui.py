@@ -316,13 +316,19 @@ class _FakeRemote:
         self.data = data
         self.calls = []
 
-    def __call__(self, cfg, offset=0):
+    def size(self, cfg):
+        return len(self.data)
+
+    def range(self, cfg, start, length):
+        start = int(start)
+        length = int(length)
+        self.calls.append((start, length))
+        return bytes(self.data[start:start + length])
+
+    def download(self, cfg, offset=0):
         offset = int(offset or 0)
-        self.calls.append(offset)
-        data = self.data
-        if offset <= 0 or offset > len(data):
-            return len(data), data
-        return len(data), data[offset:]
+        self.calls.append(("download", offset))
+        return len(self.data), bytes(self.data[offset:])
 
 
 class TestSplitTail(unittest.TestCase):
@@ -379,9 +385,13 @@ class TestResolvePath(unittest.TestCase):
 
 class TestFtpEndpoints(unittest.TestCase):
     def setUp(self):
-        self._orig_download = webui._download
+        self._orig_seams = (webui._remote_size, webui._download_range,
+                            webui._download, webui.FTP_BACK_CHUNK)
         self.remote = _FakeRemote()
-        webui._download = self.remote
+        webui._remote_size = self.remote.size
+        webui._download_range = self.remote.range
+        webui._download = self.remote.download
+        webui.FTP_BACK_CHUNK = 512
         with webui._FTP_LOCK:
             webui._FTP_SESSIONS.clear()
         self.server = webui.make_server("127.0.0.1", 0)
@@ -392,7 +402,8 @@ class TestFtpEndpoints(unittest.TestCase):
         self.base = "http://127.0.0.1:%d" % self.port
 
     def tearDown(self):
-        webui._download = self._orig_download
+        (webui._remote_size, webui._download_range,
+         webui._download, webui.FTP_BACK_CHUNK) = self._orig_seams
         with webui._FTP_LOCK:
             webui._FTP_SESSIONS.clear()
         self.server.shutdown()
@@ -447,16 +458,7 @@ class TestFtpEndpoints(unittest.TestCase):
         self.assertEqual(stored["cfg"]["password"], "topsecret")
 
     def test_progress_endpoint_reports_and_finishes(self):
-        base = ftp_jsonl([_server_record(1000.0)])
-
-        def _fake_with_progress(cfg, offset=0):
-            sink = getattr(webui._thread_progress, "sink", None)
-            if sink is not None:
-                sink(50, 100)
-                sink(100, 100)
-            return 100, base
-
-        webui._download = _fake_with_progress
+        self.remote.data = ftp_jsonl([_server_record(1000.0)])
         job = "job-progress-1"
         status, data = self._post_json(
             "/api/ftp/connect", {"host": "h", "path": "/x.jsonl", "job": job})
@@ -524,6 +526,41 @@ class TestFtpEndpoints(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data["records_count"], 1)
         self.assertEqual(data["ftp"]["records"], 1)
+
+    def test_connect_loads_only_recent_window(self):
+        self.remote.data = ftp_jsonl([_server_record(1000.0 + i) for i in range(40)])
+        status, data = self._connect(window_s=5.0)
+        self.assertEqual(status, 200)
+        self.assertFalse(data["ftp"]["reached_start"])
+        self.assertLess(data["ftp"]["records"], 40)
+        self.assertGreaterEqual(data["ftp"]["end_t"] - data["ftp"]["start_t"], 5.0)
+
+    def test_load_earlier_prepends_older_without_garbling(self):
+        self.remote.data = ftp_jsonl([_server_record(1000.0 + i) for i in range(40)])
+        _, conn = self._connect(window_s=5.0)
+        sid = conn["session"]
+        status, data = self._post_json("/api/ftp/load-earlier", {"session": sid})
+        self.assertEqual(status, 200)
+        self.assertGreater(data["ftp"]["older_records"], 0)
+        self.assertLess(data["ftp"]["start_t"], conn["ftp"]["start_t"])
+        self.assertEqual(data["records_count"],
+                         conn["records_count"] + data["ftp"]["older_records"])
+
+    def test_load_earlier_until_reached_start_then_noop(self):
+        n = 40
+        self.remote.data = ftp_jsonl([_server_record(1000.0 + i) for i in range(n)])
+        _, data = self._connect(window_s=5.0)
+        sid = data["session"]
+        for _ in range(60):
+            if data["ftp"]["reached_start"]:
+                break
+            _, data = self._post_json("/api/ftp/load-earlier", {"session": sid})
+        self.assertTrue(data["ftp"]["reached_start"])
+        self.assertEqual(data["records_count"], n)
+        _, again = self._post_json("/api/ftp/load-earlier", {"session": sid})
+        self.assertTrue(again["ftp"]["reached_start"])
+        self.assertEqual(again["ftp"]["older_records"], 0)
+        self.assertEqual(again["records_count"], n)
 
     def test_close_then_unknown_session_400(self):
         self.remote.data = ftp_jsonl([_server_record(1000.0)])

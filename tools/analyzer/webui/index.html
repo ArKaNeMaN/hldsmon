@@ -654,6 +654,7 @@
       <div class="ftp-actions">
         <button class="btn primary" id="ftpConnect" type="button">Подключить</button>
         <button class="btn" id="ftpRefresh" type="button" disabled>Обновить сейчас</button>
+        <button class="btn ghost" id="ftpLoadEarlier" type="button" disabled title="Подгрузить более старую часть файла">← загрузить раньше</button>
         <button class="btn ghost" id="ftpClose" type="button" disabled>Отключить</button>
         <label class="evt-toggle" title="Сохранять хост, логин, пароль и путь в localStorage браузера (локальный инструмент)"><input type="checkbox" id="ftpRemember" checked> сохранять креды</label>
         <div class="ftp-auto">
@@ -1207,6 +1208,7 @@ const ftp = {
   lastError: null,
   busy: false,
   progressTimer: null,
+  reachedStart: false, // true once the oldest byte of the remote file is loaded
 };
 
 function setFtpStatus(msg, kind) {
@@ -1288,6 +1290,17 @@ function ftpFormSpec() {
 function ftpLogEndSuffix() {
   const t = logEndText(state.result && state.result.log_end);
   return t ? (" · завершение: " + t.label) : "";
+}
+
+// Loaded-window suffix for the FTP status line: earliest..latest + start-of-file hint.
+function ftpWindowSuffix(f) {
+  if (!f) return "";
+  let s = "";
+  if (isNum(f.start_t) && isNum(f.end_t)) {
+    s += " · окно " + fmtIso(f.start_t) + " .. " + fmtIso(f.end_t);
+  }
+  if (f.reached_start) s += " (достигнуто начало файла)";
+  return s;
 }
 
 const FTP_PREFS_KEY = "hldsmon.ftp.v1";
@@ -1411,6 +1424,8 @@ function setFtpControls() {
   connect.disabled = ftp.busy;
   connect.textContent = (ftp.busy && !on) ? "Подключение…" : "Подключить";
   $("#ftpRefresh").disabled = !on || ftp.busy;
+  const earlier = $("#ftpLoadEarlier");
+  if (earlier) earlier.disabled = !on || ftp.busy || ftp.reachedStart;
   $("#ftpClose").disabled = !on || ftp.busy;
   $("#ftpAuto").disabled = !on;
   $("#ftpInterval").disabled = !on;
@@ -1435,6 +1450,7 @@ async function ftpConnect() {
     ftp.session = data.session;
     ftp.path = (data.ftp && data.ftp.path) ? data.ftp.path : spec.path;
     ftp.lastError = null;
+    ftp.reachedStart = !!(data.ftp && data.ftp.reached_start);
     if (!$("#ftpRemember") || !$("#ftpRemember").checked) $("#ftpPassword").value = "";
     ftpSavePrefs();
     state.demo = false;
@@ -1443,7 +1459,8 @@ async function ftpConnect() {
     state.selectedClient = null;
     render(data);
     setFtpStatus("Подключено: " + ftp.path + " · " + fmtInt(data.ftp.records) +
-      " записей (" + humanBytes(data.ftp.bytes) + ")" + ftpLogEndSuffix(), "ok");
+      " записей (" + humanBytes(data.ftp.bytes) + ")" + ftpLogEndSuffix() +
+      ftpWindowSuffix(data.ftp), "ok");
   } catch (err) {
     ftp.session = null;
     setFtpStatus("Ошибка подключения: " + (err && err.message ? err.message : String(err)), "error");
@@ -1476,10 +1493,12 @@ async function ftpRefresh(manual) {
     ftp.lastError = null;
     render(data);
     const f = data.ftp || {};
+    ftp.reachedStart = !!(f && f.reached_start);
     const now = new Date().toISOString().slice(11, 19);
     setFtpStatus("Обновлено " + now + " UTC · +" + humanBytes(f.new_bytes) +
       " / +" + fmtInt(f.new_records) + " записей · всего " + fmtInt(f.records) +
-      " записей (" + humanBytes(f.bytes) + ")" + ftpLogEndSuffix(), "ok");
+      " записей (" + humanBytes(f.bytes) + ")" + ftpLogEndSuffix() +
+      ftpWindowSuffix(f), "ok");
   } catch (err) {
     const msg = (err && err.message ? err.message : String(err));
     if (ftp.lastError !== msg) { ftp.lastError = msg; toast("FTP-обновление: " + msg, "error"); }
@@ -1492,7 +1511,38 @@ async function ftpRefresh(manual) {
   } finally {
     if (manual) ftpProgressStop();
     ftp.busy = false;
-    if (manual) setFtpControls();
+    setFtpControls();
+  }
+}
+
+async function ftpLoadEarlier() {
+  // Page the loaded window BACKWARD: fetch the previous slice of the remote file
+  // on demand. Mirrors manual refresh (progress bar + parse phase) and never runs
+  // once the file start has been reached or while another request is in flight.
+  if (ftp.busy || !ftp.session || ftp.reachedStart) return;
+  ftp.busy = true;
+  setFtpControls();
+  ftpProgressStart(ftp.session, "Загрузка старее…");
+  try {
+    const data = await ftpPost("/api/ftp/load-earlier", { session: ftp.session });
+    ftp.lastError = null;
+    render(data);
+    const f = data.ftp || {};
+    ftp.reachedStart = !!f.reached_start;
+    setFtpStatus("Догружено старее: +" + fmtInt(f.older_records) + " записей (" +
+      humanBytes(f.older_bytes) + ") · с " + fmtIso(f.start_t) + ftpWindowSuffix(f), "ok");
+  } catch (err) {
+    const msg = (err && err.message ? err.message : String(err));
+    if (ftp.lastError !== msg) { ftp.lastError = msg; toast("FTP-загрузка старее: " + msg, "error"); }
+    setFtpStatus("Ошибка загрузки старее: " + msg + " · показаны последние удачные данные", "error");
+    if (/unknown session/i.test(msg)) {
+      ftpStopAuto();
+      ftp.session = null;
+    }
+  } finally {
+    ftpProgressStop();
+    ftp.busy = false;
+    setFtpControls();
   }
 }
 
@@ -1510,6 +1560,7 @@ function ftpDisconnect() {
   const sid = ftp.session;
   ftpStopAuto();
   ftp.session = null;
+  ftp.reachedStart = false;
   $("#ftpPassword").value = "";
   setFtpControls();
   setFtpStatus("FTP-источник отключён.", "info");
@@ -3730,6 +3781,7 @@ function init() {
   });
   $("#ftpConnect").addEventListener("click", ftpConnect);
   $("#ftpRefresh").addEventListener("click", () => ftpRefresh(true));
+  $("#ftpLoadEarlier").addEventListener("click", ftpLoadEarlier);
   $("#ftpClose").addEventListener("click", ftpDisconnect);
   $("#ftpAuto").addEventListener("change", () => {
     if ($("#ftpAuto").checked) { ftpIntervalChanged(); ftpStartAuto(); }

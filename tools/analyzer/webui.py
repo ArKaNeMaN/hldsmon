@@ -54,6 +54,12 @@ MAX_BODY_BYTES = 256 * 1024 * 1024
 #: Hard cap on a single FTP download (256 MiB), matching ``MAX_BODY_BYTES``.
 MAX_FTP_BYTES = 256 * 1024 * 1024
 
+#: Initial / per-step time window (seconds) loaded from the tail of the FTP log.
+FTP_WINDOW_S = 1800.0
+
+#: Bytes fetched per backward (older) range read.
+FTP_BACK_CHUNK = 8 * 1024 * 1024
+
 #: Default socket timeout (seconds) for FTP connections.
 DEFAULT_FTP_TIMEOUT = 30.0
 
@@ -422,6 +428,7 @@ def _ftp_open(cfg):
     ftp.login(cfg.get("user") or "anonymous", cfg.get("password") or "")
     if cfg.get("tls"):
         ftp.prot_p()
+    ftp.voidcmd("TYPE I")
     return ftp
 
 
@@ -484,6 +491,203 @@ def _download(cfg, offset=0):
                 ftp.close()
             except Exception:
                 pass
+
+
+def _ftp_close(ftp):
+    try:
+        ftp.quit()
+    except Exception:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+
+def _remote_size(cfg):
+    """Return the remote file size in bytes, or ``None`` if SIZE is unsupported."""
+    ftp = _ftp_open(cfg)
+    try:
+        try:
+            return int(ftp.size(cfg["path"]))
+        except Exception:
+            return None
+    finally:
+        _ftp_close(ftp)
+
+
+def _download_range(cfg, start, length):
+    """Return the bytes of ``cfg['path']`` in ``[start, start + length)``.
+
+    Uses an FTP REST range read; falls back to a full download + slice when the
+    server lacks REST. Tolerates a short/partial transfer (never raises for it).
+    """
+    start = int(start)
+    length = int(length)
+    if length <= 0:
+        return b""
+    ftp = _ftp_open(cfg)
+    try:
+        path = cfg["path"]
+        try:
+            size = ftp.size(path)
+        except Exception:
+            size = None
+        stop = start + length
+        if size is not None and size < stop:
+            stop = size
+        if stop <= start:
+            return b""
+        try:
+            conn = ftp.transfercmd("RETR " + path, rest=start)
+        except ftplib.all_errors:
+            conn = None
+        if conn is not None:
+            buf = bytearray()
+            want = stop - start
+            try:
+                while len(buf) < want:
+                    block = conn.recv(min(65536, want - len(buf)))
+                    if not block:
+                        break
+                    buf += block
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                ftp.voidresp()
+            except Exception:
+                pass
+            return bytes(buf)
+        data = _retr_all(ftp, path, None, None)
+        return data[start:stop]
+    finally:
+        _ftp_close(ftp)
+
+
+def _lines_in_range(chunk, drop_head, keep_tail_partial):
+    """Split a raw byte range into complete JSONL line bytes.
+
+    ``drop_head``: the range starts mid-line (X > 0) - drop the leading partial.
+    ``keep_tail_partial``: the range ends at EOF - return the trailing partial
+    line separately (a write still being appended). Returns
+    ``(line_bytes, leftover_bytes)``.
+    """
+    if isinstance(chunk, str):
+        chunk = chunk.encode("utf-8")
+    data = chunk or b""
+    if drop_head:
+        nl = data.find(b"\n")
+        if nl < 0:
+            return [], (data if keep_tail_partial else b"")
+        data = data[nl + 1:]
+    if not data:
+        return [], b""
+    leftover = b""
+    if keep_tail_partial and not data.endswith(b"\n"):
+        nl = data.rfind(b"\n")
+        if nl < 0:
+            return [], data
+        leftover = data[nl + 1:]
+        data = data[:nl + 1]
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    lines = [ln for ln in data.split(b"\n") if ln] if data else []
+    return lines, leftover
+
+
+def _records_span(records):
+    """Return ``newest_t - oldest_t`` over ``records``, or ``None`` if unknown."""
+    lo = hi = None
+    for rec in records:
+        t = hldsmon._num(rec.get("t"))
+        if t is None:
+            continue
+        if lo is None or t < lo:
+            lo = t
+        if hi is None or t > hi:
+            hi = t
+    if lo is None:
+        return None
+    return hi - lo
+
+
+def _read_backward_chunk(cfg, cursor, job, loaded_bytes, keep_tail_partial):
+    """Fetch one chunk ending at ``cursor``; return ``(aligned_start, records, leftover)``."""
+    fetch_start = max(0, cursor - FTP_BACK_CHUNK)
+    chunk = _download_range(cfg, fetch_start, cursor - fetch_start)
+    loaded_bytes[0] += len(chunk)
+    lines, leftover = _lines_in_range(
+        chunk, drop_head=(fetch_start > 0), keep_tail_partial=keep_tail_partial)
+    records = _records_from_lines(lines)
+    if fetch_start > 0:
+        nl = chunk.find(b"\n")
+        aligned_start = fetch_start + nl + 1 if nl >= 0 else fetch_start
+    else:
+        aligned_start = 0
+    _progress_set(job, loaded_bytes[0], None)
+    return aligned_start, records, leftover
+
+
+def _load_tail(cfg, window_s, job):
+    """Load the newest ``window_s`` seconds (or the whole file).
+
+    Returns ``(start, end, leftover, records)`` with records oldest->newest.
+    """
+    size = _remote_size(cfg)
+    if size is None or size <= 0:
+        _, data = _download(cfg, 0)
+        lines, leftover = split_tail(b"", data)
+        return 0, len(data), leftover, _records_from_lines(lines)
+    end = int(size)
+    cursor = end
+    start = end
+    records = []
+    leftover = b""
+    loaded = [0]
+    first = True
+    while True:
+        prev_cursor = cursor
+        aligned_start, chunk_records, chunk_leftover = _read_backward_chunk(
+            cfg, cursor, job, loaded, keep_tail_partial=first)
+        if chunk_records:
+            records = chunk_records + records
+        if first:
+            leftover = chunk_leftover
+            first = False
+        start = aligned_start
+        cursor = aligned_start
+        span = _records_span(records)
+        if span is not None and span >= window_s:
+            break
+        if start <= 0 or loaded[0] >= MAX_FTP_BYTES or cursor >= prev_cursor:
+            break
+    return start, end, leftover, records
+
+
+def _ftp_meta(path, records, start, end, updated_at):
+    """Build the ``ftp`` block shared by connect / refresh / load-earlier."""
+    lo = hi = None
+    for rec in records:
+        t = hldsmon._num(rec.get("t"))
+        if t is None:
+            continue
+        if lo is None or t < lo:
+            lo = t
+        if hi is None or t > hi:
+            hi = t
+    return {
+        "path": path,
+        "bytes": max(0, int(end) - int(start)),
+        "records": len(records),
+        "updated_at": updated_at,
+        "reached_start": int(start) <= 0,
+        "start_t": lo,
+        "end_t": hi,
+    }
 
 
 def _session_put(session_id, session):
@@ -606,27 +810,24 @@ def ftp_connect(spec):
         "timeout": spec.get("timeout"),
         "path": resolved,
     }
+    window_s = float(spec.get("window_s") or FTP_WINDOW_S)
     job = str(spec.get("job") or "").strip() or secrets.token_urlsafe(12)
-    _thread_progress.sink = lambda done, total: _progress_set(job, done, total)
     _progress_set(job, 0, None)
     try:
-        _, data = _download(cfg, 0)
+        start, end, leftover, records = _load_tail(cfg, window_s, job)
     except BaseException as exc:
         _progress_finish(job, ok=False, error=str(exc))
         raise
-    finally:
-        _thread_progress.sink = None
     _progress_phase(job, "parse")
     try:
-        lines, leftover = split_tail(b"", data)
-        records = _records_from_lines(lines)
-        offset = len(data) if isinstance(data, (bytes, bytearray)) else 0
         session_id = secrets.token_urlsafe(24)
         updated_at = _utc_iso()
         _session_put(session_id, {
             "cfg": cfg,
             "path_token": path_token,
-            "offset": offset,
+            "window_s": window_s,
+            "start": start,
+            "end": end,
             "leftover": leftover,
             "records": records,
             "updated_at": updated_at,
@@ -634,12 +835,7 @@ def ftp_connect(spec):
         payload = analyze_records(records, files=[resolved])
         payload["session"] = session_id
         payload["job"] = job
-        payload["ftp"] = {
-            "path": resolved,
-            "bytes": offset,
-            "records": len(records),
-            "updated_at": updated_at,
-        }
+        payload["ftp"] = _ftp_meta(resolved, records, start, end, updated_at)
     except BaseException as exc:
         _progress_finish(job, ok=False, error=str(exc))
         raise
@@ -648,67 +844,120 @@ def ftp_connect(spec):
 
 
 def ftp_refresh(session_id):
-    """Read only the newly appended bytes and return the recomputed payload."""
+    """Append only the newly written bytes and return the recomputed payload."""
     session = _session_peek(session_id)
     if session is None:
         raise KeyError("unknown session")
     resolved = resolve_path(session["path_token"], _utc_date())
     cfg = dict(session["cfg"])
     cfg["path"] = resolved
-    offset = int(session["offset"])
     rotated = resolved != session["cfg"]["path"]
+    end = int(session["end"])
+    start = int(session["start"])
+    window_s = float(session.get("window_s") or FTP_WINDOW_S)
 
-    _thread_progress.sink = lambda done, total: _progress_set(session_id, done, total)
     _progress_set(session_id, 0, None)
     try:
-        if rotated:
-            _, data = _download(cfg, 0)
+        size = _remote_size(cfg)
+        if rotated or size is None or size < end:
+            start, end, leftover, records = _load_tail(cfg, window_s, session_id)
+            new_bytes = end - start
+            new_records = len(records)
+        elif size == end:
+            leftover = session["leftover"]
+            records = list(session["records"])
+            new_bytes = 0
+            new_records = 0
         else:
-            size, delta = _download(cfg, offset)
+            delta = _download_range(cfg, end, size - end)
+            lines, leftover = split_tail(session["leftover"], delta)
+            appended = _records_from_lines(lines)
+            records = list(session["records"]) + appended
+            end = end + len(delta)
+            new_bytes = len(delta)
+            new_records = len(appended)
     except BaseException as exc:
         _progress_finish(session_id, ok=False, error=str(exc))
         raise
-    finally:
-        _thread_progress.sink = None
     _progress_phase(session_id, "parse")
     try:
-        if rotated:
-            lines, leftover = split_tail(b"", data)
-            records = _records_from_lines(lines)
-            new_bytes = len(data)
-            new_offset = len(data)
-            new_records = len(records)
-        else:
-            if size < offset:
-                lines, leftover = split_tail(b"", delta)
-                records = _records_from_lines(lines)
-                new_bytes = len(delta)
-                new_offset = len(delta)
-                new_records = len(records)
-            else:
-                lines, leftover = split_tail(session["leftover"], delta)
-                appended = _records_from_lines(lines)
-                records = list(session["records"]) + appended
-                new_bytes = len(delta)
-                new_offset = offset + len(delta)
-                new_records = len(appended)
         updated_at = _utc_iso()
-        _session_update(session_id, session, cfg=cfg, offset=new_offset,
-                        leftover=leftover, records=records, updated_at=updated_at)
+        _session_update(session_id, session, cfg=cfg, window_s=window_s,
+                        start=start, end=end, leftover=leftover,
+                        records=records, updated_at=updated_at)
         payload = analyze_records(records, files=[resolved])
         payload["session"] = session_id
-        payload["ftp"] = {
-            "path": resolved,
-            "new_bytes": new_bytes,
-            "new_records": new_records,
-            "bytes": new_offset,
-            "records": len(records),
-            "updated_at": updated_at,
-        }
+        meta = _ftp_meta(resolved, records, start, end, updated_at)
+        meta["new_bytes"] = new_bytes
+        meta["new_records"] = new_records
+        payload["ftp"] = meta
     except BaseException as exc:
         _progress_finish(session_id, ok=False, error=str(exc))
         raise
     _progress_finish(session_id, ok=True)
+    return payload
+
+
+def ftp_load_earlier(session_id, window_s=None):
+    """Prepend an older time window (default ``FTP_WINDOW_S``) from the FTP log."""
+    session = _session_peek(session_id)
+    if session is None:
+        raise KeyError("unknown session")
+    resolved = resolve_path(session["path_token"], _utc_date())
+    cfg = dict(session["cfg"])
+    cfg["path"] = resolved
+    start = int(session["start"])
+    end = int(session["end"])
+    records = list(session["records"])
+    step = float(window_s if window_s is not None else (session.get("window_s") or FTP_WINDOW_S))
+
+    older_bytes = 0
+    older_records = 0
+    if start > 0:
+        span_before = _records_span(records) or 0.0
+        loaded = [0]
+        _progress_set(session_id, 0, None)
+        try:
+            while True:
+                prev_start = start
+                aligned_start, chunk_records, _ = _read_backward_chunk(
+                    cfg, start, session_id, loaded, keep_tail_partial=False)
+                if chunk_records:
+                    records = chunk_records + records
+                    older_records += len(chunk_records)
+                start = aligned_start
+                span = _records_span(records)
+                if span is not None and (span - span_before) >= step:
+                    break
+                if start <= 0 or loaded[0] >= MAX_FTP_BYTES or start >= prev_start:
+                    break
+            older_bytes = loaded[0]
+        except BaseException as exc:
+            _progress_finish(session_id, ok=False, error=str(exc))
+            raise
+        _progress_phase(session_id, "parse")
+        try:
+            updated_at = _utc_iso()
+            _session_update(session_id, session, start=start, records=records,
+                            updated_at=updated_at)
+            payload = analyze_records(records, files=[resolved])
+            payload["session"] = session_id
+            meta = _ftp_meta(resolved, records, start, end, updated_at)
+            meta["older_bytes"] = older_bytes
+            meta["older_records"] = older_records
+            payload["ftp"] = meta
+        except BaseException as exc:
+            _progress_finish(session_id, ok=False, error=str(exc))
+            raise
+        _progress_finish(session_id, ok=True)
+        return payload
+
+    payload = analyze_records(records, files=[resolved])
+    payload["session"] = session_id
+    meta = _ftp_meta(resolved, records, start, end, _utc_iso())
+    meta["older_bytes"] = 0
+    meta["older_records"] = 0
+    payload["ftp"] = meta
     return payload
 
 
@@ -835,6 +1084,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_ftp(ftp_connect)
         elif parts.path == "/api/ftp/refresh":
             self._handle_ftp_refresh()
+        elif parts.path == "/api/ftp/load-earlier":
+            self._handle_ftp_load_earlier()
         elif parts.path == "/api/ftp/close":
             self._handle_ftp_close()
         else:
@@ -930,6 +1181,29 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = ftp_refresh(session_id)
+        except KeyError:
+            self._send_json(400, {"ok": False, "error": "unknown session"})
+            return
+        except Exception as exc:  # noqa: BLE001 - never crash the server
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, payload)
+
+    def _handle_ftp_load_earlier(self):
+        data = self._body_or_error()
+        if data is None:
+            return
+        try:
+            spec = parse_json_body(data)
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        session_id = spec.get("session")
+        if not isinstance(session_id, str):
+            self._send_json(400, {"ok": False, "error": "unknown session"})
+            return
+        try:
+            payload = ftp_load_earlier(session_id, spec.get("window_s"))
         except KeyError:
             self._send_json(400, {"ok": False, "error": "unknown session"})
             return
