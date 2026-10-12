@@ -38,6 +38,7 @@ inline edict_t* edictByIndex(int index) { return g_pEdicts + index; }
 #include <com_client.h>
 
 #include "engine_layout.h"
+#include "host_metrics.h"
 #include "log_writer.h"
 #include "metrics.h"
 #include "modnet_got.h"
@@ -82,12 +83,18 @@ struct CvarRefs {
     cvar_t* modnet           = nullptr;
     cvar_t* modnet_targets   = nullptr;
     cvar_t* modnet_rescan_sec = nullptr;
-};
-
-// Bounded per-IP packet table entry (open addressing).
-struct IpEntry {
-    uint32_t ip;
-    uint32_t count;
+    cvar_t* host             = nullptr;
+    // Tracked engine cvars (config-context stage, design §22.3): cached once at
+    // bootstrap, read-only, nullptr when not registered (=> JSON null).
+    cvar_t* sys_ticrate      = nullptr;
+    cvar_t* host_framerate   = nullptr;
+    cvar_t* sv_timeout       = nullptr;
+    cvar_t* sv_maxrate       = nullptr;
+    cvar_t* sv_minrate       = nullptr;
+    cvar_t* sv_maxupdaterate = nullptr;
+    cvar_t* sv_minupdaterate = nullptr;
+    cvar_t* sv_maxcmdrate    = nullptr;
+    cvar_t* sv_mincmdrate    = nullptr;
 };
 
 // Mass-drop burst tracker.
@@ -96,6 +103,29 @@ struct MassDropState {
     uint32_t count     = 0;
     bool     emitted   = false;
     char     category[32] = {0};
+};
+
+// Single in-flight connect context (design §25.3, CT-1). SV_ConnectClient has
+// no arguments, so t0 cannot be tied to a slot: one fixed context tracks "a
+// connect is in progress"; a new SV_ConnectClient overwrites it and `active`
+// gates correlation. Missing markers leave the timing fields JSON null (CT-6).
+struct ConnectCtx {
+    double  t0          = 0.0;  // GetRealTime at SV_ConnectClient entry
+    double  steam_enter = 0.0;  // measured Steam_NotifyClientConnect stage in
+                                // seconds (>0) for the in-flight connect;
+                                // 0 = not measured => steam_ms null (CT-6)
+    uint8_t active      = 0;    // 1 while a connect is in progress
+};
+
+// Delayed-emission mapchange context (design §25.3 п.2, CT-2): SV_Spawn_f only
+// records the spawn time and the pending map; the 1 Hz server tick emits the
+// record when the world is ready (or after the tick window), so load_ms can be
+// measured. The massdrop reset and the same-map gate stay in SV_Spawn_f.
+struct MapCtx {
+    double   t_spawn         = 0.0;  // GetRealTime at SV_Spawn_f
+    char     pending_map[64] = {0};
+    uint8_t  pending         = 0;
+    uint16_t ticks           = 0;    // 1 Hz server ticks since spawn
 };
 
 // Per-client in-memory state (ring + delta baselines + identity).
@@ -108,10 +138,32 @@ struct ClientRuntime {
     uint32_t user_rate    = 0;      // userinfo "rate" (parsed, no alloc)
     float    last_voice_t = 0.0f;
     double   last_drop_t  = 0.0;    // engine real time of last drop record
+    // packet-quality match + jitter accumulators (design §24.3 п.1/п.2); the
+    // accumulator is drained by sample_clients, the packed match is (re)stamped
+    // at ClientConnected and cleared when the client leaves.
+    double   prev_pkt_real = 0.0;   // engine realtime of the last matched packet
+    bool     pkt_has_prev  = false;
+    uint32_t ip_packed     = 0;     // packed source IPv4 (0 = no match)
+    uint16_t port_packed   = 0;     // raw netadr_t port (network order)
+    uint32_t jit_min       = 0;
+    uint32_t jit_sum       = 0;
+    uint32_t jit_max       = 0;
+    uint32_t jit_count     = 0;
     char     ip[64]       = {0};
     char     steamid[32]  = {0};
     char     name[64]     = {0};
 };
+
+// Full reset of the per-client packet-quality state (packed IP+port match,
+// previous-packet clock, jitter accumulators). Called at ClientConnected and
+// when the client leaves; sample_clients clears only the accumulators.
+inline void reset_client_pkt_state(ClientRuntime& cr) noexcept {
+    cr.prev_pkt_real = 0.0;
+    cr.pkt_has_prev = false;
+    cr.ip_packed = 0;
+    cr.port_packed = 0;
+    jitter_reset(cr.jit_min, cr.jit_sum, cr.jit_max, cr.jit_count);
+}
 
 // Preallocated per-client identity cache (plan work item B). Stamped at
 // ClientConnected, refreshed live at emit time; indexed by slot 1..maxclients.
@@ -205,6 +257,32 @@ struct PluginContext {
     MassDropState massdrop;
     char          last_map[64] = {0};
 
+    // connect-timings (design §25): in-flight connect + delayed mapchange
+    ConnectCtx connect;
+    MapCtx     map_ctx;
+
+    // config-context (design §22.3): last emitted tracked-config snapshot and
+    // its validity; the first enabled server-tick baselines even without a
+    // change (CFG-4).
+    ConfigSnapshot last_config;
+    bool           last_config_valid = false;
+
+    // Stage 9 (`event-enrich`) baselines pulled on the 1 Hz tick: LogWriter
+    // health counters (EN-P1), the console transition guard, and the edict
+    // churn baseline (EN-P0/EN-5; reset on mapchange via SV_Spawn_f).
+    uint64_t prev_error_count  = 0;
+    uint32_t prev_prune_count  = 0;
+    bool     prev_log_enabled  = false;
+    int32_t  prev_edicts       = 0;
+    bool     edicts_has_prev   = false;
+
+    // host-metrics (design §23.3): environment caveat mask detected once at
+    // bootstrap plus the previous cumulative snapshot used as the Δ baseline.
+    // The first tick has no baseline and emits nulls (HM-2/QAS-H7).
+    HostSnapshot host_prev;
+    bool         host_has_prev    = false;
+    uint16_t     host_caveat_mask = 0;
+
     // modnet adapter state (mirrored from the header-free GOT adapter for
     // control output; synced on enable/disable/rescan). Server thread only.
     ModnetState   modnet;
@@ -212,6 +290,15 @@ struct PluginContext {
     // preallocated scratch buffers
     char line_buf[kLineBufSize];
 };
+
+// Closes the in-flight connect context when an attempt finishes (reject or
+// ClientConnected), so a stale marker cannot be attributed to a later connect
+// (CT-7). Server thread only.
+inline void reset_connect_ctx(PluginContext& c) noexcept {
+    c.connect.t0 = 0.0;
+    c.connect.steam_enter = 0.0;
+    c.connect.active = 0;
+}
 
 // Single process-wide context (server thread only, design §10).
 PluginContext& ctx() noexcept;
@@ -293,9 +380,16 @@ inline void append_u32_dec(char* out, size_t cap, size_t& pos, uint32_t v) noexc
     }
 }
 
+// Pack a 4-byte IPv4 address into a host-order uint32 (0.0.0.0 => 0).
+inline uint32_t pack_ip4(const unsigned char ip[4]) noexcept {
+    return (static_cast<uint32_t>(ip[0]) << 24) |
+           (static_cast<uint32_t>(ip[1]) << 16) |
+           (static_cast<uint32_t>(ip[2]) << 8) |
+           static_cast<uint32_t>(ip[3]);
+}
+
 // "a.b.c.d" into out (NUL-terminated).
-inline void format_ip(const netadr_t& a, char* out, size_t cap) noexcept {
-    if (cap == 0) {
+inline void format_ip(const netadr_t& a, char* out, size_t cap) noexcept {    if (cap == 0) {
         return;
     }
     size_t pos = 0;

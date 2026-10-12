@@ -110,21 +110,23 @@ class TestParserTolerance(unittest.TestCase):
         two = hldsmon.parse_records([fixture("truncated.jsonl"),
                                      fixture("types_ok.jsonl")])
         self.assertEqual(len(one), 2)
-        self.assertEqual(len(two), 2 + 11)
+        self.assertEqual(len(two), 2 + 15)
 
 
 class TestSummary(unittest.TestCase):
     def test_summary_all_types(self):
         code, out = run_cli("summary", fixture("types_ok.jsonl"))
         self.assertEqual(code, 0)
-        self.assertIn("Records: 11", out)
+        self.assertIn("Records: 15", out)
         self.assertIn("Players seen: 2 (7, 8)", out)
         self.assertIn("Reliable channel overflowed", out)
         self.assertIn("Hitch lines: 1", out)
         self.assertIn("Lag spikes (server frames >100ms): 0", out)
+        self.assertIn("Config: 1 records", out)
+        self.assertIn("Host: 1 records", out)
         for rtype in ("server", "client", "drop", "reject", "connect",
                       "netcmd", "massdrop", "packet", "hitch", "mapchange",
-                      "voice"):
+                      "voice", "config", "host", "degraded", "retention"):
             self.assertIn(rtype, out)
 
     def test_summary_deterministic(self):
@@ -227,13 +229,34 @@ class TestDigest(unittest.TestCase):
         code, out = run_cli("digest", fixture("types_ok.jsonl"))
         self.assertEqual(code, 0)
         data = json.loads(out)
-        self.assertEqual(data["records"], 11)
+        self.assertEqual(data["records"], 15)
         self.assertEqual(data["drop_count"], 1)
         self.assertEqual(data["players"], [7, 8])
         self.assertEqual(data["hitch_lines"], 1)
         self.assertEqual(data["counts_by_type"]["voice"], 1)
+        self.assertEqual(data["counts_by_type"]["config"], 1)
+        self.assertEqual(data["counts_by_type"]["host"], 1)
         self.assertEqual(data["top_drop_reasons"],
                          [["Reliable channel overflowed", 1]])
+
+    def test_digest_config_block(self):
+        data = hldsmon.build_digest(
+            hldsmon.parse_records([fixture("types_ok.jsonl")]))
+        self.assertEqual(data["config"]["records"], 1)
+        latest = data["config"]["latest"]
+        self.assertEqual(latest["map"], "de_dust2")
+        self.assertEqual(latest["maxclients"], 32)
+        self.assertEqual(latest["rehlds_major"], 3)
+        self.assertEqual(latest["sv_maxupdaterate"], 101.0)
+
+    def test_digest_config_null_tolerated(self):
+        records = [{"type": "config", "t": 1.0, "map": "de_nuke",
+                    "maxclients": 16, "sys_ticrate": None, "sv_maxrate": None}]
+        data = hldsmon.build_digest(records)
+        self.assertEqual(data["config"]["records"], 1)
+        latest = data["config"]["latest"]
+        self.assertIsNone(latest["sys_ticrate"])
+        self.assertIsNone(latest["sv_maxrate"])
 
     def test_digest_deterministic(self):
         a = run_cli("digest", fixture("types_ok.jsonl"))[1]
@@ -241,12 +264,90 @@ class TestDigest(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class TestHost(unittest.TestCase):
+    def test_known_types_include_host(self):
+        self.assertIn("host", hldsmon.KNOWN_TYPES)
+
+    def test_summary_host_line(self):
+        code, out = run_cli("summary", fixture("types_ok.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertIn("Host: 1 records", out)
+
+    def test_host_bit_constants_match_schema(self):
+        bits = list(hldsmon.HOST_PRESENT_BITS.values())
+        self.assertEqual(len(bits), len(hldsmon.HOST_FIELDS))
+        self.assertEqual(len(bits), len(set(bits)))
+        self.assertEqual(hldsmon.HOST_PRESENT_BITS["udp_rcvbuf_errors"], 1)
+        self.assertEqual(hldsmon.HOST_PRESENT_BITS["disk_bavail_mb"], 1 << 9)
+        self.assertEqual(hldsmon.HOST_CAVEAT_BITS["udp_netns"], 1)
+        self.assertEqual(hldsmon.HOST_CAVEAT_BITS["net_dev"], 1 << 1)
+        self.assertEqual(hldsmon.HOST_CAVEAT_BITS["truncated"], 1 << 5)
+
+    def test_host_series_null_tolerated(self):
+        series = hldsmon.host_series(
+            hldsmon.parse_records([fixture("host.jsonl")]))
+        self.assertEqual(len(series["t"]), 3)
+        # First sample has no Δ baseline => null, never a healthy zero.
+        self.assertEqual(series["udp_rcvbuf_errors"], [12, None, 3])
+        self.assertEqual(series["steal_pct"], [1.25, None, None])
+        self.assertEqual(series["disk_bavail_mb"], [12345, 12300, None])
+        self.assertEqual(series["present_mask"], [1023, 512, 1])
+        self.assertEqual(series["caveat_mask"], [3, 1, 1])
+
+    def test_digest_host_block_caveated_not_null(self):
+        data = hldsmon.build_digest(
+            hldsmon.parse_records([fixture("host.jsonl")]))
+        self.assertEqual(data["host"]["records"], 3)
+        latest = data["host"]["latest"]
+        # Caveated value stays present (design M4), unavailable disk is null.
+        self.assertEqual(latest["udp_rcvbuf_errors"], 3)
+        self.assertIsNone(latest["disk_bavail_mb"])
+        self.assertEqual(latest["present_mask"], 1)
+        self.assertEqual(latest["caveat_mask"], 1)
+        self.assertEqual(latest["caveats"], ["udp_netns"])
+
+    def test_digest_host_null_tolerated(self):
+        records = [{"type": "host", "t": 1.0, "udp_rcvbuf_errors": None,
+                    "present_mask": 512, "caveat_mask": 0,
+                    "disk_bavail_mb": 12345}]
+        data = hldsmon.build_digest(records)
+        latest = data["host"]["latest"]
+        self.assertIsNone(latest["udp_rcvbuf_errors"])
+        self.assertIsNone(latest["steal_pct"])
+        self.assertEqual(latest["disk_bavail_mb"], 12345)
+        self.assertEqual(latest["caveats"], [])
+
+
+class TestEventEnrich(unittest.TestCase):
+    def test_known_types_include_degraded_retention(self):
+        self.assertIn("degraded", hldsmon.KNOWN_TYPES)
+        self.assertIn("retention", hldsmon.KNOWN_TYPES)
+
+    def test_degraded_retention_parse(self):
+        records = hldsmon.parse_records([fixture("degraded.jsonl"),
+                                         fixture("retention.jsonl")])
+        self.assertEqual([r["type"] for r in records],
+                         ["degraded", "degraded", "retention"])
+        self.assertEqual(records[0]["error_count"], 3)
+        self.assertEqual(records[2]["removed"], 2)
+
+    def test_summary_degraded_retention_blocks(self):
+        code, out = run_cli("summary", fixture("degraded.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertIn("Records: 2", out)
+        self.assertIn("degraded", out)
+        code, out = run_cli("summary", fixture("retention.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertIn("Records: 1", out)
+        self.assertIn("retention", out)
+
+
 class TestExportCsv(unittest.TestCase):
     def test_export_all(self):
         code, out = run_cli("export-csv", fixture("types_ok.jsonl"))
         self.assertEqual(code, 0)
         lines = out.strip().splitlines()
-        self.assertEqual(len(lines), 1 + 11)  # header + records
+        self.assertEqual(len(lines), 1 + 15)  # header + records
         self.assertTrue(lines[0].startswith("type,t,"))
 
     def test_export_type_filter(self):
@@ -268,6 +369,9 @@ class TestNewEventTypes(unittest.TestCase):
     def test_known_types_include_shutdown_and_crash(self):
         self.assertIn("shutdown", hldsmon.KNOWN_TYPES)
         self.assertIn("crash", hldsmon.KNOWN_TYPES)
+
+    def test_known_types_include_config(self):
+        self.assertIn("config", hldsmon.KNOWN_TYPES)
 
     def test_shutdown_and_crash_parse(self):
         path = write_jsonl([
@@ -426,6 +530,40 @@ class TestClientSeries(unittest.TestCase):
         s7 = series["0:i7:gNone"]
         self.assertEqual(s7["flow_in_kbps"], [4.5, None])
         self.assertEqual(s7["flow_out_kbps"], [12.0, None])
+
+
+class TestLossRate(unittest.TestCase):
+    def test_rolling_mean_window_and_gaps(self):
+        self.assertEqual(hldsmon.rolling_mean([1, 2, 3, 4], 3),
+                         [1, 1.5, 2, 3])
+        self.assertEqual(hldsmon.rolling_mean([], 3), [])
+        self.assertEqual(hldsmon.rolling_mean([5, 7], 0), [5, 7])
+        self.assertEqual(hldsmon.rolling_mean([None, 10, None], 2),
+                         [None, 10, 10])
+        self.assertEqual(hldsmon.rolling_mean([None, None], 2),
+                         [None, None])
+
+    def test_loss_rate_fixture(self):
+        records = hldsmon.parse_records([fixture("client_quality.jsonl")])
+        rates = hldsmon.loss_rate_series(records)
+        self.assertEqual(set(rates.keys()), {"0:u7"})
+        vals = rates["0:u7"]
+        self.assertEqual(len(vals), 6)
+        self.assertEqual(vals[0], 0)
+        self.assertEqual(vals[1], 0)
+        self.assertAlmostEqual(vals[2], 100.0 / 3.0)
+        self.assertEqual(vals[3], 25)
+        self.assertEqual(vals[4], 20)
+        self.assertEqual(vals[5], 30)
+
+    def test_loss_rate_missing_sample_stays_none(self):
+        records = [
+            {"type": "client", "t": 1.0, "id": 7, "loss": 10},
+            {"type": "client", "t": 2.0, "id": 7},
+            {"type": "client", "t": 3.0, "id": 7, "loss": 20},
+        ]
+        rates = hldsmon.loss_rate_series(records, window=2)
+        self.assertEqual(rates["0:i7:gNone"], [10, 10, 20])
 
 
 class TestClientIdentities(unittest.TestCase):
@@ -925,6 +1063,392 @@ class TestModnetDigestAndCli(unittest.TestCase):
         code, out = run_cli("summary", fixture("truncated.jsonl"))
         self.assertEqual(code, 0)
         self.assertIn("Modnet: 0 records, modules: (none)", out)
+
+
+class TestConfigAt(unittest.TestCase):
+    def setUp(self):
+        self.records = [
+            {"type": "config", "t": 100.0, "map": "a"},
+            {"type": "server", "t": 150.0},
+            {"type": "config", "t": 200.0, "map": "b"},
+            {"type": "config", "t": 300.0, "map": "c"},
+        ]
+
+    def test_last_at_or_before(self):
+        self.assertEqual(hldsmon.config_at(self.records, 250.0)["map"], "b")
+
+    def test_boundary_is_inclusive(self):
+        self.assertEqual(hldsmon.config_at(self.records, 200.0)["map"], "b")
+
+    def test_tie_later_file_order_wins(self):
+        records = [
+            {"type": "config", "t": 10.0, "map": "first"},
+            {"type": "config", "t": 10.0, "map": "second"},
+        ]
+        self.assertEqual(hldsmon.config_at(records, 10.0)["map"], "second")
+
+    def test_none_before_all(self):
+        self.assertIsNone(hldsmon.config_at(self.records, 99.9))
+
+    def test_returns_the_record_not_a_copy(self):
+        self.assertIs(hldsmon.config_at(self.records, 300.0), self.records[3])
+
+    def test_unusable_timestamp_is_none(self):
+        self.assertIsNone(hldsmon.config_at(self.records, None))
+        self.assertIsNone(hldsmon.config_at(self.records, "nope"))
+
+    def test_no_config_records(self):
+        self.assertIsNone(
+            hldsmon.config_at([{"type": "server", "t": 1.0}], 5.0))
+
+
+class TestConfigDiff(unittest.TestCase):
+    def test_changed_fields_carry_both_values(self):
+        before = {"type": "config", "t": 1.0, "sys_ticrate": 100.0,
+                  "map": "a", "maxclients": 32}
+        after = {"type": "config", "t": 2.0, "sys_ticrate": 110.0,
+                 "map": "a", "maxclients": 16}
+        diff = hldsmon.config_diff(before, after)
+        self.assertTrue(diff["baseline"])
+        self.assertEqual(diff["changed"], [
+            {"field": "sys_ticrate", "before": 100.0, "after": 110.0},
+            {"field": "maxclients", "before": 32, "after": 16},
+        ])
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+
+    def test_null_side_is_set_or_cleared_not_changed(self):
+        before = {"sys_ticrate": None, "sv_timeout": 65.0, "map": "de_dust2"}
+        after = {"sys_ticrate": 100.0, "sv_timeout": None, "map": "de_dust2"}
+        diff = hldsmon.config_diff(before, after)
+        self.assertEqual(diff["changed"], [])
+        self.assertEqual(diff["added"], [
+            {"field": "sys_ticrate", "before": None, "after": 100.0}])
+        self.assertEqual(diff["removed"], [
+            {"field": "sv_timeout", "before": 65.0, "after": None}])
+
+    def test_missing_key_equals_null(self):
+        diff = hldsmon.config_diff({"sv_minrate": None}, {})
+        self.assertEqual(diff["changed"], [])
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+
+    def test_no_baseline_is_explicit_and_empty(self):
+        after = {"sys_ticrate": 100.0, "map": "de_dust2"}
+        for before in (None, "garbage", 7, []):
+            diff = hldsmon.config_diff(before, after)
+            self.assertFalse(diff["baseline"], repr(before))
+            self.assertEqual(diff["changed"], [])
+            self.assertEqual(diff["added"], [])
+            self.assertEqual(diff["removed"], [])
+
+    def test_missing_after_clears_present_fields(self):
+        diff = hldsmon.config_diff(
+            {"sys_ticrate": 100.0, "map": "a", "rehlds_major": 3}, None)
+        self.assertTrue(diff["baseline"])
+        self.assertEqual([e["field"] for e in diff["removed"]],
+                         ["sys_ticrate", "map", "rehlds_major"])
+        self.assertEqual(diff["added"], [])
+
+    def test_non_numeric_value_is_absent(self):
+        diff = hldsmon.config_diff({"sys_ticrate": "fast"},
+                                   {"sys_ticrate": 100.0})
+        self.assertEqual([e["field"] for e in diff["added"]], ["sys_ticrate"])
+        self.assertEqual(diff["changed"], [])
+
+    def test_equal_snapshot_has_no_changes(self):
+        rec = {"sys_ticrate": 100, "map": "a", "maxclients": 32.0,
+               "rehlds_major": 3, "rehlds_minor": 14}
+        diff = hldsmon.config_diff(rec, dict(rec, t=99.0))
+        self.assertTrue(diff["baseline"])
+        self.assertEqual(diff["changed"], [])
+        self.assertEqual(diff["added"], [])
+        self.assertEqual(diff["removed"], [])
+
+    def test_field_set_is_config_fields_plus_context(self):
+        self.assertEqual(
+            tuple(hldsmon.CONFIG_DIFF_FIELDS),
+            tuple(hldsmon.CONFIG_FIELDS) + ("map", "maxclients",
+                                            "rehlds_major", "rehlds_minor"))
+
+    def test_unknown_field_is_ignored(self):
+        diff = hldsmon.config_diff({"fps": 60.0}, {"fps": 30.0})
+        self.assertEqual(diff["changed"], [])
+
+
+class TestConfigSeries(unittest.TestCase):
+    def test_snapshots_carry_field_set_and_diffs(self):
+        records = [
+            {"type": "config", "t": 100.0, "map": "a", "sys_ticrate": 100.0},
+            {"type": "config", "t": 200.0, "map": "b", "sys_ticrate": 100.0},
+        ]
+        series = hldsmon.config_series(records)
+        self.assertEqual([s["t"] for s in series], [100.0, 200.0])
+        for snap in series:
+            for field in hldsmon.CONFIG_DIFF_FIELDS:
+                self.assertIn(field, snap)
+        self.assertFalse(series[0]["diff"]["baseline"])
+        self.assertEqual(series[1]["diff"]["changed"],
+                         [{"field": "map", "before": "a", "after": "b"}])
+
+    def test_window_baseline_is_taken_before_low(self):
+        records = [
+            {"type": "config", "t": 10.0, "sys_ticrate": 100.0},
+            {"type": "config", "t": 100.0, "sys_ticrate": 120.0},
+            {"type": "config", "t": 300.0, "sys_ticrate": 90.0},
+        ]
+        series = hldsmon.config_series(records, low=50.0, high=200.0)
+        self.assertEqual(len(series), 1)
+        self.assertTrue(series[0]["diff"]["baseline"])
+        self.assertEqual(series[0]["diff"]["changed"],
+                         [{"field": "sys_ticrate",
+                           "before": 100.0, "after": 120.0}])
+
+    def test_untimed_config_records_are_skipped(self):
+        series = hldsmon.config_series(
+            [{"type": "config"}, {"type": "config", "t": 5.0}])
+        self.assertEqual([s["t"] for s in series], [5.0])
+
+
+class TestHostFieldCaveats(unittest.TestCase):
+    def test_every_host_field_is_mapped(self):
+        self.assertEqual(set(hldsmon.HOST_FIELD_CAVEATS),
+                         set(hldsmon.HOST_FIELDS))
+
+    def test_expected_sources(self):
+        self.assertEqual(hldsmon.HOST_FIELD_CAVEATS, {
+            "udp_rcvbuf_errors": "udp_netns",
+            "udp_in_errors": "udp_netns",
+            "udp_in_csum_errors": "udp_netns",
+            "net_rx_dropped": "net_dev",
+            "net_rx_missed": "net_dev",
+            "net_rx_overruns": "net_dev",
+            "steal_pct": "steal",
+            "io_read_bytes": "io",
+            "io_write_bytes": "io",
+            "disk_bavail_mb": "disk",
+        })
+
+    def test_sources_are_known_caveat_bits(self):
+        for source in hldsmon.HOST_FIELD_CAVEATS.values():
+            self.assertIn(source, hldsmon.HOST_CAVEAT_BITS)
+
+    def test_bits_are_flattened_sources(self):
+        for field, source in hldsmon.HOST_FIELD_CAVEATS.items():
+            self.assertEqual(hldsmon.HOST_FIELD_CAVEAT_BITS[field],
+                             hldsmon.HOST_CAVEAT_BITS[source])
+
+
+def _bundle_records():
+    return [
+        {"type": "server", "t": 1000.0, "fps": 60.0},
+        {"type": "config", "t": 1000.5, "map": "de_dust2", "maxclients": 32,
+         "rehlds_major": 3, "rehlds_minor": 14, "sys_ticrate": 100.0,
+         "sv_timeout": 65.0},
+        {"type": "host", "t": 1001.0, "udp_rcvbuf_errors": 5,
+         "present_mask": 1, "caveat_mask": 1},
+        {"type": "drop", "t": 1002.0, "id": 7, "reason": "Timeout",
+         "category": "timeout", "window": [{"t": 1001.0, "ping": 40}]},
+        {"type": "client", "t": 1002.0, "id": 7, "ping": 45},
+        {"type": "server", "t": 1010.0, "fps": 59.0},
+    ]
+
+
+class TestIncidentBundle(unittest.TestCase):
+    def setUp(self):
+        self.records = _bundle_records()
+        self.drop = self.records[3]
+        self.bundle = hldsmon.incident_bundle(
+            self.records, self.drop, mins=0.05)
+
+    def test_envelope_keys_and_version(self):
+        self.assertEqual(self.bundle["bundle_version"], 1)
+        for key in ("drop", "window", "config", "host", "records", "warnings"):
+            self.assertIn(key, self.bundle)
+        self.assertIsInstance(self.bundle["warnings"], list)
+
+    def test_drop_is_embedded_as_is(self):
+        self.assertIs(self.bundle["drop"], self.drop)
+
+    def test_window_bounds_around_drop(self):
+        self.assertEqual(self.bundle["window"],
+                         {"start": 1002.0 - 3.0, "end": 1002.0 + 3.0})
+
+    def test_dedup_default_omits_raw_records(self):
+        self.assertEqual(self.bundle["records"], [])
+        self.assertTrue(any("dedup policy" in w for w in self.bundle["warnings"]))
+
+    def test_forced_records_exclude_the_embedded_drop(self):
+        bundle = hldsmon.incident_bundle(
+            self.records, self.drop, mins=0.05, include_records=True)
+        types = [r["type"] for r in bundle["records"]]
+        self.assertEqual(types, ["server", "config", "host", "client"])
+        self.assertNotIn(self.drop, bundle["records"])
+        self.assertTrue(any("dedup policy" in w for w in bundle["warnings"]))
+
+    def test_no_center_uses_full_span_and_keeps_records(self):
+        bundle = hldsmon.incident_bundle(self.records, None)
+        self.assertIsNone(bundle["drop"])
+        self.assertEqual(bundle["window"], {"start": 1000.0, "end": 1010.0})
+        self.assertEqual(bundle["records"], self.records)
+
+    def test_timestamp_center(self):
+        bundle = hldsmon.incident_bundle(self.records, 1002.0, mins=0.05)
+        self.assertIsNone(bundle["drop"])
+        self.assertEqual(bundle["window"]["start"], 999.0)
+        self.assertEqual([r["type"] for r in bundle["records"]],
+                         ["server", "config", "host", "drop", "client"])
+
+    def test_config_block_carries_snapshot(self):
+        self.assertEqual(len(self.bundle["config"]), 1)
+        snap = self.bundle["config"][0]
+        self.assertEqual(snap["map"], "de_dust2")
+        self.assertEqual(snap["sys_ticrate"], 100.0)
+        self.assertFalse(snap["diff"]["baseline"])
+
+    def test_config_block_falls_back_to_active_snapshot(self):
+        bundle = hldsmon.incident_bundle(self.records, 1010.0, mins=0.001)
+        self.assertEqual(len(bundle["config"]), 1)
+        self.assertEqual(bundle["config"][0]["t"], 1000.5)
+        self.assertFalse(bundle["config"][0]["diff"]["baseline"])
+
+    def test_host_block_carries_series(self):
+        host = self.bundle["host"]
+        self.assertEqual(host["records"], 1)
+        self.assertEqual(host["series"]["t"], [1001.0])
+        self.assertEqual(host["series"]["udp_rcvbuf_errors"], [5])
+        self.assertEqual(host["series"]["caveat_mask"], [1])
+
+    def test_bad_mins_rejected(self):
+        with self.assertRaises(ValueError):
+            hldsmon.incident_bundle(self.records, self.drop, mins=-1)
+        with self.assertRaises(ValueError):
+            hldsmon.incident_bundle(self.records, self.drop, mins="soon")
+
+    def test_bad_drop_rejected(self):
+        with self.assertRaises(ValueError):
+            hldsmon.incident_bundle(self.records, "drop")
+        with self.assertRaises(ValueError):
+            hldsmon.incident_bundle(self.records, {"type": "drop"})
+
+    def test_deterministic(self):
+        other = hldsmon.incident_bundle(self.records, self.drop, mins=0.05)
+        self.assertEqual(json.dumps(other, sort_keys=True),
+                         json.dumps(self.bundle, sort_keys=True))
+
+
+class TestBundleReader(unittest.TestCase):
+    def setUp(self):
+        self.records = _bundle_records()
+
+    def test_reingest_round_trip(self):
+        bundle = hldsmon.incident_bundle(self.records, None, mins=2.0)
+        expected = bundle["records"]
+        got = hldsmon.read_bundle(bundle)
+        self.assertEqual(got, expected)
+        path = write_jsonl(got)
+        try:
+            self.assertEqual(hldsmon.parse_records([path]), expected)
+        finally:
+            os.remove(path)
+
+    def test_reader_from_file(self):
+        import tempfile
+        bundle = hldsmon.incident_bundle(self.records, None)
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(bundle, fh)
+            self.assertEqual(hldsmon.read_bundle(path), bundle["records"])
+        finally:
+            os.remove(path)
+
+    def test_reader_deduplicated_bundle_yields_the_drop(self):
+        bundle = hldsmon.incident_bundle(self.records, self.records[3], mins=0.05)
+        self.assertEqual(hldsmon.read_bundle(bundle), [self.records[3]])
+
+    def test_reader_skips_unknown_types_in_records(self):
+        bundle = {"bundle_version": 1,
+                  "records": [{"type": "bogus", "t": 1.0},
+                              {"type": "server", "t": 2.0},
+                              "not a record", None]}
+        self.assertEqual([r["type"] for r in hldsmon.read_bundle(bundle)],
+                         ["server"])
+
+    def test_reader_sorts_by_time_with_untimed_last(self):
+        bundle = {"bundle_version": 1,
+                  "drop": {"type": "drop", "t": 5.0},
+                  "records": [{"type": "server", "t": 9.0},
+                              {"type": "server", "t": 1.0}]}
+        self.assertEqual([r["t"] for r in hldsmon.read_bundle(bundle)],
+                         [1.0, 5.0, 9.0])
+
+    def test_reader_rejects_non_bundle(self):
+        for bad in ({"records": []}, [], {}, 7, None):
+            with self.assertRaises(ValueError):
+                hldsmon.read_bundle(bad)
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            with self.assertRaises(ValueError):
+                hldsmon.read_bundle(path)
+        finally:
+            os.remove(path)
+
+
+class TestBundleSizeCap(unittest.TestCase):
+    def _records(self):
+        records = [
+            {"type": "client", "t": 1000.0 + i * 0.1, "id": i % 5,
+             "ping": 40 + i, "loss": i % 3}
+            for i in range(400)
+        ]
+        records.append({"type": "drop", "t": 1002.0, "id": 7,
+                        "reason": "Timeout", "category": "timeout"})
+        return records
+
+    def test_records_dropped_to_fit(self):
+        records = self._records()
+        drop = records[-1]
+        base = hldsmon.incident_bundle(records, drop, mins=0.05,
+                                       include_records=False)
+        cap = len(json.dumps(base, ensure_ascii=False).encode("utf-8")) + 400
+        bundle = hldsmon.incident_bundle(records, drop, mins=0.05,
+                                         include_records=True, max_bytes=cap)
+        self.assertEqual(bundle["records"], [])
+        self.assertLessEqual(
+            len(json.dumps(bundle, ensure_ascii=False).encode("utf-8")), cap)
+        self.assertTrue(any("raw window records dropped" in w
+                            for w in bundle["warnings"]))
+        self.assertFalse(any("trimmed" in w for w in bundle["warnings"]))
+
+    def test_drop_window_trimmed_to_fit(self):
+        drop = {"type": "drop", "t": 1002.0, "id": 7, "reason": "Timeout",
+                "category": "timeout",
+                "window": [{"t": 1000.0 + i * 0.01, "ping": 40 + i,
+                            "loss": i % 4} for i in range(40)]}
+        records = [drop] + [
+            {"type": "client", "t": 1000.0 + i * 0.01, "id": i % 5,
+             "ping": 40 + i} for i in range(40)]
+        cap = 1500
+        bundle = hldsmon.incident_bundle(records, drop, mins=0.05,
+                                         max_bytes=cap, include_records=True)
+        self.assertLessEqual(
+            len(json.dumps(bundle, ensure_ascii=False).encode("utf-8")), cap)
+        self.assertLess(len(bundle["drop"]["window"]), 40)
+        self.assertTrue(any("trimmed" in w for w in bundle["warnings"]))
+        self.assertEqual(len(drop["window"]), 40)  # input untouched
+
+    def test_impossible_cap_warns_and_keeps_the_drop(self):
+        records = self._records()
+        drop = records[-1]
+        bundle = hldsmon.incident_bundle(records, drop, mins=0.05,
+                                         max_bytes=10)
+        self.assertEqual(bundle["records"], [])
+        self.assertIs(bundle["drop"], drop)
+        self.assertTrue(any("exceeds" in w for w in bundle["warnings"]))
 
 
 if __name__ == "__main__":

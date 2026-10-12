@@ -13,6 +13,11 @@ void sampler_on_frame(double frame_ms, double now_real) noexcept;
 // Current map name from the engine globals (never null; may be empty).
 const char* current_map() noexcept;
 
+// Fills `out` from the cached tracked-cvar pointers: memsets first (CFG-5),
+// then sets a `present` bit and the value for each resolved cvar (design §22.3
+// п.2). No allocation; server thread only.
+void build_config_snapshot(ConfigSnapshot& out) noexcept;
+
 } // namespace hldsmon
 
 #endif // HLDSMON_SAMPLER_H

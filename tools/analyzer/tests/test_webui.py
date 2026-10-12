@@ -218,6 +218,109 @@ class TestExportBytes(unittest.TestCase):
             webui.export_bytes(fixture_bytes(), rtype="bogus")
 
 
+def _telemetry_fixture_bytes():
+    """A log with server/config/host/client/drop records (stage-10 payload)."""
+    entries = [
+        {"type": "server", "t": 1000.0, "fps": 60.0},
+        {"type": "config", "t": 1000.5, "map": "de_dust2", "maxclients": 32,
+         "rehlds_major": 3, "rehlds_minor": 14, "sys_ticrate": 100.0,
+         "sv_timeout": 65.0},
+        {"type": "host", "t": 1001.0, "udp_rcvbuf_errors": 5,
+         "udp_in_errors": None, "net_rx_dropped": 2, "steal_pct": 1.5,
+         "io_read_bytes": 10, "io_write_bytes": 20, "disk_bavail_mb": 1000,
+         "present_mask": 1023, "caveat_mask": 1},
+        {"type": "host", "t": 1002.0, "udp_rcvbuf_errors": None,
+         "udp_in_errors": 1, "net_rx_dropped": None, "steal_pct": None,
+         "io_read_bytes": None, "io_write_bytes": None, "disk_bavail_mb": 999,
+         "present_mask": 512, "caveat_mask": 1},
+        {"type": "client", "t": 1002.5, "id": 7, "ping": 45},
+        {"type": "config", "t": 1004.0, "map": "de_nuke", "maxclients": 32,
+         "rehlds_major": 3, "rehlds_minor": 14, "sys_ticrate": 120.0,
+         "sv_timeout": 65.0},
+        {"type": "drop", "t": 1003.0, "id": 7, "reason": "Timeout",
+         "category": "timeout", "window": [{"t": 1002.5, "ping": 45}]},
+    ]
+    return ("\n".join(json.dumps(e) for e in entries) + "\n").encode("utf-8")
+
+
+class TestAnalyzeTelemetryPayload(unittest.TestCase):
+    def setUp(self):
+        self.payload = webui.analyze_bytes(_telemetry_fixture_bytes())
+
+    def test_host_series_key(self):
+        host = self.payload["host_series"]
+        for key in ("t", "udp_rcvbuf_errors", "net_rx_dropped", "steal_pct",
+                    "io_read_bytes", "io_write_bytes", "disk_bavail_mb",
+                    "present_mask", "caveat_mask"):
+            self.assertIn(key, host, key)
+        self.assertEqual(host["t"], [1001.0, 1002.0])
+        self.assertEqual(host["udp_rcvbuf_errors"], [5, None])
+        self.assertEqual(host["udp_in_errors"], [None, 1])
+        self.assertEqual(host["caveat_mask"], [1, 1])
+
+    def test_host_caveats_map_covers_fields(self):
+        caveats = self.payload["host_caveats"]
+        self.assertEqual(set(caveats), set(hldsmon.HOST_FIELDS))
+        self.assertEqual(caveats["udp_in_errors"],
+                         {"source": "udp_netns", "bit": 1})
+        self.assertEqual(caveats["net_rx_dropped"],
+                         {"source": "net_dev", "bit": 2})
+        self.assertEqual(caveats["disk_bavail_mb"]["source"], "disk")
+
+    def test_config_array_with_diffs(self):
+        config = self.payload["config"]
+        self.assertEqual([c["t"] for c in config], [1000.5, 1004.0])
+        self.assertEqual(config[0]["map"], "de_dust2")
+        self.assertFalse(config[0]["diff"]["baseline"])
+        second = config[1]["diff"]
+        self.assertTrue(second["baseline"])
+        self.assertEqual(second["changed"], [
+            {"field": "sys_ticrate", "before": 100.0, "after": 120.0},
+            {"field": "map", "before": "de_dust2", "after": "de_nuke"},
+        ])
+        self.assertEqual(second["added"], [])
+        self.assertEqual(second["removed"], [])
+
+
+class TestBundleBytes(unittest.TestCase):
+    def setUp(self):
+        self.data = _telemetry_fixture_bytes()
+        self.bundle = webui.bundle_bytes(self.data, 0, 2.0)
+
+    def test_envelope_shape(self):
+        self.assertEqual(self.bundle["bundle_version"], 1)
+        self.assertEqual(self.bundle["drop"]["reason"], "Timeout")
+        self.assertEqual(self.bundle["window"],
+                         {"start": 1003.0 - 120.0, "end": 1003.0 + 120.0})
+        self.assertEqual(self.bundle["host"]["records"], 2)
+        self.assertEqual(len(self.bundle["config"]), 2)
+        self.assertEqual(self.bundle["records"], [])
+        self.assertTrue(self.bundle["warnings"])
+
+    def test_drop_index_out_of_range(self):
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, 1, 2.0)
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, -1, 2.0)
+
+    def test_bad_drop_index_type(self):
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, "0", 2.0)
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, True, 2.0)
+
+    def test_no_drops(self):
+        data = json.dumps({"type": "server", "t": 1.0}).encode("utf-8")
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(data, 0, 2.0)
+
+    def test_invalid_mins(self):
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, 0, -1)
+        with self.assertRaises(ValueError):
+            webui.bundle_bytes(self.data, 0, "soon")
+
+
 class TestHTTP(unittest.TestCase):
     def setUp(self):
         self.server = webui.make_server("127.0.0.1", 0)
@@ -285,6 +388,40 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(status, 400)
         data = json.loads(body.decode("utf-8"))
         self.assertFalse(data["ok"])
+
+    def test_post_bundle(self):
+        status, headers, body = self._request(
+            "POST", "/api/bundle?drop=0&mins=2",
+            data=_telemetry_fixture_bytes(),
+            headers={"Content-Type": "application/octet-stream"})
+        self.assertEqual(status, 200)
+        self.assertTrue(
+            headers.get("Content-Type").startswith("application/json"))
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["bundle_version"], 1)
+        self.assertEqual(data["drop"]["reason"], "Timeout")
+        self.assertEqual(data["window"],
+                         {"start": 1003.0 - 120.0, "end": 1003.0 + 120.0})
+        self.assertEqual(data["host"]["records"], 2)
+        self.assertIn("config", data)
+        self.assertIn("records", data)
+
+    def test_post_bundle_requires_valid_drop_index(self):
+        for path in ("/api/bundle",
+                     "/api/bundle?drop=abc",
+                     "/api/bundle?drop=99"):
+            status, _, body = self._request(
+                "POST", path, data=_telemetry_fixture_bytes())
+            self.assertEqual(status, 400, path)
+            data = json.loads(body.decode("utf-8"))
+            self.assertFalse(data["ok"])
+
+    def test_post_bundle_invalid_mins(self):
+        for mins in ("abc", "-1"):
+            status, _, body = self._request(
+                "POST", "/api/bundle?drop=0&mins=" + mins,
+                data=_telemetry_fixture_bytes())
+            self.assertEqual(status, 400, mins)
 
     def test_unknown_path_404(self):
         status, headers, body = self._request("GET", "/nope")

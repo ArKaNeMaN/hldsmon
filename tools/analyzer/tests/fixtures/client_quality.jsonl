@@ -1,0 +1,6 @@
+{"type":"client","t":1712345670.0,"id":7,"gen":1712000000,"userid":7,"ping":40,"loss":0,"jit_min_ms":1,"jit_avg_ms":2,"jit_max_ms":5}
+{"type":"client","t":1712345671.0,"id":7,"gen":1712000000,"userid":7,"ping":41,"loss":0,"jit_min_ms":1,"jit_avg_ms":3,"jit_max_ms":9}
+{"type":"client","t":1712345672.0,"id":7,"gen":1712000000,"userid":7,"ping":90,"loss":100,"jit_min_ms":40,"jit_avg_ms":120,"jit_max_ms":400}
+{"type":"client","t":1712345673.0,"id":7,"gen":1712000000,"userid":7,"ping":75,"loss":0,"jit_min_ms":2,"jit_avg_ms":8,"jit_max_ms":30}
+{"type":"client","t":1712345674.0,"id":7,"gen":1712000000,"userid":7,"ping":44,"loss":0,"jit_min_ms":1,"jit_avg_ms":2,"jit_max_ms":6}
+{"type":"client","t":1712345675.0,"id":7,"gen":1712000000,"userid":7,"ping":60,"loss":50,"jit_min_ms":5,"jit_avg_ms":25,"jit_max_ms":80}

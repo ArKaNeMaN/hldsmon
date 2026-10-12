@@ -9,3 +9,7 @@
 {"type":"hitch","t":1712345681.5,"duration_ms":120}
 {"type":"mapchange","t":1712345682.0,"map":"de_nuke"}
 {"type":"voice","t":1712345682.5,"id":7,"last_voice_time":1712345680.0}
+{"type":"config","t":1755000000.0,"rehlds_major":3,"rehlds_minor":14,"map":"de_dust2","maxclients":32,"sys_ticrate":100.0,"host_framerate":0.0,"sv_timeout":65.0,"sv_maxrate":0.0,"sv_minrate":0.0,"sv_maxupdaterate":101.0,"sv_minupdaterate":10.0,"sv_maxcmdrate":101.0,"sv_mincmdrate":10.0}
+{"type":"host","t":1755000000.0,"udp_rcvbuf_errors":0,"udp_in_errors":0,"udp_in_csum_errors":0,"net_rx_dropped":0,"net_rx_missed":0,"net_rx_overruns":0,"steal_pct":0.0,"io_read_bytes":0,"io_write_bytes":0,"disk_bavail_mb":12345,"present_mask":1023,"caveat_mask":3}
+{"type":"degraded","t":1712345683.0,"error_count":2}
+{"type":"retention","t":1712345683.5,"removed":1}

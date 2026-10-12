@@ -13,13 +13,6 @@
 namespace hldsmon {
 namespace {
 
-inline uint32_t pack_ip4(const unsigned char ip[4]) noexcept {
-    return (static_cast<uint32_t>(ip[0]) << 24) |
-           (static_cast<uint32_t>(ip[1]) << 16) |
-           (static_cast<uint32_t>(ip[2]) << 8) |
-           static_cast<uint32_t>(ip[3]);
-}
-
 inline uint16_t rel_fill16(int reliable_length) noexcept {
     if (reliable_length <= 0) {
         return 0;
@@ -69,7 +62,8 @@ void ip_insert(uint32_t ip) noexcept {
 }
 
 void emit_reject(const netadr_t* adr, const char* stage, const char* detail,
-                 const char* steamid) noexcept {
+                 const char* steamid, uint32_t stage_ms, uint32_t total_ms,
+                 uint8_t timing_present) noexcept {
     if (!plugin_enabled()) {
         return;
     }
@@ -82,8 +76,40 @@ void emit_reject(const netadr_t* adr, const char* stage, const char* detail,
     copy_str(r.steamid, sizeof(r.steamid), steamid != nullptr ? steamid : "");
     copy_str(r.stage, sizeof(r.stage), stage != nullptr ? stage : "");
     copy_str(r.detail, sizeof(r.detail), detail != nullptr ? detail : "");
+    r.stage_ms = stage_ms;
+    r.total_ms = total_ms;
+    r.timing_present = timing_present;
     events::write_reject(r);
     ++ctx().reject_count;
+}
+
+// Current engine real time, or 0.0 when the funcs table is not available.
+inline double engine_now_real() noexcept {
+    const PluginContext& c = ctx();
+    return c.funcs != nullptr ? c.funcs->GetRealTime() : 0.0;
+}
+
+// Reject tail shared by every validator and the Steam auth hook: fill stage_ms
+// (the duration around the rejecting callNext) and total_ms (from the
+// SV_ConnectClient marker), emit the record, then close the connect context.
+// A missing marker or a guard-rejected delta leaves the bit clear => null
+// (CT-6/CT-8).
+void reject_with_timing(const netadr_t* adr, const char* stage, const char* detail,
+                        const char* steamid, double begin_real) noexcept {
+    PluginContext& c = ctx();
+    const double end_real = engine_now_real();
+    uint32_t stage_ms = 0;
+    uint32_t total_ms = 0;
+    uint8_t present = 0;
+    if (timing_delta_ms(end_real - begin_real, stage_ms)) {
+        present |= kTimingStageMs;
+    }
+    if (c.connect.active != 0 && c.connect.t0 > 0.0 &&
+        timing_delta_ms(end_real - c.connect.t0, total_ms)) {
+        present |= kTimingTotalMs;
+    }
+    emit_reject(adr, stage, detail, steamid, stage_ms, total_ms, present);
+    reset_connect_ctx(c);
 }
 
 void update_massdrop(const char* category, double now_real) noexcept {
@@ -179,6 +205,7 @@ void build_drop_record(int id, IGameClient* live, bool crash, const char* reason
     rec.gen = (id >= 0 && id < c.maxclients) ? c.clients[id].gen : 0;
     copy_str(rec.reason, sizeof(rec.reason), reason != nullptr ? reason : "");
     classify_reason(reason, rec.category, sizeof(rec.category));
+    classify_detector(reason, rec.detector, sizeof(rec.detector));
     rec.crash = crash ? 1 : 0;
     copy_str(rec.observed_via, sizeof(rec.observed_via),
              observed_via != nullptr ? observed_via : "unknown");
@@ -186,12 +213,14 @@ void build_drop_record(int id, IGameClient* live, bool crash, const char* reason
 
     const double now_real = c.funcs != nullptr ? c.funcs->GetRealTime() : 0.0;
     rec.netchan.now_real = static_cast<float>(now_real);
-    if (g_engfuncs.pfnCVarGetPointer != nullptr) {
-        const cvar_t* tmo = g_engfuncs.pfnCVarGetPointer("sv_timeout");
-        if (tmo != nullptr) {
-            rec.netchan.sv_timeout = tmo->value;
-        }
+    // P1 compatibility keeps netchan.sv_timeout, but it is now read from the
+    // cached cvar_t* — never a by-name lookup on the drop path (CM-1, CFG-3).
+    if (c.cvars.sv_timeout != nullptr) {
+        rec.netchan.sv_timeout = c.cvars.sv_timeout->value;
     }
+    // Live tracked-config snapshot; authoritative rate/timeout context (QAS-C3,
+    // CFG-3).
+    build_config_snapshot(rec.config);
 
     client_t* ct = client_by_id(c.svs, id);
     if (ct != nullptr) {
@@ -257,7 +286,7 @@ void build_drop_record(int id, IGameClient* live, bool crash, const char* reason
         ++count;
         const float l = o->packet_loss;
         sum_loss += static_cast<double>(l);
-        sum_ping += static_cast<double>(o->latency);
+        sum_ping += static_cast<double>(ping_ms_from_latency(o->latency));
         if (l > max_loss) {
             max_loss = l;
         }
@@ -267,6 +296,40 @@ void build_drop_record(int id, IGameClient* live, bool crash, const char* reason
         rec.neighbors.avg_loss = static_cast<float>(sum_loss / static_cast<double>(count));
         rec.neighbors.avg_ping = static_cast<float>(sum_ping / static_cast<double>(count));
         rec.neighbors.max_loss = max_loss;
+    }
+}
+
+// Accumulate one client's inter-arrival jitter for the packet arriving from
+// `adr` (design §24.3 п.1/п.2). Client lookup is a bounded linear scan
+// (<= MAX_CLIENTS) of packed IP+port, gated by `active` so a stale slot cannot
+// capture a reused address; integer compares and O(1) work, no allocation.
+void accumulate_packet_jitter(const netadr_t& adr) noexcept {
+    PluginContext& c = ctx();
+    if (adr.type != NA_IP) {
+        return;
+    }
+    const uint32_t ip = pack_ip4(adr.ip);
+    if (ip == 0u) {
+        return;
+    }
+    const uint16_t port = adr.port;
+    for (int id = 0; id < c.maxclients; ++id) {
+        ClientRuntime& cr = c.clients[id];
+        if (cr.ip_packed != ip || cr.port_packed != port) {
+            continue;
+        }
+        client_t* ct = client_by_id(c.svs, id);
+        if (ct == nullptr || !ct->active) {
+            continue;
+        }
+        const double now_real = c.funcs != nullptr ? c.funcs->GetRealTime() : 0.0;
+        uint32_t delta_ms = 0;
+        if (cr.pkt_has_prev && jitter_delta_ms(now_real, cr.prev_pkt_real, delta_ms)) {
+            jitter_add_ms(cr.jit_min, cr.jit_sum, cr.jit_max, cr.jit_count, delta_ms);
+        }
+        cr.prev_pkt_real = now_real;
+        cr.pkt_has_prev = true;
+        return;   // IP+port is unique among the active slots
     }
 }
 
@@ -308,6 +371,7 @@ void h_Steam_NotifyClientDisconnect(IRehldsHook_Steam_NotifyClientDisconnect* ch
             }
             c.clients[id].ring.clear();
             c.clients[id].has_prev = false;
+            reset_client_pkt_state(c.clients[id]);
         }
     }
     chain->callNext(cl);
@@ -326,6 +390,7 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
             cr.user_rate = 0;
             cr.last_voice_t = 0.0f;
             cr.last_drop_t = 0.0;
+            reset_client_pkt_state(cr);
 
             uint64_t sid = 0;
             USERID_t* uid = cl->GetNetworkUserID();
@@ -336,11 +401,32 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
             cr.gen = sid != 0 ? static_cast<uint32_t>(sid & 0xFFFFFFFFull)
                               : static_cast<uint32_t>(now_real);
 
+            // Connect-pipeline timings (design §25.3 п.1, CT-P0): auth_ms is
+            // measured to here; steam_ms was cached by the Steam hook. With no
+            // active context (short-circuit/abandoned attempt) both stay null.
+            uint32_t auth_ms = 0;
+            uint32_t steam_ms = 0;
+            uint8_t timing_present = 0;
+            if (c.connect.active != 0) {
+                if (c.connect.t0 > 0.0 &&
+                    timing_delta_ms(now_real - c.connect.t0, auth_ms)) {
+                    timing_present |= kTimingAuthMs;
+                }
+                if (timing_delta_ms(c.connect.steam_enter, steam_ms)) {
+                    timing_present |= kTimingSteamMs;
+                }
+                reset_connect_ctx(c);
+            }
+
             INetChan* nc = cl->GetNetChan();
             if (nc != nullptr) {
                 const netadr_t* a = nc->GetRemoteAdr();
                 if (a != nullptr) {
                     format_ip(*a, cr.ip, sizeof(cr.ip));
+                    if (a->type == NA_IP) {
+                        cr.ip_packed = pack_ip4(a->ip);
+                        cr.port_packed = a->port;
+                    }
                 }
             }
             format_steamid(sid, cr.steamid, sizeof(cr.steamid));
@@ -355,6 +441,9 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
                 copy_str(rec.ip, sizeof(rec.ip), cr.ip);
                 copy_str(rec.steamid, sizeof(rec.steamid), cr.steamid);
                 copy_str(rec.name, sizeof(rec.name), cr.name);
+                rec.auth_ms = auth_ms;
+                rec.steam_ms = steam_ms;
+                rec.timing_present = timing_present;
                 events::write_connect(rec);
             }
         }
@@ -363,57 +452,69 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
 }
 
 void h_SV_ConnectClient(IRehldsHook_SV_ConnectClient* chain) {
-    if (ctx().attached) {
-        ++ctx().connect_attempts;
+    PluginContext& c = ctx();
+    if (c.attached) {
+        ++c.connect_attempts;
+        // New in-flight attempt: overwrite any stale/abandoned context (CT-7).
+        c.connect.t0 = engine_now_real();
+        c.connect.steam_enter = 0.0;
+        c.connect.active = 1;
     }
     chain->callNext();
 }
 
 int h_SV_CheckProtocol(IRehldsHook_SV_CheckProtocol* chain, netadr_t* adr, int protocol) {
+    const double begin_real = engine_now_real();
     const int r = chain->callNext(adr, protocol);
     if (r == 0) {
-        emit_reject(adr, "SV_CheckProtocol", "", "");
+        reject_with_timing(adr, "SV_CheckProtocol", "", "", begin_real);
     }
     return r;
 }
 
 int h_SV_CheckIPRestrictions(IRehldsHook_SV_CheckIPRestrictions* chain, netadr_t* adr, int type) {
+    const double begin_real = engine_now_real();
     const int r = chain->callNext(adr, type);
     if (r == 0) {
-        emit_reject(adr, "SV_CheckIPRestrictions", "", "");
+        reject_with_timing(adr, "SV_CheckIPRestrictions", "", "", begin_real);
     }
     return r;
 }
 
 int h_SV_FinishCertificateCheck(IRehldsHook_SV_FinishCertificateCheck* chain, netadr_t* adr,
                                  int type, char* key, char* val) {
+    const double begin_real = engine_now_real();
     const int r = chain->callNext(adr, type, key, val);
     if (r == 0) {
-        emit_reject(adr, "SV_FinishCertificateCheck", val, "");
+        reject_with_timing(adr, "SV_FinishCertificateCheck", val, "", begin_real);
     }
     return r;
 }
 
 int h_SV_CheckKeyInfo(IRehldsHook_SV_CheckKeyInfo* chain, netadr_t* adr, char* key,
                        uint16* pkc, int* pkg, char* steamid, char* val) {
+    const double begin_real = engine_now_real();
     const int r = chain->callNext(adr, key, pkc, pkg, steamid, val);
     if (r == 0) {
-        emit_reject(adr, "SV_CheckKeyInfo", val, steamid);
+        reject_with_timing(adr, "SV_CheckKeyInfo", val, steamid, begin_real);
     }
     return r;
 }
 
 int h_SV_CheckUserInfo(IRehldsHook_SV_CheckUserInfo* chain, netadr_t* adr, char* userinfo,
                         qboolean reconnect, int slot, char* name) {
+    const double begin_real = engine_now_real();
     const int r = chain->callNext(adr, userinfo, reconnect, slot, name);
     if (r == 0) {
-        emit_reject(adr, "SV_CheckUserInfo", userinfo, "");
+        reject_with_timing(adr, "SV_CheckUserInfo", userinfo, "", begin_real);
     }
     return r;
 }
 
 qboolean h_Steam_NotifyClientConnect(IRehldsHook_Steam_NotifyClientConnect* chain,
                                      IGameClient* cl, const void* key, unsigned int len) {
+    PluginContext& c = ctx();
+    const double begin_real = engine_now_real();
     const qboolean r = chain->callNext(cl, key, len);
     if (r == 0) {
         char sid[32];
@@ -424,7 +525,12 @@ qboolean h_Steam_NotifyClientConnect(IRehldsHook_Steam_NotifyClientConnect* chai
                 format_steamid(uid->m_SteamID, sid, sizeof(sid));
             }
         }
-        emit_reject(nullptr, "Steam_NotifyClientConnect", "", sid);
+        reject_with_timing(nullptr, "Steam_NotifyClientConnect", "", sid, begin_real);
+    } else if (c.attached && c.connect.active != 0) {
+        // Cache the measured Steam-stage duration for the connect record
+        // emitted at ClientConnected; 0 = not measured (guard => null).
+        const double steam_s = engine_now_real() - begin_real;
+        c.connect.steam_enter = steam_s > 0.0 ? steam_s : 0.0;
     }
     return r;
 }
@@ -452,6 +558,11 @@ bool h_PreprocessPacket(IRehldsHook_PreprocessPacket* chain, uint8* data,
             ++c.pkt_sizes.ge1024;
         }
         ip_insert(pack_ip4(adr.ip));
+        // Jitter is drained per-client only while per-client sampling runs
+        // (CQ-4); the same gate keeps the match off the hot path when off.
+        if (cvar_f(c.cvars.client_hz, 1.0f) > 0.0f) {
+            accumulate_packet_jitter(adr);
+        }
     }
     return chain->callNext(data, len, adr);
 }
@@ -497,12 +608,19 @@ void h_SV_Spawn_f(IRehldsHook_SV_Spawn_f* chain) {
             c.massdrop.category[0] = '\0';
             c.massdrop.count = 0;
             c.massdrop.emitted = false;
+            // Edict churn baseline resets on mapchange (EN-5): the first 1 Hz
+            // interval after the spawn reports `edicts_churn` as null.
+            c.edicts_has_prev = false;
+            c.prev_edicts = 0;
+            // Delayed-emission (CT-2): record the spawn marker only; the 1 Hz
+            // server tick emits `mapchange` once the world is ready (or after
+            // the window) so load_ms can be measured.
             if (plugin_enabled()) {
-                MapChangeRecord rec;
-                std::memset(&rec, 0, sizeof(rec));
-                rec.t = platform_wall_seconds();
-                copy_str(rec.map, sizeof(rec.map), m);
-                events::write_mapchange(rec);
+                MapCtx& mc = c.map_ctx;
+                mc.t_spawn = engine_now_real();
+                copy_str(mc.pending_map, sizeof(mc.pending_map), m);
+                mc.pending = 1;
+                mc.ticks = 0;
             }
         }
         modnet_request_rescan();

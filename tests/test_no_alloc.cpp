@@ -7,6 +7,7 @@
 // must stay at zero. std::string is deliberately absent from the measured path.
 
 #include "serialization.h"
+#include "host_metrics.h"
 #include "modnet.h"
 
 #include <cstddef>
@@ -62,6 +63,10 @@ static ClientSample make_client(uint8_t id) {
     c.flow_out_kbps = 18.1f;
     c.flow_in_avg = 12.0f;
     c.flow_out_avg = 18.0f;
+    c.idle_ms = 1200u + id;
+    c.jit_min_ms = 1;
+    c.jit_avg_ms = 7;
+    c.jit_max_ms = 40 + id;
     return c;
 }
 
@@ -89,8 +94,9 @@ int main() {
     d.netchan.rate = 20000;
     d.netchan.last_received = 1000.0f;
     d.netchan.connect_time = 900.0f;
-    d.window_count = 50;
-    for (uint8_t i = 0; i < 50; ++i) {
+    // Full drop window (worst-case line size for kLineBufSize headroom).
+    d.window_count = 64;
+    for (uint8_t i = 0; i < 64; ++i) {
         d.window[i] = make_client(i);
     }
     d.server.t = 3.0;
@@ -157,6 +163,97 @@ int main() {
         ++g_fail;
     }
 
+    PacketStats ps;
+    std::memset(&ps, 0, sizeof ps);
+    ps.t = 1712345679.0;
+    ps.pps = 100;
+    std::strcpy(ps.top_ip, "9.9.9.9");
+    std::strcpy(ps.top_ips[0].ip, "9.9.9.9");
+    ps.top_ips[0].count = 5;
+    const size_t n_packet = write_packet_json(buf, sizeof buf, ps);
+    if (n_packet == 0) {
+        std::printf("FAIL: packet serialization returned 0\n");
+        ++g_fail;
+    }
+
+    DegradedRecord dr;
+    std::memset(&dr, 0, sizeof dr);
+    dr.t = 1712345679.0;
+    dr.error_count = 3;
+    const size_t n_degraded = write_degraded_json(buf, sizeof buf, dr);
+    if (n_degraded == 0) {
+        std::printf("FAIL: degraded serialization returned 0\n");
+        ++g_fail;
+    }
+
+    RetentionRecord rr;
+    std::memset(&rr, 0, sizeof rr);
+    rr.t = 1712345679.0;
+    rr.removed = 2;
+    const size_t n_retention = write_retention_json(buf, sizeof buf, rr);
+    if (n_retention == 0) {
+        std::printf("FAIL: retention serialization returned 0\n");
+        ++g_fail;
+    }
+
+    ConfigSnapshot cfg_a;
+    std::memset(&cfg_a, 0, sizeof cfg_a);
+    ConfigSnapshot cfg_b;
+    std::memset(&cfg_b, 0, sizeof cfg_b);
+    cfg_b.present = kCfgSvTimeout | kCfgSvMaxrate;
+    cfg_b.sv_timeout = 65.0f;
+    cfg_b.sv_maxrate = 30000.0f;
+    const bool cfg_diff = config_changed(cfg_a, cfg_b);
+
+    ConfigRecord cr;
+    std::memset(&cr, 0, sizeof cr);
+    cr.t = 1712345679.0;
+    cr.rehlds_major = 3;
+    cr.rehlds_minor = 14;
+    std::strcpy(cr.map, "de_dust2");
+    cr.maxclients = 32;
+    cr.config = cfg_b;
+    const size_t n_config = write_config_json(buf, sizeof buf, cr);
+    if (n_config == 0) {
+        std::printf("FAIL: config serialization returned 0\n");
+        ++g_fail;
+    }
+
+    // Host-metrics (QAS-H4/HM-4): the whole gather -> parse -> compose ->
+    // serialize path must stay allocation-free as well.
+    HostSnapshot hs_prev;
+    std::memset(&hs_prev, 0, sizeof hs_prev);
+    HostSnapshot hs_cur;
+    std::memset(&hs_cur, 0, sizeof hs_cur);
+    char hfile[4096];
+    size_t hlen = 0;
+    bool htrunc = false;
+    if (read_file("/proc/stat", hfile, sizeof hfile, &hlen, &htrunc)) {
+        parse_stat(hfile, hs_cur);
+    }
+    parse_snmp_udp(
+        "Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors\n"
+        "Udp: 10 0 5 20 3\n",
+        hs_cur);
+    parse_net_dev(
+        " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+        " eth0: 1 2 0 4 0 0 0 0 1 2 0 0 0 0 0 0\n",
+        hs_cur);
+    parse_self_io("read_bytes: 100\nwrite_bytes: 200\n", hs_cur);
+    uint64_t hbav = 0;
+    if (statvfs_bavail(".", &hbav)) {
+        hs_cur.disk_bavail_mb = hbav;
+        hs_cur.present |= kHostDiskBavailMb;
+    }
+    HostRecord hr;
+    build_host_record(hs_prev, /*has_prev=*/false, hs_cur, kCaveatNetDev, false,
+                      1712345679.0, hr);
+    const size_t n_host = write_host_json(buf, sizeof buf, hr);
+    if (n_host == 0) {
+        std::printf("FAIL: host serialization returned 0\n");
+        ++g_fail;
+    }
+
     const size_t allocs_in_measured_region = g_allocs;
 
     // ---- end measured region ----
@@ -170,6 +267,12 @@ int main() {
     CHECK(n_server > 0);
     CHECK(n_esc > 0);
     CHECK(n_modnet > 0);
+    CHECK(n_packet > 0);
+    CHECK(n_degraded > 0);
+    CHECK(n_retention > 0);
+    CHECK(n_config > 0);
+    CHECK(n_host > 0);
+    CHECK(cfg_diff);
 
     if (g_fail == 0) std::printf("test_no_alloc: PASS\n");
     return g_fail == 0 ? 0 : 1;

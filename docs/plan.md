@@ -207,29 +207,39 @@
 
 ```
 server:  {type, t, frame_ms:{min,avg,max}, hitch:{gt50,gt100}, cpu_pct, rss_kb, minflt, majflt,
-          players, real, proxy, fake, in_kbps, out_kbps, edicts, map, uptime_s, fps, maxclients}
+          players, real, proxy, fake, in_kbps, out_kbps, edicts, edicts_churn, map, uptime_s, fps, maxclients}
 client:  {type, t, id, gen, ping, loss, dloss, choke, dchoke, delta_seq, in_seq, in_ack, out_seq,
           rel_seq, rel_fill, rate, cleartime, updaterate, cmdrate, state, fragbuf_total,
           incomingready_mask, flow_in_kbps, flow_out_kbps, flow_in_avg, flow_out_avg, msg_flags,
-          idle_ms, name, authid, steamid64, ip, port, userid, slot, conn_s, fake, proxy}
-drop:    {type, t, id, gen, reason, category, crash, observed_via,
+          idle_ms, jit_min_ms, jit_avg_ms, jit_max_ms, name, authid, steamid64, ip, port, userid,
+          slot, conn_s, fake, proxy}
+drop:    {type, t, id, gen, reason, category, crash, observed_via, detector,
           name, authid, steamid64, ip, port, userid, slot, conn_s, fake, proxy,
           client:{active,spawned,fully_connected,connected,proxy,fake,userid,connecttime,cmdtime,connection_started},
           netchan:{in_seq,in_ack,in_rel_ack,in_rel_seq,out_seq,rel_seq,last_rel_seq,rel_len,rel_fill,rate,cleartime,msg_flags,last_received,connect_time,now_real,idle_ms,sv_timeout},
           window:[{client-sample compact}], server:{server-sample}, neighbors:{count,avg_loss,avg_ping,max_loss}}
-reject:  {type, t, ip, steamid, stage, detail}
-connect: {type, t, id, ip, steamid, name}
+reject:  {type, t, ip, steamid, stage, detail, stage_ms|null, total_ms|null}
+connect: {type, t, id, ip, steamid, name, auth_ms|null, steam_ms|null}
 netcmd:  {type, t, id, cmd, count}
 massdrop:{type, t, window_s, count, reason, category}
-packet:  {type, t, pps, bytes, sizes:{lt128,lt512,lt1024,ge1024}, unique_ips, top_ip}
+packet:  {type, t, pps, bytes, sizes:{lt128,lt512,lt1024,ge1024}, unique_ips, top_ip, top_ips:[{ip,count}]}
 hitch:   {type, t, duration_ms}
-mapchange:{type, t, map}
+mapchange:{type, t, map, load_ms|null}
 voice:   {type, t, id, last_voice_time}
 shutdown:{type, t, reason}
 crash:   {type, t, signal}
+degraded:{type, t, error_count}
+retention:{type, t, removed}
 ```
 
 Все числовые значения — неотрицательные; отсутствующие — `null`; строки JSON-экранируются. Поля идентичности (`name`/`authid`/`steamid64`/`ip`) — `""`, `port`/`userid` — `-1`, `conn_s` — `0` при отсутствии данных; `fake`/`proxy` — булевы.
+
+Расширения схемы:
+- `server.edicts_churn` — знаковый Δ `pfnNumberOfEntities()` за интервал (может быть отрицательным); первый интервал после attach/mapchange — `null` (`edicts_churn_present`); вложенный `drop.server` несёт то же поле (Стадия 9, EN-5).
+- `drop.detector` — best-effort детектор `rehlds_security` по подстроке reason: `movecmd`/`stringcmd`/`dlfile`/`speedhack`; промах — `""` (не влияет на drop; тип `filter` не вводится; Стадия 9, EN-1/EN-3).
+- `packet.top_ips` — top-3 `{ip,count}` (фиксированный массив из 3; count `0` — пустой слот); `top_ip` сохранён (top-1) для совместимости (Стадия 9, EN-4).
+- `degraded` — деградация сбора (Δ `error_count` `LogWriter`), эмитится 1 Гц только при `log->enabled()`; hard-failure/кап — console + `hldsmon_status`, тип `write_error` не вводится (Стадия 9, EN-2/EN-7).
+- `retention` — Δ числа файлов, удалённых `prune()` (`removed`), pull-модель из sampler (Стадия 9, EN-P1).
 
 ---
 
@@ -795,3 +805,630 @@ modnet: {type, t, module, so, conns, conn_fail, connect_attempts, dns_calls,
 | RET-2 | Low | (ожидает) — источник даты для `prune()` (`year_/month_/day_`) и определение `retention_value()`. |
 | RET-3 | Low | (ожидает) — точка вставки `set_retention_days` = `do_server_tick()` перед `maybe_rotate()`. |
 | RET-4 | Low | (ожидает) — выбрать `(int)cvar_f` / `cvar_i`. |
+
+---
+
+# Стадия 4 — `ping-fix` — план реализации (rev 1 — сокращённый багфикс-трек)
+
+> Корректирующий багфикс единиц `latency` (секунды→мс): per-client `ping` и `drop.neighbors.avg_ping` сейчас всегда `0`. Авторитетный дизайн — `docs/design.md` §21 (rev 5, после oracle design-review PG-1..PG-7 folded). **Трек сокращённый** (design §21.12): независимое plan-ревью `momus` для этой стадии **не проводится** — изменений ≈3 строки + один host-тест, без развилок/схемы/ABI.
+
+## Заголовок стадии (bindings)
+
+- **Design:** `docs/design.md` §21 — **rev 5 (ping-fix)**; oracle design-review — **PASS-WITH-REVISIONS; PG-1..PG-7 сложены** (§21.12). Индекс дизайна — `AGENTS.md`.
+- **Design-review:** `oracle` — PASS-WITH-REVISIONS (закрыто).
+- **Plan-review:** **не требуется** (сокращённый багфикс-трек; обоснование — design §21.12).
+- **Язык документации:** русский; идентификаторы/код — английский.
+- **Решения владельца (§21.10):** fix A (конвертер в месте чтения); `avg_ping` чинится тем же конвертером; `ping=0` трактуется как «не измерено»; NT-1 (устаревший вендоренный интерфейс) — отдельной стадией. Коммит — только по явной просьбе.
+- **Верификация:** `make` (сборка 32-бит), `make test` (host C++ ядро + Python analyzer), `make verify-exports` (whitelist **не меняется**).
+- **Коммит:** запрещён без явной просьбы владельца; один связный коммит на стадию (код + тест + доки + журнал).
+- **Интеграционная проверка:** тестовый ReHLDS-сервер (владелец) — smoke: реальный клиент даёт `ping>0` в `client` и `drop.neighbors.avg_ping`; вне CI.
+
+**Границы стадии:** только конверсия единиц `latency`; схема P1/ключи/типы/экспорты/cvar — **без изменений**. **Вне стадии (non-goals):** поле-различитель «бот/не измерено»; ре-вендоринг заголовков (NT-1); смена источника `packet_loss`; переход на `pfnGetPlayerStats`/`GetLatency`.
+
+## Глобальные инварианты стадии `ping-fix`
+
+Базовые INV-1..INV-6 действуют без изменений; новых INV не вводится.
+- **INV-2** — конвертер чисто вычислительный (стек, без аллокаций).
+- **INV-4** — пробу **не меняем**; корректность фикса наследует покрытие раскладки `client_t` (§21.5, PG-3).
+- **INV-5** — формат JSONL не меняется.
+
+## Маппинг QAS-P1..P5 → метод проверки (design §21.9)
+
+| QAS | Где | Метод |
+|---|---|---|
+| QAS-P1 (границы конвертера: NaN/0/отриц/clamp) | PF-P0 | host-тест `tests/test_ping.cpp` |
+| QAS-P2 (`sampler` вызывает конвертер) | PF-P1 | review-only (логика покрыта QAS-P1) |
+| QAS-P3 (`neighbors.avg_ping` в мс) | PF-P1 | review-only (логика покрыта QAS-P1) |
+| QAS-P4 (контракт/CI: ключи, whitelist, `make`/`make test`) | PF-P2 | CI/локально |
+| QAS-P5 (бот/first-2s → `ping=0`) | — | документировано (§21.8); не тестируется как «должно быть >0» |
+
+---
+
+## PF-P0 — Host-testable конвертер + тест
+
+**Цель:** чистый конвертер секунды→мс, покрытый host-тестом.
+
+**Файлы:** `src/metrics.h` (inline-хелпер), `tests/test_ping.cpp`.
+
+**Границы / non-goals:** без движковых заголовков; без изменения полей/размеров POD.
+
+**Шаги:**
+1. `src/metrics.h`: добавить `inline uint16_t ping_ms_from_latency(float latency_s)` — код и numeric-края по §21.3 (PG-1: `if (!(ms > 0.0))` для NaN; PG-2: clamp по округлённому `r = ms + 0.5`).
+2. `tests/test_ping.cpp` (включает только `metrics.h`): QAS-P1 — `0.040→40`; `0.0`/отрицательное/`NaN→0`; `65.535→65535` и `70.0→65535`; краевой `65.5347→65535`; `0.0005→1`.
+3. **Makefile не трогаем (PG-4):** `TEST_SRCS := $(wildcard tests/test_*.cpp)` подхватывает файл; новый `.cpp` ядра не нужен (хелпер inline).
+
+**Инварианты:** INV-2 (без аллокаций), INV-4 (структуры не меняются).
+**Acceptance:** `make test` собирает и прогоняет `test_ping` зелёным.
+**Verify:** `make test`.
+**Риски:** numeric-края (NaN/clamp) — покрыты тестом; убедиться, что тест реально собран (не тихо пропущен).
+
+---
+
+## PF-P1 — Замена кастов в точках чтения
+
+**Цель:** обе точки чтения `latency` конвертируют секунды→мс.
+
+**Файлы:** `src/sampler.cpp`, `src/hooks.cpp`.
+
+**Шаги:**
+1. `src/sampler.cpp:101` → `cs.ping = ping_ms_from_latency(ct->latency);`
+2. `src/hooks.cpp` (сбор `neighbors`): `sum_ping += static_cast<double>(ping_ms_from_latency(o->latency));` (сумма в мс; `rec.neighbors.avg_ping = sum_ping / count` — без иных правок).
+3. `packet_loss`/`loss`/`dloss` — **не трогать** (уже корректны).
+
+**Инварианты:** INV-1 (только чтение), INV-2, INV-3 (server thread).
+**Acceptance:** сборка `-Wall -Wextra -Werror` без предупреждений; `ping`/`avg_ping` — мс.
+**Verify:** `make`.
+**Риски:** случайно задеть соседние поля — покрыть диффом/review.
+
+---
+
+## PF-P2 — Верификация и документация
+
+**Файлы:** (опц.) `README.md` — уточнение, что `ping` в мс.
+
+**Шаги:** `make clean && make && make verify-exports && make test`; убедиться, что whitelist экспортов без изменений и Python-тесты зелёные; при доступе — боевой smoke (клиент с `ping>0` в `client` и `neighbors.avg_ping`).
+
+**Acceptance:** `make`/`make test`/`make verify-exports` зелёные; whitelist без изменений.
+**Verify:** `make clean && make && make verify-exports && make test`.
+
+---
+
+## PF-P3 — Запись стадии (journal)
+
+**Файлы:** `docs/journal.md`. **Acceptance:** контекст (жалоба владельца «ping=0»); что сделано (PF-P0..PF-P2); решения и почему (fix A; побочный `avg_ping`; `ping=0`=`не измерено`; NT-1 отдельно); затронутые артефакты; открытые нити (NT-1: ре-вендоринг ReHLDS-интерфейсов); следующие шаги (Стадия 5 = F2 и т.д.); индексы `AGENTS.md` актуальны.
+
+---
+
+## PF-P4 — Коммит (гейт)
+
+Один связный коммит (код + тест + доки + журнал) — **только по явной просьбе владельца**. Иначе: «готово к коммиту».
+
+---
+
+## Definition of Done (стадия `ping-fix`)
+
+- [ ] `ping_ms_from_latency` в `metrics.h`; NaN/отрицательное→0; clamp по округлённому (PG-1/PG-2).
+- [ ] `sampler.cpp`/`hooks.cpp` используют конвертер (не сырой каст `static_cast<uint16_t>(ct->latency)`).
+- [ ] `tests/test_ping.cpp` собран и зелёный (подхват через `wildcard`).
+- [ ] `make`/`make test`/`make verify-exports` зелёные; схема P1 и whitelist экспортов — **без изменений**.
+- [ ] Бот/first-2s/высокий разброс → `ping=0` (ожидаемо, документировано §21.8) — не регресс.
+- [ ] `docs/journal.md` заполнен; индексы обновлены.
+- [ ] Коммит — только при явной просьбе.
+
+---
+
+## Раздел ревью плана (momus) — стадия `ping-fix`
+
+**Не проводится** (сокращённый багфикс-трек; обоснование — oracle design-review, design §21.12: нет развилок/схемы/ABI). Гейт имплементации открыт на основании пройденного дизайн-ревью и закрытия PG-1..PG-7.
+
+---
+
+# Стадия 5 — `config-context` — план реализации (rev 2 — plan-review пройден; CM-1..CM-5 folded)
+
+> Контекст запуска и rate-снимок: новый тип JSONL `config` (boot + при изменении) и вложенный снимок конфигурации в `drop`. Авторитетный дизайн — `docs/design.md` §22 (rev 6, после oracle design-review CFG-1..CFG-8 folded). План разворачивает §22 в фазы CFG-P0..CFG-P6; семантика — по ссылкам на §22.
+
+## Заголовок стадии (bindings)
+
+- **Design:** `docs/design.md` §22 — **rev 6 (config-context)**; design-review `oracle` — **PASS-WITH-REVISIONS; CFG-1..CFG-8 folded** (§22.11). Индекс — `AGENTS.md`.
+- **Plan-review:** `momus` — **PASS-WITH-REVISIONS; CM-1..CM-5 сложены (folded)** — раздел ниже.
+- **Язык:** русский; идентификаторы/код — английский.
+- **Решения владельца:** набор полей — дефолт §22.3; снимок в `drop` — да; список плагинов — отложен (§22.7). Коммит — только по явной просьбе.
+- **Верификация:** `make`, `make test` (host C++ + Python analyzer), `make verify-exports` (whitelist **без изменений**).
+- **Интеграционная проверка:** тестовый ReHLDS-сервер — smoke: boot `config`-запись, изменение `sv_maxrate` → новая `config`-запись ≤1 с, `drop.config` заполнен; вне CI.
+
+**Границы стадии:** новый тип `config` + `drop.config` + анализатор/UI-поддержка + эмиттер `null`. **Вне стадии:** список плагинов; дамп всех cvar; история каждого изменения; Windows/внешний агент.
+
+## Глобальные инварианты стадии `config-context`
+
+Базовые INV-1..INV-6 без изменений; новых INV не вводится.
+- **INV-1** — только чтение cvar (пассивность).
+- **INV-2** — поллинг/diff/сравнение на server-tick, фиксированные POD, без аллокаций; снимок `memset` перед заполнением (CFG-5).
+- **INV-3** — только server thread.
+- **INV-4** — не затрагивается.
+- **INV-5** — `config` содержит `type`+`t`; отсутствующие cvar — литерал `null`.
+
+## Новые cvar'ы стадии
+
+**Нет** (набор отслеживаемых cvar фиксирован дизайном §22.3).
+
+## Маппинг QAS-C1..C5 → метод проверки (design §22.8)
+
+| QAS | Где | Метод |
+|---|---|---|
+| QAS-C1 (boot `config`; отсутствующий cvar → `null`) | CFG-P1/P2 | host-тест сериализатора + smoke |
+| QAS-C2 (изменение cvar → новая запись ≤1 с) | CFG-P0/P2 | host-тест diff-хелпера + smoke |
+| QAS-C3 (`drop.config` заполнен) | CFG-P1/P2 | unit-тест сборки drop (`test_serialization`) |
+| QAS-C4 (без аллокаций; bounded размер) | CFG-P0 | unit-тест размеров + тест «0 аллокаций» |
+| QAS-C5 (P1 расширен; whitelist без изменений; make/make test) | CFG-P4 | CI/локально |
+
+---
+
+## CFG-P0 — Host-testable ядро: `ConfigRecord`/`ConfigSnapshot` + diff
+
+**Цель:** POD-структуры и чистая логика «изменилось ли» на хосте.
+
+**Файлы:** `src/metrics.h`, `tests/test_config.cpp` (новый).
+
+**Шаги:**
+1. `metrics.h`: `ConfigSnapshot` (числовой rate/timeout-набор + tickrate; `present`-битмаска для отсутствующих cvar, CFG-2); `ConfigRecord` (`type`+`t`+версии+map+maxclients+`ConfigSnapshot`). Обновить `static_assert` размеров.
+2. `metrics.h` (inline, host-testable): `bool config_changed(const ConfigSnapshot& a, const ConfigSnapshot& b)` — сравнение по POD (после `memset`), без аллокаций.
+3. `tests/test_config.cpp`: равенство/неравенство снимков, `present`-битмаска, размеры; расширить `tests/test_no_alloc.cpp` — `config_changed` без аллокаций (**CM-3**).
+
+**Инварианты:** INV-2, INV-5.
+**Acceptance:** `make test` собирает/проходит `test_config`; размеры bounded.
+**Verify:** `make test`.
+
+---
+
+## CFG-P1 — Serialization: `write_config_json` + эмиттер `null` + `drop.config`
+
+**Цель:** JSONL-эмиссия нового типа и вложенного снимка; поддержка `null`.
+
+**Файлы:** `src/serialization.{h,cpp}`, `src/events.{h,cpp}`, `src/metrics.h` (`DropRecord` +`ConfigSnapshot`), `tests/test_serialization.cpp`.
+
+**Шаги:**
+1. `serialization.cpp`: **явный эмиттер `null`** для отсутствующего cvar (CFG-2); `write_config_json`; расширить `write_drop_json` вложенным `config` (общий подсет с типом `config`, CFG-8).
+2. `events.{h,cpp}`: `write_config`.
+3. `metrics.h`: `DropRecord` +`ConfigSnapshot config`; обновить `static_assert(sizeof(DropRecord))`.
+4. `tests/test_serialization.cpp`: `config` (полный/с `null`); `drop` содержит `config`; расширить `tests/test_no_alloc.cpp` — `write_config_json` без аллокаций (**CM-3**).
+
+**Инварианты:** INV-5; ключи/типы по P1.
+**Acceptance:** host-тесты зелёные; валидный JSON (в т.ч. `null`).
+**Verify:** `make test`.
+
+---
+
+## CFG-P2 — Bootstrap/Sampler/Hooks: кэш cvar, poll/diff, boot, drop-снимок
+
+**Цель:** сборка снимков в движке.
+
+**Файлы:** `src/plugin.h` (`CvarRefs` + `last_config` + флаг валидности), `src/bootstrap.cpp`, `src/sampler.cpp`, `src/hooks.cpp`.
+
+**Шаги:**
+1. `bootstrap.cpp`: закэшировать `cvar_t*` отслеживаемых cvar (`g_engfuncs.pfnCVarGetPointer`) в `CvarRefs` (H2-паттерн); отсутствующий ⇒ nullptr.
+2. `sampler.cpp::do_server_tick` (**CM-5**): заполнить `ConfigSnapshot` (с `memset`, CFG-5) из кэша + версии/map/maxclients; сравнить с `last_config` (diff-хелпер CFG-P0); при отличии — **или на первом тике с невалидным `last_config` (baseline; инициатор boot-эмиссии — `sampler`, а не `bootstrap`)** — эмитировать `config` и обновить `last_config`. Всё под `plugin_enabled()`.
+3. `hooks.cpp::build_drop_record` (**CM-1**): заполнить `rec.config` живым снимком; **сохранить** `rec.netchan.sv_timeout`, заполняя его из **кэша** `cvar_t*` (не `pfnCVarGetPointer` по имени) — совместимость P1; авторитет — `drop.config` (CFG-3).
+
+**Инварианты:** INV-1/2/3.
+**Acceptance:** `make` (32-бит, `-Werror`); boot + изменение дают `config`; drop содержит `config`.
+**Verify:** `make`.
+**Риски:** строковый lookup на пути дропа — использовать кэш `cvar_t*`, не `pfnCVarGetPointer` по имени (CFG §22.3 п.3).
+
+---
+
+## CFG-P3 — Анализатор/UI: `KNOWN_TYPES` + фикстура + панель
+
+**Цель:** `config` видим анализатором и UI (CFG-1).
+
+**Файлы:** `tools/analyzer/hldsmon.py`, `tools/analyzer/webui.py`, `tools/analyzer/webui/index.html`, `tools/analyzer/tests/fixtures/*.jsonl`, `tools/analyzer/tests/test_hldsmon.py`, `tools/analyzer/tests/test_webui.py`.
+
+**Шаги:**
+1. `hldsmon.py`: `KNOWN_TYPES += "config"`; строка в `summary`/`digest`; толерантность `null` (уже есть в `_num`).
+2. Фикстуры: новый `config` + расширить `types_ok.jsonl`; тесты на наличие `config` в сводке.
+3. UI: маркер/панель конфигурации; `webui.py` pass-through при необходимости.
+
+**Acceptance:** Python-тесты зелёные; `config` учитывается в `counts_by_type`/`summary`.
+**Verify:** `make test` (python-часть).
+
+---
+
+## CFG-P4 — Верификация и документация
+
+**Файлы:** `README.md` (описание типа `config`/`drop.config`), `docs/design.md` (при необходимости).
+
+**Шаги:** `make clean && make && make verify-exports && make test`; whitelist без изменений; README — задокументировать тип `config`/`drop.config` **и схлопывание/потерю изменений <1 с** (**CFG-6**, **CM-4**); при доступе — smoke.
+
+**Acceptance:** три команды зелёные; whitelist без изменений.
+
+---
+
+## CFG-P5 — Запись стадии (journal)
+**Файлы:** `docs/journal.md`. Контекст/сделано/решения (новый тип; `present`+`null`; дубль `sv_timeout`; гейт baseline; diff; **CFG-6** схлопывание <1 с; **CFG-7** результаты сверки имён cvar/build-геттера — CM-4)/открытые нити/индексы.
+
+## CFG-P6 — Коммит (гейт)
+Один связный коммит — **только по явной просьбе владельца**.
+
+---
+
+## Definition of Done (стадия `config-context`)
+
+- [ ] `ConfigRecord`/`ConfigSnapshot` + `config_changed` (host-testable, `memset`, CFG-5).
+- [ ] `write_config_json` + эмиттер `null` (CFG-2); `drop.config` (общий подсет, CFG-8); `static_assert(DropRecord)` обновлён.
+- [ ] Boot `config` + при изменении (≤1 с); baseline при включении mid-run (CFG-4); под `plugin_enabled()`.
+- [ ] `KNOWN_TYPES += "config"` + фикстура + `types_ok.jsonl` + `summary`/`digest` (CFG-1); UI-панель.
+- [ ] P1 расширен (`config`, `drop.config`, правило `null`); whitelist экспортов без изменений.
+- [ ] `make`/`make test`/`make verify-exports` зелёные; `test_config` и расширенный `test_serialization` зелёные.
+- [ ] `docs/journal.md` заполнен; индексы обновлены. Коммит — только при явной просьбе.
+
+---
+
+## Приложение P1 — расширение: тип `config` и `drop.config` (стадия `config-context`)
+
+```json
+{"type":"config","t":1755000000.0,"rehlds_major":3,"rehlds_minor":14,
+ "map":"de_dust2","maxclients":32,"sys_ticrate":100.0,"host_framerate":0.0,
+ "sv_timeout":65.0,"sv_maxrate":0.0,"sv_minrate":0.0,
+ "sv_maxupdaterate":101.0,"sv_minupdaterate":10.0,
+ "sv_maxcmdrate":101.0,"sv_mincmdrate":10.0}
+```
+- Отсутствующий cvar ⇒ значение `null` (эмиттер `null`, CFG-2).
+- `drop` получает вложенный `config` = **числовой подсет** (`sys_ticrate`, `host_framerate`, `sv_timeout`, `sv_maxrate`/`sv_minrate`, `sv_maxupdaterate`/`sv_minupdaterate`, `sv_maxcmdrate`/`sv_mincmdrate`) — тот же суб-эмиттер, что у `config`, без `type`/`t`/`rehlds_*`/`map`/`maxclients` (CFG-8, **CM-2**).
+- `drop.netchan.sv_timeout` сохраняется для совместимости P1 (заполняется из кэша `cvar_t*`, не by-name lookup); авторитет по `sv_timeout` — у `drop.config` (CFG-3, **CM-1**).
+
+---
+
+## Раздел ревью плана (momus) — стадия `config-context`
+
+**Ревьюер:** `momus` (независимый). **Plan rev:** 1 → folded в rev 2. **Вердикт: PASS-WITH-REVISIONS; гейт имплементации ОТКРЫТ** (Critical/High нет).
+
+План исполнимо развёрнут из §22: фазы CFG-P0..P6 покрывают компоненты §22.6, все ссылки на файлы реальны, QAS-C1..C5 имеют конкретный метод, команды верификации существуют. Замечания CM-1..CM-5 (Med/Low) сложены:
+
+| ID | Severity | Учтено |
+|---|---|---|
+| CM-1 | Med | CFG-P2 п.3: явно сохранён `rec.netchan.sv_timeout` (заполняется из кэша `cvar_t*`), авторитет — `drop.config` (CFG-3); исключена регрессия P1. |
+| CM-2 | Med | Приложение P1: hedge «уточняется при реализации» заменён решённым составом `drop.config` (числовой подсет, CFG-8). |
+| CM-3 | Low | CFG-P0/P1: добавлен шаг расширения `tests/test_no_alloc.cpp` (`config_changed`/`write_config_json`). |
+| CM-4 | Low | CFG-P4/P5: CFG-6 (схлопывание <1 с) — в README; CFG-7 (сверка имён cvar/build-геттера) — в журнал. |
+| CM-5 | Low | CFG-P2 п.2: инициатор boot-эмиссии — `sampler` (baseline), формулировка согласована с §22.6 (design-level). |
+
+**Fine (не менять):** новый тип `config`; поллинг 1 Гц + diff с кэшем `cvar_t*`; `present`-битмаска + эмиттер `null`; расширение `DropRecord`; общий суб-эмиттер; `Makefile`/`CORE_SRCS`/`exports.whitelist` без изменений; `KNOWN_TYPES += "config"` обязателен; `null` уже переживается анализатором (`_num`).
+
+---
+
+# Стадия 6 — `host-metrics` — план реализации (rev 1 — ожидает plan-review)
+
+> Best-effort хост/ядро-телеметрия: новый тип JSONL `host` (1 Гц), cvar `hldsmon_host` (**default 0/OFF**), engine-free модуль `src/host_metrics.{h,cpp}` (парсеры + POSIX-I/O + чистая детекция окружения). Авторитетный дизайн — `docs/design.md` §23 (rev 7, oracle PASS-WITH-REVISIONS; H1/H2/M1..M5 folded). **Зависимость:** использует эмиттер `null` из Стадии 5 (`config`) — реализовывать после Стадии 5 или включить эмиттер в эту стадию (design §23 Q4/L5).
+
+## Заголовок стадии (bindings)
+
+- **Design:** `docs/design.md` §23 — **rev 7**; design-review `oracle` — **PASS-WITH-REVISIONS; H1/H2/M1-M5 folded** (§23.11); повторное ревью — PASS.
+- **Plan-review:** `momus` — раздел ниже (ожидает).
+- **Язык:** русский; код — английский.
+- **Решения владельца:** default `hldsmon_host = 0` (opt-in; §23.9 Q1). Коммит — только по явной просьбе.
+- **Верификация:** `make`, `make test` (host C++ + Python), `make verify-exports` (whitelist **без изменений**).
+- **Интеграционная проверка:** тестовый ReHLDS-сервер — smoke: `hldsmon_host 1` даёт записи `host` с флагами достоверности; на shared-netns — caveated; вне CI.
+
+**Границы стадии:** чтение `/proc` + `statvfs` best-effort, тип `host`, детекция окружения, Δ-семантика, маска достоверности. **Вне стадии:** внешний агент; eBPF; `loadavg` в контейнерах; активные действия; `modnet`-атрибуция; Windows.
+
+## Глобальные инварианты стадии `host-metrics`
+
+- **INV-1** — только чтение (пассивность); **INV-2** — фикс. буфер, без аллокаций; **INV-3** — server thread; **INV-5** — валидный JSON (`type`+`t`), недоступное → `null`.
+
+## Новые cvar'ы стадии
+
+| Имя | Тип | Назначение | Default | Регистрация |
+|---|---|---|---|---|
+| `hldsmon_host` | cvar | мастер-выключатель host-телеметрии | **0** (OFF) | `bootstrap.cpp::register_cvars()` + `CvarRefs` |
+
+## Маппинг QAS-H1..H8 → метод (design §23.8)
+
+| QAS | Где | Метод |
+|---|---|---|
+| QAS-H1 (parse-by-name устойчив к отсутствующим/новым полям) | HM-P0 | host-тест `test_host_metrics` |
+| QAS-H2 (shared netns ⇒ caveated) | HM-P0/P2 | host-тест детектора |
+| QAS-H3 (нет файла ⇒ флаг, не 0-здоровье) | HM-P0 | host-тест |
+| QAS-H4 (без аллокаций; недоступное → `null`) | HM-P0/P1 | тест «0 аллокаций» + сериализатор |
+| QAS-H5 (`hldsmon_host=0` ⇒ ноль записей/накладных) | HM-P2 | host/review |
+| QAS-H6 (`make`/`make test`/`verify-exports`; whitelist) | HM-P4 | CI/локально |
+| QAS-H7 (первый сэмпл ⇒ Δ `null`; `steal` — %) | HM-P0 | host-тест |
+| QAS-H8 (`EACCES`/неопределённость ⇒ caveated, без краха) | HM-P0 | host-тест детектора |
+
+---
+
+## HM-P0 — Engine-free ядро: парсеры, детекция, Δ
+
+**Цель:** чистая host-testable логика (без движковых заголовков) + POSIX-I/O.
+
+**Файлы:** `src/host_metrics.{h,cpp}` (новый), `tests/test_host_metrics.cpp`, `Makefile` (`CORE_SRCS += src/host_metrics.cpp` — ловушка M1).
+
+**Шаги:**
+1. `host_metrics.h`: структуры снимка + маска достоверности; чистые функции `parse_snmp_udp(buf,...)`, `parse_net_dev(buf,...)`, `parse_stat(buf,...)`, `parse_self_io(buf,...)` (parse-by-name, неизвестное = 0/отсутствует); `detect_env(inputs...)` (чистая, по cgroup/lxcfs/dockerenv/inode-флагам); enum-константы **битов маски** (HM-3: `present` — по-полям, `caveat` — по-источникам) ; `delta_u64(prev,cur)` — **wrap/reset-safe (HM-1): `cur<prev` ⇒ re-baseline (значение `null`), а не unsigned-гигант**; bounded `read_file(path, buf, cap)` (POSIX `open`/`read`/`close`, drain до EOF, `EINTR`), `statvfs_bavail(dir)`.
+2. `Makefile`: `CORE_SRCS += src/host_metrics.cpp`.
+3. `tests/test_host_metrics.cpp`: QAS-H1/H2/H3/H7/H8 (parse-by-name без `MemErrors`; детектор: shared/isolated/EACCES; отсутствие файла; первый сэмпл Δ=null; `steal` %); **HM-1** (reset/wrap); и расширить `tests/test_no_alloc.cpp` для QAS-H4 /**HM-4**.
+
+**Инварианты:** INV-2/INV-5.
+**Acceptance:** `make test` собирает/проходит `test_host_metrics`.
+**Verify:** `make test`.
+**Риски:** забыть `CORE_SRCS` (M1); парсинг по позиции — запрещён.
+
+---
+
+## HM-P1 — `HostRecord` + сериализация
+
+**Файлы:** `src/metrics.h` (`HostRecord` + маска), `src/serialization.{h,cpp}` (`write_host_json`; недоступное → `null`), `src/events.{h,cpp}` (`write_host`), `tests/test_serialization.cpp`.
+
+**Шаги:** POD `HostRecord`; `write_host_json` через существующий `null`-эмиттер (Стадия 5); `write_host`; тесты (полный/частичный/`null`).
+
+**Acceptance:** host-тесты зелёные; валидный JSON.
+**Verify:** `make test`.
+
+---
+
+## HM-P2 — Bootstrap/Sampler: cvar, детекция, 1 Гц сбор/эмиссия
+
+**Файлы:** `src/plugin.h` (`CvarRefs::host`, состояние снимка), `src/bootstrap.cpp` (cvar), `src/sampler.{h,cpp}`.
+
+**Шаги:** регистрация `hldsmon_host` (0); детекция окружения при старте (хранить маску); на 1 Гц server-tick при `hldsmon_host>0.5 && plugin_enabled()` — сбор, Δ, эмиссия `host`; OFF ⇒ ноль работы.
+
+**Acceptance:** `make` (32-бит, `-Werror`); при OFF — ни одной `host`-записи.
+**Verify:** `make`.
+
+---
+
+## HM-P3 — Анализатор/UI
+
+**Файлы:** `tools/analyzer/hldsmon.py`, `webui.py`, `webui/index.html`, fixtures, tests.
+
+**Шаги:** `KNOWN_TYPES += "host"`; ряды/панель; фикстура `host` (вкл. caveated/`null`).
+
+**Acceptance:** Python-тесты зелёные.
+**Verify:** `make test`.
+
+---
+
+## HM-P4 — Верификация и документация
+`README.md` (тип `host`, cvar, caveats netns/драйвер); `make clean && make && make verify-exports && make test`.
+
+## HM-P5 — Запись стадии (journal)
+Контекст/сделано/решения (best-effort; default OFF; детекция окружения; Δ; net/dev caveated)/открытые нити (реальные caveats на хостинге владельца)/индексы.
+
+## HM-P6 — Коммит (гейт)
+Только по явной просьбе владельца.
+
+## Definition of Done (стадия `host-metrics`)
+
+- [ ] `src/host_metrics.{h,cpp}` engine-free; `CORE_SRCS += src/host_metrics.cpp`; `test_host_metrics` зелёный.
+- [ ] Parse-by-name; отсутствие файла/`EACCES` ⇒ флаг/`null`, не 0-здоровье (QAS-H1/H3/H8).
+- [ ] Δ-семантика: первый сэмпл `null`; `steal` — % (QAS-H7).
+- [ ] Детекция окружения (контейнеризация; несостоятельное `self==PID1` не используется); shared ⇒ caveated (QAS-H2).
+- [ ] `HostRecord` + `write_host_json` (общий `null`-эмиттер); `KNOWN_TYPES += "host"` + фикстуры (QAS-H4).
+- [ ] Cvar `hldsmon_host` (0); OFF ⇒ ноль записей (QAS-H5).
+- [ ] `make`/`make test`/`make verify-exports` зелёные; whitelist без изменений (QAS-H6).
+- [ ] `docs/journal.md` заполнен; индексы обновлены. Коммит — только при явной просьбе.
+
+## Приложение P1 — расширение: тип `host` (стадия `host-metrics`)
+
+```json
+{"type":"host","t":1755000000.0,
+ "udp_rcvbuf_errors":0,"udp_in_errors":0,"udp_in_csum_errors":0,
+ "net_rx_dropped":0,"net_rx_missed":0,"net_rx_overruns":0,
+ "steal_pct":0.0,"io_read_bytes":0,"io_write_bytes":0,"disk_bavail_mb":12345,
+ "present_mask":1023,"caveat_mask":3}
+```
+- Все счётчики — **Δ за интервал** (первый сэмпл → `null`). **Недоступное ⇒ `null` + бит `present` снят; недостоверное (caveated) ⇒ значение ПРИСУТСТВУЕТ + бит `caveat`** (design M4, «caveated ≠ null»; **HM-2**). Биты маски: `present` — по-полям, `caveat` — по-источникам; константы — в `host_metrics.h` (**HM-3**). `udp_in_csum_errors` — добавление сверх §23.2 (в духе parse-by-name; **HM-6**).
+
+## Раздел ревью плана (momus) — стадия `host-metrics`
+
+**Ревьюер:** `momus` (независимый). **Plan rev:** 1 → folded в rev 2. **Вердикт: PASS-WITH-REVISIONS; гейт имплементации ОТКРЫТ** (Critical/High нет).
+
+План исполнимо разворачивает §23: фазы HM-P0..HM-P6 покрывают §23.6, ловушка `CORE_SRCS` присутствует, зависимость от Стадии 5 названа и удовлетворена, ссылки/команды реальны. Замечания HM-1..HM-6 (Med/Low) сложены:
+
+| ID | Severity | Учтено |
+|---|---|---|
+| HM-1 | Med | HM-P0/DoD: задана **reset/wrap**-семантика `delta_u64` (cur<prev ⇒ re-baseline, значение `null`, не гигантское unsigned) + тест (design H2). |
+| HM-2 | Med | Приложение P1: разведены **недоступное ⇒ `null`** и **caveated ⇒ значение присутствует + бит** (design M4 «caveated ≠ null»). |
+| HM-3 | Med | HM-P0/P3: зафиксирована **раскладка битов** маски (enum-константы `present` по-полям, `caveat` по-источникам) в `host_metrics.h`; анализатор ссылается на неё. |
+| HM-4 | Low | HM-P0: добавлен явный шаг расширения `tests/test_no_alloc.cpp` (QAS-H4). |
+| HM-5 | Low | Приложение P1: пример `present_mask` приведён к числу полей (10 ⇒ 1023). |
+| HM-6 | Low | Приложение P1: `udp_in_csum_errors` помечен как добавление сверх §23.2 (в духе parse-by-name). |
+
+**Fine (не менять):** engine-free модуль; `platform_linux` без изменений; default OFF; регистрация через `register_cvars`+`CvarRefs`; зависимость от `null`-эмиттера Стадии 5; parse-by-name; «флаг, не 0-здоровье»; `steal` — %; первый сэмпл `null`; `statvfs` по `hldsmon_dir`; отсутствие новых экспортов; границы (без loadavg/eBPF/агента/Windows).
+
+---
+
+# Стадия 7 — `client-quality` — план реализации (rev 1)
+
+> Jitter per-client + скользящий loss (анализатор). Авторитетный дизайн — `docs/design.md` §24 (rev 8; D1: `reliable_overflow` вынесен из scope; D2: окно по `loss`).
+
+## Заголовок стадии (bindings)
+- **Design:** §24 rev 8; oracle PASS-WITH-REVISIONS (H1/H2/M1-M4 folded). **Plan-review:** `momus` (ожидает).
+- **Решения:** D1 — overflow вне scope; D2 — окно по `loss` в анализаторе. **Коммит** — только по явной просьбе.
+- **Верификация:** `make`, `make test`, `make verify-exports` (whitelist без изменений).
+
+## Глобальные инварианты
+INV-1..6. **INV-2:** jitter — O(1) целочисленно; IP+port матч ≤`MAX_CLIENTS`(32). **INV-3:** server thread.
+
+## Новые cvar'ы: **нет.**
+
+## Маппинг QAS-CQ1..CQ5 → метод (design §24.8)
+| QAS | Где | Метод |
+|---|---|---|
+| CQ1 (jitter min/avg/max) | CQ-P0 | host-тест |
+| CQ2 (rolling loss корректен) | CQ-P1 | python-тест |
+| CQ3 (`sizeof(ClientSample)<256`) | CQ-P0 | static_assert |
+| CQ4/CQ5 (без аллокаций; make/make test/verify) | CQ-P2 | CI/локально |
+
+## CQ-P0 — Jitter-ядро + IP+port матч
+**Файлы:** `src/metrics.h` (`ClientSample` +`jit_min_ms`/`jit_avg_ms`/`jit_max_ms` — 3×uint16=6Б; host-testable inline-аккумулятор), `src/plugin.h` (`ClientRuntime`: `prev_pkt_real`, packed `ip`/`port`, `jit_min/sum/max/count`), `src/hooks.cpp` (`PreprocessPacket`: матч по IP+port ≤32 → накопление Δ через `GetRealTime`, guard; reset на connect/gen), `src/sampler.cpp` (reset per-client после сэмпла, под `client_hz>0`), `tests/test_client_quality.cpp`.
+**Границы:** p99/гистограмма — вне (бюджет). **Acceptance:** `make test` (вкл. `test_client_quality`); `static_assert(sizeof(ClientSample)<256)` (247+6=253).
+**Ripple/ревью (CQ-1..CQ-5):** обновить `static_assert(sizeof(DropRecord))` (`src/metrics.h`) + проверки размеров в `tests/test_serialization_events.cpp`/`tests/test_config.cpp` (рост `window[64]`: +6×64=384Б); `static_assert(sizeof(ClientSample)==247)` → `==253`; packed-IP называть без конфликта с `ClientRuntime::ip[64]` (напр. `ip_packed`/`port_packed`); short-circuit `client_hz>0` применяется и к hot-path матчу; уточнить дизайн §24 (убрать устаревшие упоминания overflow).
+**Риски:** hot-path матч — только целочисленно; clamp uint16.
+
+## CQ-P1 — Сериализация + анализатор
+**Файлы:** `src/serialization.cpp` (поля jitter в `client`), `tools/analyzer/hldsmon.py` (скользящее окно loss по `loss`), fixtures/tests.
+**Acceptance:** `make test` (python зелёные). **Verify:** `make test`.
+
+## CQ-P2 — Верификация/документация
+`make clean && make && make verify-exports && make test`; README (jitter).
+## CQ-P3 — Запись стадии (journal).
+## CQ-P4 — Коммит (гейт).
+
+## Definition of Done
+- [ ] `ClientSample` +3 jitter-поля, `<256` (CQ3); jitter host-testable (CQ1).
+- [ ] IP+port матч в `PreprocessPacket`, reset per-client/gen, под `client_hz>0`.
+- [ ] Скользящий loss в анализаторе по `loss` (CQ2); `reliable_overflow` вне scope.
+- [ ] `make`/`make test`/`make verify-exports` зелёные; whitelist без изменений.
+- [ ] `docs/journal.md` заполнен. Коммит — только по просьбе.
+
+## Приложение P1 — расширение: `client` +`jit_min_ms`/`jit_avg_ms`/`jit_max_ms`.
+
+## Раздел ревью плана (momus) — стадия `client-quality`
+**Ревьюер:** `momus`. **Вердикт: PASS-WITH-REVISIONS; гейт ОТКРЫТ** (блокеров нет). CQ-1..CQ-5 сложены (ripple `DropRecord`/точный `static_assert`/имя packed-IP/`client_hz`-гейт/гигиена дизайна §24).
+**Fine:** 3×uint16 min/avg/max; отказ от гистограммы/`clientq`; бюджет `247+6=253<256`; D1 (overflow вне scope)/D2 (окно по `loss`); `Makefile` авто-глоб тестов; `GetRealTime`+clamp; IP+port ≤32.
+
+---
+
+# Стадия 8 — `connect-timings` — план реализации (rev 1)
+
+> Тайминги коннект-пайплайна + длительность загрузки карты. Дизайн — §25 (rev 9; Q1 решён). **Plan-review:** `momus`.
+
+## Заголовок стадии (bindings)
+- **Design:** §25 rev 9; oracle PASS-WITH-REVISIONS (CT-1..CT-9 folded). **Решения:** Q1 — готовность = первый server-tick после `SV_Spawn_f` с доступным миром/спавном, окно 30 тиков, иначе `null`. **Коммит** — по явной просьбе. **Верификация:** `make`/`make test`/`make verify-exports`.
+
+## Глобальные инварианты
+INV-1..6; единый контекст «коннект в процессе» (не per-slot); `GetRealTime()` + guard; short-circuit ⇒ `null`.
+
+## Новые cvar'ы: **нет.**
+
+## Маппинг QAS-CT1..CT4 → метод
+| CT1/CT2 (длительности reject/connect) | CT-P0 | host-тест сборки записи |
+| CT3 (`mapchange.load_ms`, `null`) | CT-P1 | unit + smoke |
+| CT4 (без аллокаций; CI) | CT-P2 | CI |
+
+## CT-P0 — Коннект-контекст + тайминги
+**Файлы:** `src/plugin.h` (`struct ConnectCtx { double t0; double steam_enter; uint8_t active; }` + reset-точки), `src/hooks.cpp` (`SV_ConnectClient` → `t0`+`active=1`; валидаторы → `stage_ms` вокруг `callNext`; `reject` +`stage_ms`/`total_ms`; `Steam_NotifyClientConnect` → `steam_ms`; `ClientConnected` → `auth_ms`/`steam_ms`, `active=0`), `src/metrics.h` (`RejectRecord`/`ConnectRecord` поля), serialization.
+**Ноль-семантика (CTP-1):** `uint32` не может быть `null` ⇒ **`present`-бит** (как в `ConfigSnapshot`/`HostRecord`) + `kv_u32_or_null`; нет метки/не наступило ⇒ `null`. **Тип:** `uint32` мс (как `HitchRecord.duration_ms`).
+**Границы:** не менять логику валидаторов; **host-testable** вынести `delta→ms`-конвертер+guard в `metrics.h` (CTP-4); `static_assert(sizeof(RejectRecord))`/`(sizeof(ConnectRecord))` обновить (CTP-5).
+**Acceptance:** `make`; host-тест конвертера/сборки. **Риски:** short-circuit/abandoned connect ⇒ `null`; **синхронность пайплайна (CTP-3) — проверить эмпирически по логу `stage`; иначе `null`**.
+
+## CT-P1 — Загрузка карты (delayed-emission)
+**Файлы:** `src/hooks.cpp` (`SV_Spawn_f` → `t_spawn`+pending-map+tick-counter, **не эмитить сразу**; reset massdrop остаётся), `src/plugin.h` (`MapCtx { double t_spawn; char pending_map[64]; uint8_t pending; uint16_t ticks; }`), `src/sampler.cpp` (эмиссия `mapchange` при готовности/окне), `src/metrics.h` (`MapChangeRecord` +`load_ms`+present), serialization.
+**Критерий готовности (CTP-2, решён):** первый server-tick после `SV_Spawn_f`, на котором мир доступен — **конкретный предикат:** `g_engfuncs.pfnGetModelPtr() != nullptr` **или** непустой `current_map()`; окно **30 тиков**; не наступило ⇒ `load_ms=null` (present-бит снят). Только при смене карты (сохранить `strcmp`-гейт).
+**Acceptance:** `load_ms` = от spawn до готовности; не наступило ⇒ `null`; `static_assert(sizeof(MapChangeRecord))` обновлён (CTP-5).
+
+## CT-P2 — Верификация/docs; CT-P3 — journal; CT-P4 — commit gate.
+
+## Definition of Done
+- [ ] Единый контекст коннекта; `stage_ms`/`total_ms`/`auth_ms`/`steam_ms` (`uint32` мс, nullable); short-circuit ⇒ `null`.
+- [ ] `mapchange.load_ms` delayed-emission; готовность по Q1 (окно 30 тиков); иначе `null`.
+- [ ] `GetRealTime()` + guard; `DropRecord` не трогается.
+- [ ] `make`/`make test`/`make verify-exports` зелёные; whitelist без изменений.
+- [ ] `docs/journal.md`. Коммит — только по просьбе.
+
+## Приложение P1 — расширение: `reject`+`stage_ms`/`total_ms`; `connect`+`auth_ms`/`steam_ms`; `mapchange`+`load_ms`.
+
+Поля добавлены в **существующие** записи (в конце объекта; канонический блок выше обновлён). Все — `uint32` мс (как `HitchRecord.duration_ms`), **nullable**: измерение отсутствует (short-circuit стадии другим плагином, нет метки, guard `GetRealTime()` на `<=0`/отрицательную дельту) ⇒ JSON `null` (present-бит снят), а не `0` (CT-4/CT-6/CT-8).
+
+| Поле | Семантика |
+|---|---|
+| `reject.stage_ms` | длительность стадии валидатора вокруг `callNext` (напр. `SV_CheckUserInfo`) |
+| `reject.total_ms` | от входа `SV_ConnectClient` до отказа |
+| `connect.auth_ms` | от входа `SV_ConnectClient` до `ClientConnected` (успех) |
+| `connect.steam_ms` | длительность стадии `Steam_NotifyClientConnect` |
+| `mapchange.load_ms` | от `SV_Spawn_f` до готовности мира (Q1: первый 1 Гц server-tick с непустым `current_map()`); не наступило за окно 30 тиков ⇒ `null` |
+
+- Единый контекст «коннект в процессе» (server thread); новый `SV_ConnectClient` перезаписывает контекст (CT-1/CT-7). `DropRecord` не изменяется.
+- `mapchange` — **delayed-emission** (CT-2): `SV_Spawn_f` только фиксирует метку спавна; запись эмитится на 1 Гц server-tick при готовности/окне (append-only JSONL не позволяет дополнить строку).
+
+## Раздел ревью плана (momus) — стадия `connect-timings`
+**Ревьюер:** `momus`. **Вердикт: PASS-WITH-REVISIONS; гейт ОТКРЫТ после сложения** (было 2 High). Сложено: CTP-1 (`present`-бит + `kv_u32_or_null` для «null»); CTP-2 (конкретный предикат готовности: `pfnGetModelPtr`/`current_map()` + окно 30 + хранение pending в `plugin.h`); CTP-3 (проверка синхронности эмпирически; иначе `null`); CTP-4 (host-testable конвертер+guard); CTP-5 (`static_assert`); CTP-6 (P1-схема полей).
+**Fine:** поля в существующих записях; `GetRealTime()`; `stage_ms` вокруг `callNext`; `DropRecord` не трогается.
+
+---
+
+# Стадия 9 — `event-enrich` — план реализации (rev 1)
+
+> Детектор-поле в `drop`; top-N; события деградации; edict churn. Дизайн — §26 (rev 10; EN-1..EN-7 folded, EN-7/Q2 решены). **Plan-review:** `momus`.
+
+## Заголовок стадии (bindings)
+- **Design:** §26 rev 10; oracle PASS-WITH-REVISIONS. **Решения (EN-7):** детектор — поле в `drop`; `top_ips` аддитивно; hard-failure — console. **Коммит** — по просьбе. **Верификация:** `make`/`make test`/`make verify-exports`.
+
+## Глобальные инварианты
+INV-1..6; гейт `plugin_enabled()`; `LogWriter` — sink (pull).
+
+## Новые cvar'ы: **нет.** Новые типы: **`degraded`**, **`retention`**.
+
+## Маппинг QAS-E1..E4 → метод
+| E1 (детектор рядом с drop) | EN-P0 | host-тест матча |
+| E2 (top-N) | EN-P0 | host-тест |
+| E3 (`degraded`/`retention`) | EN-P1 | host-тест pull |
+| E4 (edicts_churn; без аллокаций; CI) | EN-P0/P2 | CI |
+
+## EN-P0 — Детектор-поле, top-N, edicts_churn
+**Файлы:** `src/metrics.h` (`DropRecord` +`detector[32]`; `PacketStats` +`top_ips[3]` — POD `IpCount { char ip[64]; uint32_t count; }` (EV-5), keep `top_ip`; `ServerSample` +`int32 edicts_churn` + `uint8_t edicts_churn_present` (EV-2)), `src/plugin.h`/`src/hooks.cpp` (матч подстрок в `classify_reason`-стиле → `detector`; reset churn-baseline на `SV_Spawn_f`), `src/sampler.cpp` (one-pass top-3; churn Δ signed + present; reset baseline на mapchange), serialization (`kv_i64`/`kv_u32_or_null`), fixtures.
+**Acceptance:** `make test`; тест на реальной строке детектора. **Риски:** substring хрупкость (best-effort).
+
+## EN-P1 — События деградации (pull)
+**Файлы:** `src/log_writer.{h,cpp}` (`last_prune_count()`+clear; `error_count()`/`size_capped()`/`enabled()` — уже есть), `src/plugin.h` (baseline `prev_error_count`/`prev_prune_count` в `PluginContext`), `src/sampler.cpp` (1 Гц: дельты → `degraded`/`retention` только при `log->enabled()`), `src/events.{h,cpp}`, `src/control.cpp` (`hldsmon_status` — hard-failure видимость), metrics/serialization.
+**Схема (EV-1):** `degraded {type,t,error_count}` (Δ), `retention {type,t,removed}` (Δ). **Границы:** hard write-failure — console (`pfnServerPrint`)/`hldsmon_status`, **не** JSONL. **Acceptance:** `make`; `degraded`/`retention` эмитятся; callback нет.
+
+## EN-P2 — Верификация/docs; EN-P3 — journal; EN-P4 — commit gate.
+
+## Definition of Done
+- [ ] `drop.detector` (best-effort, `""` при промахе, не влияет на drop); тип `filter` не вводится.
+- [ ] `packet.top_ips` (N=3) + сохранён `top_ip`; `static_assert` правлены.
+- [ ] `degraded`/`retention` (pull, при enabled); `write_error` не вводится; hard-failure — console.
+- [ ] `edicts_churn` `int32` + present/`null` + reset на mapchange; `drop.server` учтён.
+- [ ] P1/фикстуры/`KNOWN_TYPES` для `degraded`/`retention`; `make`/`make test`/`make verify-exports` зелёные.
+- [ ] `docs/journal.md`. Коммит — по просьбе.
+
+## Приложение P1 — расширение: `drop.detector`; `packet.top_ips`; `server.edicts_churn`; типы `degraded`/`retention`.
+
+- `drop.detector` (`char[32]`) — best-effort подстрочный матч reason против набора детекторов `rehlds_security` (`movecmd`/`stringcmd`/`dlfile`/`speedhack`); промах — `""`; drop не меняется; тип `filter` не вводится (EN-1/EN-3/EV-1/EV-5).
+- `packet.top_ips` — top-3 `{ip,count}` (const N=3), аддитивно к сохранённому `top_ip`; один линейный проход вне hot path (EN-4).
+- `server.edicts_churn` — знаковый `int32` Δ `pfnNumberOfEntities()` за интервал + present-бит (`null` на первом интервале/после mapchange); baseline сбрасывается на `SV_Spawn_f`; вложенный `drop.server` наследует поле (EN-5).
+- `degraded {type,t,error_count}` / `retention {type,t,removed}` — pull из 1 Гц sampler по флагам/счётчикам `LogWriter` (`enabled()`/`error_count()`/`last_prune_count()`+clear), только пока `log->enabled()`; hard write-failure/кап — console/`hldsmon_status` (EN-2/EN-7).
+
+## Раздел ревью плана (momus) — стадия `event-enrich`
+**Ревьюер:** `momus`. **Вердикт: OKAY (PASS); гейт ОТКРЫТ.** Сложены неблокирующие EV-1..EV-5: схема `degraded`/`retention` (`error_count`/`removed`); present-флаг `edicts_churn`; `plugin.h`/`control.cpp` в файлах; POD `IpCount`; актуализировать stale §26.5/§26.6.
+**Fine:** детектор-поле в `drop`; `top_ip` сохранён; pull-модель без callback; hard-failure=console; точки вставки (`hooks.cpp:277,493`, `sampler.cpp:326`).
+
+---
+
+# Стадия 10 — `analyzer-ui` — план реализации (rev 1)
+
+> Host-overlay, incident bundle (JSON-конверт), config-diff. Дизайн — §27 (rev 11; AU-1..AU-9 folded, Q1 решён). **Только `tools/analyzer`.** **Plan-review:** `momus` (или сокращённый для UI-стадии).
+
+## Заголовок стадии (bindings)
+- **Design:** §27 rev 11; oracle PASS-WITH-REVISIONS. **Решения (Q1):** bundle — JSON-конверт (zip опционален). **Коммит** — по просьбе. **Верификация:** `make test` (python).
+
+## Глобальные инварианты
+Плагин/схема не меняются; stdlib-only.
+
+## Новые cvar'ы/типы: **нет** (только analyzer/UI).
+
+## Маппинг QAS-U1..U4 → метод
+| U1 (bundle, ре-инжестится) | UI-P1 | python-тест |
+| U2 (config-diff) | UI-P1 | python-тест |
+| U3 (host-overlay, caveats) | UI-P2 | python-тест + review |
+| U4 (без плагинных изменений) | UI-P2 | CI |
+
+## UI-P1 — Библиотека: `config_at`, `config_diff`, `incident_bundle`, `field→caveat`
+**Файлы:** `tools/analyzer/hldsmon.py` (`config_at(records,t)`; `config_diff(before,after)` → `{changed,added,removed,baseline}` по `CONFIG_FIELDS`+`map`/`maxclients`/`rehlds_*`, null=`set`/`cleared`; **карта field→caveat-source рядом с `HOST_CAVEAT_BITS`** (AU-5/F3); `incident_bundle(records, drop, mins)` → JSON-конверт `{bundle_version, drop, window, config, host, records}` + ридер), fixtures/tests.
+**Дедуп (AU-2/F1):** `drop` as-is **или** сырые `records` — **не оба безусловно** (дроп уже несёт `window[64]`); верхняя граница размера + предупреждение. **Acceptance:** bundle ре-инжестится в `iter_records`; граница размера; кейс «нет baseline». **Verify:** `make test`.
+
+## UI-P2 — Webui payload + UI
+**Файлы:** `tools/analyzer/webui.py` (`/api/analyze` +`host_series`/`config`; `/api/bundle`), `webui/index.html` (host-overlay: 3 состояния точки, caveat-маркер; config-diff панель; кнопка bundle; `ALL_DATASETS`/localStorage).
+**Acceptance:** UI рисует host/caveat/config-diff; bundle скачивается.
+
+## UI-P3 — Верификация/docs; UI-P4 — journal; UI-P5 — commit gate.
+
+## Definition of Done
+- [ ] `config_at`/`config_diff` (`{changed,added,removed,baseline}`); «нет baseline» — флаг.
+- [ ] `incident_bundle` — JSON-конверт + ридер; ре-инжестится; граница размера.
+- [ ] `/api/analyze` отдаёт `host_series`+`config`; `/api/bundle`; UI: overlay (null=разрыв, caveat=маркер), config-diff, bundle.
+- [ ] Python-тесты зелёные; плагин/схема не тронуты. `docs/journal.md`. Коммит — по просьбе.
+
+## Раздел ревью плана (momus) — стадия `analyzer-ui`
+**Ревьюер:** `momus`. **Вердикт: OKAY (PASS); гейт ОТКРЫТ.** Сложены F1..F4: политика дедупа `drop`/`records`; карта field→caveat-source в `hldsmon.py`; набор `config_diff` (`CONFIG_FIELDS`+`map`/`maxclients`/`rehlds_*`, `set`/`cleared`); QA достаточно.
+**Fine:** только `tools/analyzer`; реюз `host_series`/`iter_records`/`cmd_window`/`_config_digest_block`; три состояния host-точки (`None`≠0); точка интеграции «Все датасеты».

@@ -14,6 +14,7 @@ namespace hldsmon {
 namespace {
 
 constexpr uint32_t kNetCmdPerTick = 16;
+constexpr uint16_t kMapReadyTicks = 30;  // readiness window, 1 Hz server ticks
 
 inline uint16_t rel_fill_pct(int reliable_length) noexcept {
     if (reliable_length <= 0) {
@@ -98,7 +99,7 @@ bool build_client_sample(int id, double now_epoch, ClientSample& cs) noexcept {
     cs.t = now_epoch;
     cs.id = static_cast<uint8_t>(id);
     cs.gen = c.clients[id].gen;
-    cs.ping = static_cast<uint16_t>(ct->latency);
+    cs.ping = ping_ms_from_latency(ct->latency);
     cs.loss = static_cast<uint32_t>(ct->packet_loss);
     cs.choke = static_cast<uint32_t>(ct->chokecount);
 
@@ -145,6 +146,11 @@ bool build_client_sample(int id, double now_epoch, ClientSample& cs) noexcept {
     }
     gate_idle_flow(cs, kIdleZeroFlowMs);
 
+    // Jitter accumulated since this client's previous sample (design §24.3
+    // п.1); count==0 => all-zero "no data".
+    jitter_finalize(cr.jit_min, cr.jit_sum, cr.jit_max, cr.jit_count,
+                    cs.jit_min_ms, cs.jit_avg_ms, cs.jit_max_ms);
+
     parse_userinfo(ct, cr, cs);
     return true;
 }
@@ -160,23 +166,16 @@ void emit_packet_interval(double now_epoch) noexcept {
         ps.sizes = c.pkt_sizes;
         ps.unique_ips = c.ip_unique;
 
-        uint32_t best = 0;
-        uint32_t best_ip = 0;
-        for (uint32_t i = 0; i < c.ip_table_size; ++i) {
-            if (c.ip_table[i].count > best) {
-                best = c.ip_table[i].count;
-                best_ip = c.ip_table[i].ip;
-            }
+        // One linear pass selects the top-3 (EN-4); `top_ip` keeps its old
+        // meaning (the count leader) for schema backward compatibility.
+        IpCount top[HLDSMON_TOP_IPS];
+        std::memset(top, 0, sizeof(top));
+        const size_t ntop = select_top_ips(c.ip_table, c.ip_table_size, top);
+        for (size_t k = 0; k < ntop; ++k) {
+            ps.top_ips[k] = top[k];
         }
-        if (best > 0 && best_ip != 0) {
-            netadr_t a;
-            std::memset(&a, 0, sizeof(a));
-            a.type = NA_IP;
-            a.ip[0] = static_cast<unsigned char>((best_ip >> 24) & 0xFFu);
-            a.ip[1] = static_cast<unsigned char>((best_ip >> 16) & 0xFFu);
-            a.ip[2] = static_cast<unsigned char>((best_ip >> 8) & 0xFFu);
-            a.ip[3] = static_cast<unsigned char>(best_ip & 0xFFu);
-            format_ip(a, ps.top_ip, sizeof(ps.top_ip));
+        if (ntop > 0) {
+            copy_str(ps.top_ip, sizeof(ps.top_ip), top[0].ip);
         }
         events::write_packet(ps);
         ++c.packet_records;
@@ -216,6 +215,36 @@ void emit_netcmd_interval(double now_epoch) noexcept {
     }
 }
 
+// Delayed `mapchange` (design §25.3 п.2, CT-2): SV_Spawn_f records only the
+// spawn marker, so the record is emitted here once the world is available
+// (non-empty current_map(), Q1) or the readiness window expires; not ready
+// within the window => load_ms present bit clear (JSON null).
+void emit_pending_mapchange(double now_real, double now_epoch) noexcept {
+    PluginContext& c = ctx();
+    if (c.map_ctx.pending == 0) {
+        return;
+    }
+    ++c.map_ctx.ticks;
+    const bool ready = current_map()[0] != '\0';
+    if (!ready && c.map_ctx.ticks < kMapReadyTicks) {
+        return;
+    }
+    MapChangeRecord rec;
+    std::memset(&rec, 0, sizeof(rec));
+    rec.t = now_epoch;
+    copy_str(rec.map, sizeof(rec.map), c.map_ctx.pending_map);
+    if (ready && c.map_ctx.t_spawn > 0.0) {
+        uint32_t load_ms = 0;
+        if (timing_delta_ms(now_real - c.map_ctx.t_spawn, load_ms)) {
+            rec.load_ms = load_ms;
+            rec.load_present = 1;
+        }
+    }
+    events::write_mapchange(rec);
+    c.map_ctx.pending = 0;
+    c.map_ctx.ticks = 0;
+}
+
 void modnet_emit_interval(double now_epoch, double now_real) noexcept {
     PluginContext& c = ctx();
     if (!c.modnet.enabled) {
@@ -235,6 +264,138 @@ void modnet_emit_interval(double now_epoch, double now_real) noexcept {
         }
         events::write_modnet(r);
     }
+}
+
+// statvfs must target the directory the log actually lives in (M5), not "/";
+// resolution mirrors LogWriter paths (game dir + relative cvar) without snprintf.
+void resolve_host_dir(char* out, size_t cap) noexcept {
+    PluginContext& c = ctx();
+    const char* dir = "addons/hldsmon/logs";
+    if (c.cvars.dir != nullptr && c.cvars.dir->string != nullptr &&
+        c.cvars.dir->string[0] != '\0') {
+        dir = c.cvars.dir->string;
+    }
+    if (dir[0] == '/' || cap == 0) {
+        copy_str(out, cap, dir);
+        return;
+    }
+    char game_dir[512];
+    game_dir[0] = '\0';
+    if (g_engfuncs.pfnGetGameDir != nullptr) {
+        g_engfuncs.pfnGetGameDir(game_dir);
+    }
+    if (game_dir[0] == '\0') {
+        copy_str(out, cap, dir);
+        return;
+    }
+    size_t pos = 0;
+    while (game_dir[pos] != '\0' && pos + 1 < cap) {
+        out[pos] = game_dir[pos];
+        ++pos;
+    }
+    if (pos + 1 < cap) {
+        out[pos] = '/';
+        ++pos;
+    }
+    copy_str(out + pos, cap - pos, dir);
+}
+
+// 1 Hz host/kernel telemetry (design §23.3): gather -> Δ -> emit `host`.
+// OFF => not a single read (QAS-H5). Unavailable sources leave their fields
+// null; the env caveat mask is computed once at bootstrap.
+void host_emit_interval(double now_epoch) noexcept {
+    PluginContext& c = ctx();
+    if (cvar_f(c.cvars.host, 0.0f) <= 0.5f) {
+        return;
+    }
+
+    HostSnapshot cur;
+    std::memset(&cur, 0, sizeof(cur));
+    char buf[kHostReadCap];
+    size_t len = 0;
+    bool truncated = false;
+    bool any_truncated = false;
+
+    if (read_file("/proc/net/snmp", buf, sizeof(buf), &len, &truncated)) {
+        parse_snmp_udp(buf, cur);
+    }
+    any_truncated = any_truncated || truncated;
+
+    if (read_file("/proc/net/dev", buf, sizeof(buf), &len, &truncated)) {
+        parse_net_dev(buf, cur);
+    }
+    any_truncated = any_truncated || truncated;
+
+    if (read_file("/proc/stat", buf, sizeof(buf), &len, &truncated)) {
+        parse_stat(buf, cur);
+    }
+    any_truncated = any_truncated || truncated;
+
+    if (read_file("/proc/self/io", buf, sizeof(buf), &len, &truncated)) {
+        parse_self_io(buf, cur);
+    }
+    any_truncated = any_truncated || truncated;
+
+    char dir[1024];
+    resolve_host_dir(dir, sizeof(dir));
+    uint64_t avail_mb = 0;
+    if (statvfs_bavail(dir, &avail_mb)) {
+        cur.disk_bavail_mb = avail_mb;
+        cur.present |= kHostDiskBavailMb;
+    }
+
+    HostRecord r;
+    build_host_record(c.host_prev, c.host_has_prev, cur, c.host_caveat_mask,
+                      any_truncated, now_epoch, r);
+    c.host_prev = cur;
+    c.host_has_prev = true;
+    events::write_host(r);
+}
+
+// Pull-based degradation visibility (design §26.3 п.4, EN-2/EN-7): LogWriter
+// stays an engine-free sink; the 1 Hz tick reads its counters and emits
+// `degraded`/`retention` while writing is enabled. A hard write failure or the
+// size cap cannot be reported into the JSONL it just disabled, so it goes to
+// the console only (no `write_error` type); `hldsmon_status` shows the flags.
+void emit_log_health(double now_epoch) noexcept {
+    PluginContext& c = ctx();
+    if (c.log == nullptr) {
+        return;
+    }
+    const bool enabled = c.log->enabled();
+
+    const uint64_t ec = c.log->error_count();
+    if (ec > c.prev_error_count) {
+        const uint64_t delta = ec - c.prev_error_count;
+        if (enabled) {
+            DegradedRecord r;
+            std::memset(&r, 0, sizeof(r));
+            r.t = now_epoch;
+            r.error_count = delta;
+            events::write_degraded(r);
+        } else if (g_engfuncs.pfnServerPrint != nullptr) {
+            g_engfuncs.pfnServerPrint(
+                "hldsmon: log write errors; JSONL writing disabled (see hldsmon_status)\n");
+        }
+    }
+    c.prev_error_count = ec;
+
+    const uint32_t pc = c.log->last_prune_count();
+    if (enabled && pc > c.prev_prune_count) {
+        RetentionRecord r;
+        std::memset(&r, 0, sizeof(r));
+        r.t = now_epoch;
+        r.removed = pc - c.prev_prune_count;
+        events::write_retention(r);
+    }
+    c.prev_prune_count = pc;
+
+    if (c.prev_log_enabled && !enabled && c.log->size_capped() &&
+        g_engfuncs.pfnServerPrint != nullptr) {
+        g_engfuncs.pfnServerPrint(
+            "hldsmon: log size cap reached; writing disabled until next rotation\n");
+    }
+    c.prev_log_enabled = enabled;
 }
 
 void do_server_tick(double now_real, double now_epoch) noexcept {
@@ -294,7 +455,19 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
     s.fake = fake;
     s.in_kbps = in_k;
     s.out_kbps = out_k;
-    s.edicts = static_cast<uint32_t>(g_engfuncs.pfnNumberOfEntities());
+    const int32_t edicts_now = static_cast<int32_t>(g_engfuncs.pfnNumberOfEntities());
+    s.edicts = static_cast<uint32_t>(edicts_now);
+    // Signed churn over the interval (EN-5); no baseline yet (startup, first
+    // tick after mapchange) leaves the present bit clear => JSON null.
+    if (c.edicts_has_prev) {
+        int64_t churn = static_cast<int64_t>(edicts_now) - static_cast<int64_t>(c.prev_edicts);
+        if (churn > 2147483647LL) churn = 2147483647LL;
+        if (churn < -2147483648LL) churn = -2147483648LL;
+        s.edicts_churn = static_cast<int32_t>(churn);
+        s.edicts_churn_present = 1;
+    }
+    c.prev_edicts = edicts_now;
+    c.edicts_has_prev = true;
     copy_str(s.map, sizeof(s.map), current_map());
     s.uptime_s = gpGlobals != nullptr ? static_cast<uint32_t>(gpGlobals->time) : 0;
     s.fps = static_cast<float>(c.frame_count);
@@ -303,9 +476,31 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
     c.server_ring.push(s);
     events::write_server(s);
 
+    // Tracked config: first enabled tick emits the baseline, later ticks emit
+    // only on change (design §22.3 п.1, CFG-4; caller gates on plugin_enabled).
+    ConfigSnapshot cfg;
+    build_config_snapshot(cfg);
+    if (!c.last_config_valid || config_changed(c.last_config, cfg)) {
+        ConfigRecord cr;
+        std::memset(&cr, 0, sizeof(cr));
+        cr.t = now_epoch;
+        if (c.api != nullptr) {
+            cr.rehlds_major = c.api->GetMajorVersion();
+            cr.rehlds_minor = c.api->GetMinorVersion();
+        }
+        copy_str(cr.map, sizeof(cr.map), current_map());
+        cr.maxclients = static_cast<uint8_t>(c.maxclients > 0 ? c.maxclients : 0);
+        cr.config = cfg;
+        events::write_config(cr);
+        c.last_config = cfg;
+        c.last_config_valid = true;
+    }
+
     emit_packet_interval(now_epoch);
     emit_netcmd_interval(now_epoch);
+    emit_pending_mapchange(now_real, now_epoch);
     modnet_emit_interval(now_epoch, now_real);
+    host_emit_interval(now_epoch);
 
     c.frame_count = 0;
     c.frame_min = 0.0f;
@@ -323,6 +518,7 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
             c.last_flush_t = now_real;
         }
     }
+    emit_log_health(now_epoch);
 }
 
 void sample_clients(double now_epoch) noexcept {
@@ -337,6 +533,11 @@ void sample_clients(double now_epoch) noexcept {
         ClientSample cs;
         if (build_client_sample(id, now_epoch, cs)) {
             c.clients[id].ring.push(cs);
+            // Reset right after this client's sample: sampling is staggered
+            // (M3) and this function only runs under client_hz>0 (CQ-4), so the
+            // accumulators are always drained by the matching sample.
+            ClientRuntime& cr = c.clients[id];
+            jitter_reset(cr.jit_min, cr.jit_sum, cr.jit_max, cr.jit_count);
         }
     }
 }
@@ -391,6 +592,48 @@ const char* current_map() noexcept {
         }
     }
     return "";
+}
+
+void build_config_snapshot(ConfigSnapshot& out) noexcept {
+    PluginContext& c = ctx();
+    std::memset(&out, 0, sizeof(out));
+    const CvarRefs& cv = c.cvars;
+    if (cv.sys_ticrate != nullptr) {
+        out.present |= kCfgSysTicrate;
+        out.sys_ticrate = cv.sys_ticrate->value;
+    }
+    if (cv.host_framerate != nullptr) {
+        out.present |= kCfgHostFramerate;
+        out.host_framerate = cv.host_framerate->value;
+    }
+    if (cv.sv_timeout != nullptr) {
+        out.present |= kCfgSvTimeout;
+        out.sv_timeout = cv.sv_timeout->value;
+    }
+    if (cv.sv_maxrate != nullptr) {
+        out.present |= kCfgSvMaxrate;
+        out.sv_maxrate = cv.sv_maxrate->value;
+    }
+    if (cv.sv_minrate != nullptr) {
+        out.present |= kCfgSvMinrate;
+        out.sv_minrate = cv.sv_minrate->value;
+    }
+    if (cv.sv_maxupdaterate != nullptr) {
+        out.present |= kCfgSvMaxupdaterate;
+        out.sv_maxupdaterate = cv.sv_maxupdaterate->value;
+    }
+    if (cv.sv_minupdaterate != nullptr) {
+        out.present |= kCfgSvMinupdaterate;
+        out.sv_minupdaterate = cv.sv_minupdaterate->value;
+    }
+    if (cv.sv_maxcmdrate != nullptr) {
+        out.present |= kCfgSvMaxcmdrate;
+        out.sv_maxcmdrate = cv.sv_maxcmdrate->value;
+    }
+    if (cv.sv_mincmdrate != nullptr) {
+        out.present |= kCfgSvMincmdrate;
+        out.sv_mincmdrate = cv.sv_mincmdrate->value;
+    }
 }
 
 void sampler_on_frame(double frame_ms, double now_real) noexcept {

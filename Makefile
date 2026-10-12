@@ -35,7 +35,7 @@ HARNESS_TFLAGS := $(WARN) -O2 -m32 -fPIC -shared -fno-optimize-sibling-calls
 
 TARGET := HldsMonitoring_mm_i386.so
 SRCS   := $(wildcard src/*.cpp)
-CORE_SRCS := $(wildcard src/serialization.cpp src/log_writer.cpp src/metrics.cpp src/modnet.cpp src/retention.cpp)
+CORE_SRCS := $(wildcard src/serialization.cpp src/log_writer.cpp src/metrics.cpp src/modnet.cpp src/retention.cpp src/host_metrics.cpp)
 TEST_SRCS := $(wildcard tests/test_*.cpp)
 
 .PHONY: all test test-host-core test-core test-python web verify-exports test-modnet-harness clean

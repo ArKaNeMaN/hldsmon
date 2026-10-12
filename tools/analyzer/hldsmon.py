@@ -58,8 +58,88 @@ KNOWN_TYPES = (
     "modnet",
     "shutdown",
     "crash",
+    "config",
+    "host",
+    "degraded",
+    "retention",
 )
 _KNOWN_TYPES = frozenset(KNOWN_TYPES)
+
+#: Numeric tracked-config fields (docs/plan.md, P1 `config` / `drop.config`).
+CONFIG_FIELDS = (
+    "sys_ticrate",
+    "host_framerate",
+    "sv_timeout",
+    "sv_maxrate",
+    "sv_minrate",
+    "sv_maxupdaterate",
+    "sv_minupdaterate",
+    "sv_maxcmdrate",
+    "sv_mincmdrate",
+)
+
+#: Numeric `host` metric fields (docs/plan.md, P1 extension `host`).
+HOST_FIELDS = (
+    "udp_rcvbuf_errors",
+    "udp_in_errors",
+    "udp_in_csum_errors",
+    "net_rx_dropped",
+    "net_rx_missed",
+    "net_rx_overruns",
+    "steal_pct",
+    "io_read_bytes",
+    "io_write_bytes",
+    "disk_bavail_mb",
+)
+
+#: `present` mask bit per emitted `host` field; constants mirrored in
+#: ``src/host_metrics.h`` (HM-3). A field whose bit is clear is JSON null
+#: (unavailable or no Δ baseline yet).
+HOST_PRESENT_BITS = {name: 1 << index for index, name in enumerate(HOST_FIELDS)}
+
+#: `caveat` mask bits by source (``src/host_metrics.h``): the value is present
+#: but must not be attributed to this server (shared netns, driver-dependent
+#: NIC counters, lxcfs-steal, task-io semantics, thin/quota disk, truncated
+#: source read).
+HOST_CAVEAT_BITS = {
+    "udp_netns": 1 << 0,
+    "net_dev": 1 << 1,
+    "steal": 1 << 2,
+    "io": 1 << 3,
+    "disk": 1 << 4,
+    "truncated": 1 << 5,
+}
+
+#: ``host`` metric field -> caveat source name (:data:`HOST_CAVEAT_BITS` key).
+#: A sample is *caveated* for that field when the source's bit is set in
+#: ``caveat_mask``: the value is present but must not be attributed to this
+#: server (shared netns, driver-dependent NIC counters, lxcfs-steal, task-io
+#: semantics, thin/quota disk). Mirrored in the web UI via the ``host_caveats``
+#: payload key (design §27.2 п.1, AU-5/F3).
+HOST_FIELD_CAVEATS = {
+    "udp_rcvbuf_errors": "udp_netns",
+    "udp_in_errors": "udp_netns",
+    "udp_in_csum_errors": "udp_netns",
+    "net_rx_dropped": "net_dev",
+    "net_rx_missed": "net_dev",
+    "net_rx_overruns": "net_dev",
+    "steal_pct": "steal",
+    "io_read_bytes": "io",
+    "io_write_bytes": "io",
+    "disk_bavail_mb": "disk",
+}
+
+#: :data:`HOST_FIELD_CAVEATS` flattened to the mask bit per field.
+HOST_FIELD_CAVEAT_BITS = {
+    field: HOST_CAVEAT_BITS[source]
+    for field, source in HOST_FIELD_CAVEATS.items()
+}
+
+#: Incident bundle envelope version and default upper size bound (bytes of the
+#: serialized JSON envelope). The bound is enforced best-effort with a warning
+#: (AU-1/AU-2).
+BUNDLE_VERSION = 1
+BUNDLE_MAX_BYTES = 8 * 1024 * 1024
 
 #: Slide thresholds used by the anomaly heuristics.
 MASS_DROP_COUNT = 3
@@ -520,6 +600,40 @@ def client_series(records):
     return series
 
 
+# Trailing loss-rate window (stage 7, design §24.3 п.4 / D2). The emitted
+# `loss` is already a percentage (client_t::packet_loss), so a trailing mean
+# separates a transient spike from a persistently bad link without any new
+# plugin field and without cumulative counters (in_seq).
+LOSS_RATE_WINDOW = 5
+
+
+def rolling_mean(values, window=LOSS_RATE_WINDOW):
+    """Trailing mean over up to ``window`` samples, skipping ``None`` gaps.
+
+    Returns one value per input position, in order; the value is ``None`` when
+    the window holds no numeric sample. ``window`` < 1 is treated as 1.
+    """
+    if window < 1:
+        window = 1
+    out = []
+    for idx in range(len(values)):
+        chunk = [v for v in values[max(0, idx - window + 1):idx + 1]
+                 if v is not None]
+        out.append(mean(chunk) if chunk else None)
+    return out
+
+
+def loss_rate_series(records, window=LOSS_RATE_WINDOW):
+    """Per-session rolling loss-rate from :func:`client_series`.
+
+    Keyed exactly like ``client_series``; each value is the trailing mean of
+    the per-sample ``loss`` percentages (missing samples are skipped, an
+    all-``None`` window stays ``None``).
+    """
+    return {skey: rolling_mean(entry.get("loss", []), window)
+            for skey, entry in client_series(records).items()}
+
+
 _ID_STR_FIELDS = ("name", "authid", "steamid64", "ip")
 _ID_NUM_FIELDS = ("port", "slot", "userid", "conn_s")
 _ID_BOOL_FIELDS = ("fake", "proxy")
@@ -807,6 +921,361 @@ def _modnet_digest_block(records):
         "conn_fail": total_fail,
         "modules": rows,
     }
+
+
+def _config_digest_block(records):
+    """Return the digest ``config`` block: record count and latest snapshot.
+
+    ``null`` values (cvar absent on the server) pass through as ``None``.
+    """
+    configs = [r for r in records if r.get("type") == "config"]
+    latest = None
+    if configs:
+        rec = configs[-1]
+        latest = {
+            "t": _num(rec.get("t")),
+            "rehlds_major": _num(rec.get("rehlds_major")),
+            "rehlds_minor": _num(rec.get("rehlds_minor")),
+            "map": rec.get("map") if isinstance(rec.get("map"), str) else None,
+            "maxclients": _num(rec.get("maxclients")),
+        }
+        for key in CONFIG_FIELDS:
+            latest[key] = _num(rec.get(key))
+    return {"records": len(configs), "latest": latest}
+
+
+#: Tracked fields compared by :func:`config_diff`: the numeric
+#: :data:`CONFIG_FIELDS` plus the non-numeric config context (design §27.2 п.4).
+CONFIG_DIFF_FIELDS = CONFIG_FIELDS + (
+    "map",
+    "maxclients",
+    "rehlds_major",
+    "rehlds_minor",
+)
+
+
+def _config_value(rec, field):
+    """Return a config field's value, or ``None`` when absent/unusable.
+
+    ``map`` is a non-empty string; every other field is numeric. A missing key
+    and an explicit JSON ``null`` are equivalent (the cvar was not registered).
+    """
+    value = rec.get(field)
+    if field == "map":
+        return value if isinstance(value, str) and value != "" else None
+    return _num(value)
+
+
+def config_snapshot(rec):
+    """Return the normalized snapshot of a ``config`` record.
+
+    Keys: ``t`` plus :data:`CONFIG_DIFF_FIELDS`; absent/unusable values become
+    ``None`` (never zero). Accepts both raw records and snapshots.
+    """
+    snap = {"t": _record_ts(rec)}
+    for field in CONFIG_DIFF_FIELDS:
+        snap[field] = _config_value(rec, field)
+    return snap
+
+
+def config_at(records, t):
+    """Return the last ``config`` record with time ``<= t``, or ``None``.
+
+    "Last" is file order among matching records (ties on ``t``: later wins).
+    ``t`` is epoch seconds; a non-numeric or ``None`` ``t`` yields ``None``.
+    """
+    cutoff = _num(t)
+    if cutoff is None:
+        return None
+    latest = None
+    for rec in records:
+        if rec.get("type") != "config":
+            continue
+        rt = _record_ts(rec)
+        if rt is None or rt > cutoff:
+            continue
+        latest = rec
+    return latest
+
+
+def config_diff(before, after):
+    """Diff two config records/snapshots over :data:`CONFIG_DIFF_FIELDS`.
+
+    Returns ``{"baseline", "changed", "added", "removed"}``; every entry is
+    ``{"field", "before", "after"}`` in :data:`CONFIG_DIFF_FIELDS` order.
+
+    A value that is null/missing on one side is *added* (set) or *removed*
+    (cleared) — never *changed*. With no baseline (``before`` is ``None``/not a
+    dict) all three lists stay empty: absence of a baseline is not "everything
+    changed".
+    """
+    result = {"baseline": isinstance(before, dict),
+              "changed": [], "added": [], "removed": []}
+    if not result["baseline"]:
+        return result
+    after_d = after if isinstance(after, dict) else {}
+    for field in CONFIG_DIFF_FIELDS:
+        old = _config_value(before, field)
+        new = _config_value(after_d, field)
+        if old is None and new is None:
+            continue
+        entry = {"field": field, "before": old, "after": new}
+        if old is None:
+            result["added"].append(entry)
+        elif new is None:
+            result["removed"].append(entry)
+        elif old != new:
+            result["changed"].append(entry)
+    return result
+
+
+def config_series(records, low=None, high=None):
+    """Return normalized ``config`` snapshots (file order), each with ``diff``.
+
+    ``diff`` is :func:`config_diff` against the previous snapshot — inside the
+    ``[low, high]`` window when bounds are given, with the baseline taken from
+    the last config at/ before ``low``. Snapshots without a usable ``t`` are
+    skipped. ``records`` must be a sequence (it is scanned twice when ``low``
+    is set).
+    """
+    prev = config_at(records, low) if low is not None else None
+    out = []
+    for rec in records:
+        if rec.get("type") != "config":
+            continue
+        t = _record_ts(rec)
+        if t is None:
+            continue
+        if low is not None and t < low:
+            continue
+        if high is not None and t > high:
+            continue
+        snap = config_snapshot(rec)
+        snap["diff"] = config_diff(prev, rec)
+        out.append(snap)
+        prev = rec
+    return out
+
+
+def host_series(records):
+    """Return parallel time series over ``host`` records in file order.
+
+    Keys: ``t`` plus :data:`HOST_FIELDS` plus ``present_mask``/``caveat_mask``.
+    A missing or ``null`` value becomes ``None`` — unavailable (or the first
+    sample, whose Δ has no baseline) must never read as a healthy zero.
+    """
+    keys = ("t",) + HOST_FIELDS + ("present_mask", "caveat_mask")
+    series = {name: [] for name in keys}
+    for rec in records:
+        if rec.get("type") != "host":
+            continue
+        for name in keys:
+            series[name].append(_num(rec.get(name)))
+    return series
+
+
+def _host_digest_block(records):
+    """Return the digest ``host`` block: record count and latest snapshot.
+
+    ``null`` values pass through as ``None``; ``caveats`` lists the source
+    names whose bits are set in the latest ``caveat_mask`` (value present but
+    not attributable — design §23).
+    """
+    hosts = [r for r in records if r.get("type") == "host"]
+    latest = None
+    if hosts:
+        rec = hosts[-1]
+        latest = {"t": _num(rec.get("t"))}
+        for key in HOST_FIELDS:
+            latest[key] = _num(rec.get(key))
+        present = _num(rec.get("present_mask"))
+        caveat = _num(rec.get("caveat_mask"))
+        latest["present_mask"] = present
+        latest["caveat_mask"] = caveat
+        latest["caveats"] = [
+            name for name, bit in sorted(HOST_CAVEAT_BITS.items())
+            if caveat is not None and (int(caveat) & bit)
+        ]
+    return {"records": len(hosts), "latest": latest}
+
+
+# ---------------------------------------------------------------------------
+# Incident bundle (JSON envelope) + reader
+# ---------------------------------------------------------------------------
+
+def _bundle_size(bundle):
+    """Serialized size in bytes, matching the web UI's JSON encoding."""
+    return len(json.dumps(bundle, ensure_ascii=False).encode("utf-8"))
+
+
+def _bundle_config(records, low, high):
+    """Config snapshots in the window; falls back to the active snapshot."""
+    snapshots = config_series(records, low, high)
+    if not snapshots and high is not None:
+        anchor = config_at(records, high)
+        if anchor is not None:
+            snap = config_snapshot(anchor)
+            snap["diff"] = config_diff(None, anchor)
+            snapshots = [snap]
+    return snapshots
+
+
+def _bundle_host(window_records):
+    """Host block: the Δ series of the ``host`` records inside the window."""
+    hosts = [r for r in window_records if r.get("type") == "host"]
+    return {"records": len(hosts), "series": host_series(hosts)}
+
+
+def incident_bundle(records, drop=None, mins=2.0, include_records=None,
+                    max_bytes=BUNDLE_MAX_BYTES):
+    """Build the incident JSON envelope for an analyzer record sequence.
+
+    Envelope: ``{bundle_version, drop, window:{start,end}, config, host,
+    records, warnings}``. ``drop`` anchors the window: a drop record (dict,
+    embedded as-is), a timestamp, or ``None`` (whole log span). ``mins`` is the
+    half-window in minutes.
+
+    Dedup (AU-2/F1): the drop already embeds its own ``window`` sample slice, so
+    raw window records are included only when there is no drop — or when
+    ``include_records=True`` forces both (the embedded drop is then excluded
+    from ``records``). ``max_bytes`` caps the serialized envelope; oversize
+    bundles drop raw records, then trim ``drop.window`` from the oldest end,
+    recording every step in ``warnings``.
+    """
+    records = list(records)
+
+    if isinstance(drop, dict):
+        center = _record_ts(drop)
+        if center is None:
+            raise ValueError("drop record has no usable t")
+        drop_out = drop
+    elif drop is None:
+        center = None
+        drop_out = None
+    else:
+        center = _num(drop)
+        if center is None:
+            raise ValueError("drop must be a record dict, a timestamp or None")
+        drop_out = None
+
+    half = _num(mins)
+    if half is None or half < 0:
+        raise ValueError("mins must be a non-negative number")
+    half_seconds = float(half) * 60.0
+
+    if center is not None:
+        low, high = center - half_seconds, center + half_seconds
+    else:
+        stamps = [t for t in (_record_ts(r) for r in records)
+                  if t is not None]
+        low, high = (min(stamps), max(stamps)) if stamps else (None, None)
+
+    window = []
+    if low is not None:
+        for index, rec in enumerate(records):
+            t = _record_ts(rec)
+            if t is not None and low <= t <= high:
+                window.append((t, index, rec))
+    window.sort(key=lambda item: (item[0], item[1]))
+    ordered = [rec for _, _, rec in window]
+
+    warnings = []
+    include = (drop_out is None) if include_records is None else bool(include_records)
+    if include:
+        kept = [r for r in ordered if r is not drop_out]
+        if drop_out is not None:
+            warnings.append(
+                "drop and raw records both included: the drop's embedded "
+                "window may duplicate client samples (dedup policy AU-2/F1)")
+    else:
+        kept = []
+        if ordered:
+            warnings.append(
+                "raw window records omitted (dedup policy AU-2/F1: the drop "
+                "already carries its own window); pass include_records=True "
+                "to force")
+
+    bundle = {
+        "bundle_version": BUNDLE_VERSION,
+        "drop": drop_out,
+        "window": {"start": low, "end": high},
+        "config": _bundle_config(records, low, high),
+        "host": _bundle_host(ordered),
+        "records": kept,
+        "warnings": warnings,
+    }
+
+    cap = _num(max_bytes)
+    if cap is None or cap < 0:
+        cap = BUNDLE_MAX_BYTES
+    cap = int(cap)
+    if _bundle_size(bundle) > cap:
+        if bundle["records"]:
+            bundle["records"] = []
+            warnings.append(
+                "size cap %d bytes: raw window records dropped" % cap)
+        if _bundle_size(bundle) > cap and isinstance(drop_out, dict):
+            embedded = drop_out.get("window")
+            if isinstance(embedded, list) and embedded:
+                trimmed = list(embedded)
+                drop_out = dict(drop_out)
+                drop_out["window"] = trimmed
+                bundle["drop"] = drop_out
+                warn_at = len(warnings)
+                warnings.append("")
+                while True:
+                    warnings[warn_at] = (
+                        "size cap %d bytes: drop.window trimmed to %d samples"
+                        % (cap, len(trimmed)))
+                    if not trimmed or _bundle_size(bundle) <= cap:
+                        break
+                    trimmed.pop(0)
+        if _bundle_size(bundle) > cap:
+            warnings.append(
+                "bundle still exceeds the %d-byte cap (cannot shrink further)"
+                % cap)
+    return bundle
+
+
+def read_bundle(source):
+    """Return the records embedded in an incident bundle (re-ingestible).
+
+    ``source`` may be a path, a file object, or an already-decoded envelope.
+    Returns ``[drop] + records`` sorted by ``t`` (stable: file order for ties,
+    timestamp-less records last) — every entry carries a known ``type``, so the
+    result can be written back as JSONL and parsed by :func:`iter_records` or
+    fed to any record-based analyzer function. Raises ``ValueError`` when
+    ``source`` is not an incident bundle envelope.
+    """
+    if isinstance(source, dict):
+        bundle = source
+    elif hasattr(source, "read"):
+        bundle = _parse_bundle_json(source.read())
+    elif isinstance(source, (str, bytes)) or hasattr(source, "__fspath__"):
+        with open(source, "r", encoding="utf-8", errors="replace") as fh:
+            bundle = _parse_bundle_json(fh.read())
+    else:
+        raise ValueError(
+            "source must be a path, a file object or a bundle dict")
+    if not isinstance(bundle, dict) or bundle.get("bundle_version") is None:
+        raise ValueError("not an incident bundle: missing bundle_version")
+    out = []
+    if isinstance(bundle.get("drop"), dict):
+        out.append(bundle["drop"])
+    recs = bundle.get("records")
+    if isinstance(recs, list):
+        out.extend(r for r in recs
+                   if isinstance(r, dict) and r.get("type") in _KNOWN_TYPES)
+    out.sort(key=lambda r: (_record_ts(r) if _record_ts(r) is not None
+                            else float("inf")))
+    return out
+
+
+def _parse_bundle_json(text):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid bundle JSON") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1596,8 @@ def build_digest(records, files=None):
         "hitch_lines": counts.get("hitch", 0),
         "lag_spikes": lag_spike_count(records),
         "modnet": _modnet_digest_block(records),
+        "config": _config_digest_block(records),
+        "host": _host_digest_block(records),
         "log_end": log_end_state(records),
         "exclusions": exclusion_windows(records),
         "anomalies_excluded": len(
@@ -1212,6 +1683,10 @@ def cmd_summary(args):
     modules = ", ".join(sorted(modnet_summary(records)))
     print("Modnet: %d records, modules: %s"
           % (counts.get("modnet", 0), modules if modules else "(none)"))
+
+    print("Config: %d records" % counts.get("config", 0))
+
+    print("Host: %d records" % counts.get("host", 0))
 
     detail = find_anomalies_detail(records, exclude=(not args.no_exclude))
     print("Anomalies: %d" % len(detail["findings"]))

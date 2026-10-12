@@ -273,6 +273,7 @@ void LogWriter::prune()
         return; // fail-safe: selection overflow => exactly zero unlink
     }
 
+    uint32_t removed = 0;
     for (size_t i = 0; i < doomed_n; ++i) {
         char full[HLDSMON_LOGWRITER_PATH_MAX];
         const int fn = std::snprintf(full, sizeof(full), "%s/%s", dir_, s_doomed[i]);
@@ -285,8 +286,12 @@ void LogWriter::prune()
         }
         if (::unlink(full) != 0) {
             ++error_count_; // counted, loop continues with other candidates
+            continue;
         }
+        ++removed;
     }
+    const uint32_t room = 0xFFFFFFFFu - last_prune_count_;
+    last_prune_count_ = (removed > room) ? 0xFFFFFFFFu : last_prune_count_ + removed;
 }
 
 } // namespace hldsmon

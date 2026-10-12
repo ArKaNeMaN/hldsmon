@@ -62,6 +62,12 @@ public:
     uint64_t bytes_today() const { return bytes_today_; }
     uint64_t error_count() const { return error_count_; }
 
+    // Cumulative files removed by prune() since construction (design §26.3
+    // п.4, EN-P1). The 1 Hz sampler pulls deltas for the `retention` event;
+    // clear_last_prune_count() resets the counter (tests / explicit re-baseline).
+    uint32_t last_prune_count() const { return last_prune_count_; }
+    void clear_last_prune_count() { last_prune_count_ = 0; }
+
     // Per-day size limit. When bytes_today() >= mb*1024*1024, disable
     // writing (size_capped()==true) while keeping the object usable.
     // mb==0 disables the cap.
@@ -87,6 +93,7 @@ private:
     int      day_   = 0;
     uint64_t bytes_today_ = 0;
     uint64_t error_count_ = 0;
+    uint32_t last_prune_count_ = 0;
     uint64_t max_bytes_   = 0;
     int      retention_days_ = 0;
 };

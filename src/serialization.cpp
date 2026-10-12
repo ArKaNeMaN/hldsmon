@@ -9,6 +9,7 @@
 // floats by integer/fraction decomposition (see append_fixed).
 
 #include "serialization.h"
+#include "host_metrics.h"
 
 #include <cmath>
 #include <cstdint>
@@ -171,6 +172,48 @@ void kv_bool(JsonBuf& b, const char* k, bool v) {
     kv_key(b, k);
     b.lit(v ? "true" : "false");
 }
+// Explicit JSON `null` value. No other path emits `null`: append_fixed maps
+// non-finite doubles to 0, which must NOT be used for an absent cvar (CFG-2).
+void kv_null(JsonBuf& b, const char* k) {
+    kv_key(b, k);
+    b.lit("null");
+}
+// Key + fixed-precision value, or `null` when the field is absent (tracked
+// cvar not registered; design §22.3 п.2, CFG-2).
+void kv_fixed_or_null(JsonBuf& b, const char* k, bool present, float v) {
+    if (present) {
+        kv_fixed(b, k, static_cast<double>(v), 3);
+    } else {
+        kv_null(b, k);
+    }
+}
+// Key + unsigned value, or `null` when the field is absent (host-metrics
+// unavailable or not yet baselined; design §23.3 п.5, HM-2).
+void kv_u64_or_null(JsonBuf& b, const char* k, bool present, uint64_t v) {
+    if (present) {
+        kv_u64(b, k, v);
+    } else {
+        kv_null(b, k);
+    }
+}
+// Key + uint32 value, or `null` when the measurement is absent (connect
+// timings: missing marker / guard-rejected delta; design §25.3, CT-4).
+void kv_u32_or_null(JsonBuf& b, const char* k, bool present, uint32_t v) {
+    if (present) {
+        kv_u64(b, k, v);
+    } else {
+        kv_null(b, k);
+    }
+}
+// Key + signed value, or `null` when the field is absent (edict churn: first
+// interval / post-mapchange; design §26.3 п.5, EN-5).
+void kv_i64_or_null(JsonBuf& b, const char* k, bool present, int64_t v) {
+    if (present) {
+        kv_i64(b, k, v);
+    } else {
+        kv_null(b, k);
+    }
+}
 
 // ---- per-record emitters -------------------------------------------------
 
@@ -257,6 +300,12 @@ void emit_client(JsonBuf& b, const ClientSample& r) {
     kv_u64(b, "msg_flags", r.msg_flags);
     b.ch(',');
     kv_u64(b, "idle_ms", r.idle_ms);
+    b.ch(',');
+    kv_u64(b, "jit_min_ms", r.jit_min_ms);
+    b.ch(',');
+    kv_u64(b, "jit_avg_ms", r.jit_avg_ms);
+    b.ch(',');
+    kv_u64(b, "jit_max_ms", r.jit_max_ms);
     emit_identity(b, r);
     b.ch('}');
 }
@@ -379,6 +428,8 @@ void emit_server(JsonBuf& b, const ServerSample& r) {
     b.ch(',');
     kv_u64(b, "edicts", r.edicts);
     b.ch(',');
+    kv_i64_or_null(b, "edicts_churn", r.edicts_churn_present != 0, r.edicts_churn);
+    b.ch(',');
     kv_str(b, "map", r.map);
     b.ch(',');
     kv_u64(b, "uptime_s", r.uptime_s);
@@ -386,6 +437,83 @@ void emit_server(JsonBuf& b, const ServerSample& r) {
     kv_fixed(b, "fps", r.fps, 3);
     b.ch(',');
     kv_u64(b, "maxclients", r.maxclients);
+    b.ch('}');
+}
+
+// Numeric tracked-config subset shared by the `config` record and the nested
+// `drop.config` object (CFG-8). Emits bare key/value pairs (no braces) in P1
+// order; absent cvar => literal null (CFG-2).
+void emit_config_numbers(JsonBuf& b, const ConfigSnapshot& c) {
+    kv_fixed_or_null(b, "sys_ticrate", (c.present & kCfgSysTicrate) != 0, c.sys_ticrate);
+    b.ch(',');
+    kv_fixed_or_null(b, "host_framerate", (c.present & kCfgHostFramerate) != 0, c.host_framerate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_timeout", (c.present & kCfgSvTimeout) != 0, c.sv_timeout);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_maxrate", (c.present & kCfgSvMaxrate) != 0, c.sv_maxrate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_minrate", (c.present & kCfgSvMinrate) != 0, c.sv_minrate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_maxupdaterate", (c.present & kCfgSvMaxupdaterate) != 0, c.sv_maxupdaterate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_minupdaterate", (c.present & kCfgSvMinupdaterate) != 0, c.sv_minupdaterate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_maxcmdrate", (c.present & kCfgSvMaxcmdrate) != 0, c.sv_maxcmdrate);
+    b.ch(',');
+    kv_fixed_or_null(b, "sv_mincmdrate", (c.present & kCfgSvMincmdrate) != 0, c.sv_mincmdrate);
+}
+
+void emit_config(JsonBuf& b, const ConfigRecord& r) {
+    b.ch('{');
+    kv_str(b, "type", "config");
+    b.ch(',');
+    kv_fixed(b, "t", r.t, 3);
+    b.ch(',');
+    kv_i64(b, "rehlds_major", r.rehlds_major);
+    b.ch(',');
+    kv_i64(b, "rehlds_minor", r.rehlds_minor);
+    b.ch(',');
+    kv_str(b, "map", r.map);
+    b.ch(',');
+    kv_u64(b, "maxclients", r.maxclients);
+    b.ch(',');
+    emit_config_numbers(b, r.config);
+    b.ch('}');
+}
+
+// `host` record (P1 extension, Stage 6). Every metric is present iff its
+// kHost* bit is set; otherwise the literal null (unavailable / first sample).
+// caveat_mask flags per-source uncertainty while the value stays present (M4).
+void emit_host(JsonBuf& b, const HostRecord& r) {
+    const uint16_t p = r.present_mask;
+    b.ch('{');
+    kv_str(b, "type", "host");
+    b.ch(',');
+    kv_fixed(b, "t", r.t, 3);
+    b.ch(',');
+    kv_u64_or_null(b, "udp_rcvbuf_errors", (p & kHostUdpRcvbufErrors) != 0, r.udp_rcvbuf_errors);
+    b.ch(',');
+    kv_u64_or_null(b, "udp_in_errors", (p & kHostUdpInErrors) != 0, r.udp_in_errors);
+    b.ch(',');
+    kv_u64_or_null(b, "udp_in_csum_errors", (p & kHostUdpInCsumErrors) != 0, r.udp_in_csum_errors);
+    b.ch(',');
+    kv_u64_or_null(b, "net_rx_dropped", (p & kHostNetRxDropped) != 0, r.net_rx_dropped);
+    b.ch(',');
+    kv_u64_or_null(b, "net_rx_missed", (p & kHostNetRxMissed) != 0, r.net_rx_missed);
+    b.ch(',');
+    kv_u64_or_null(b, "net_rx_overruns", (p & kHostNetRxOverruns) != 0, r.net_rx_overruns);
+    b.ch(',');
+    kv_fixed_or_null(b, "steal_pct", (p & kHostStealPct) != 0, r.steal_pct);
+    b.ch(',');
+    kv_u64_or_null(b, "io_read_bytes", (p & kHostIoReadBytes) != 0, r.io_read_bytes);
+    b.ch(',');
+    kv_u64_or_null(b, "io_write_bytes", (p & kHostIoWriteBytes) != 0, r.io_write_bytes);
+    b.ch(',');
+    kv_u64_or_null(b, "disk_bavail_mb", (p & kHostDiskBavailMb) != 0, r.disk_bavail_mb);
+    b.ch(',');
+    kv_u64(b, "present_mask", r.present_mask);
+    b.ch(',');
+    kv_u64(b, "caveat_mask", r.caveat_mask);
     b.ch('}');
 }
 
@@ -406,6 +534,8 @@ void emit_drop(JsonBuf& b, const DropRecord& r) {
     kv_bool(b, "crash", r.crash != 0);
     b.ch(',');
     kv_str(b, "observed_via", r.observed_via);
+    b.ch(',');
+    kv_str(b, "detector", r.detector);
     emit_identity(b, r);
     b.ch(',');
     kv_key(b, "client");
@@ -413,6 +543,11 @@ void emit_drop(JsonBuf& b, const DropRecord& r) {
     b.ch(',');
     kv_key(b, "netchan");
     emit_netchan(b, r.netchan);
+    b.ch(',');
+    kv_key(b, "config");
+    b.ch('{');
+    emit_config_numbers(b, r.config);
+    b.ch('}');
     b.ch(',');
     kv_key(b, "window");
     b.ch('[');
@@ -447,6 +582,10 @@ void emit_reject(JsonBuf& b, const RejectRecord& r) {
     kv_str(b, "stage", r.stage);
     b.ch(',');
     kv_str(b, "detail", r.detail);
+    b.ch(',');
+    kv_u32_or_null(b, "stage_ms", (r.timing_present & kTimingStageMs) != 0, r.stage_ms);
+    b.ch(',');
+    kv_u32_or_null(b, "total_ms", (r.timing_present & kTimingTotalMs) != 0, r.total_ms);
     b.ch('}');
 }
 
@@ -463,6 +602,10 @@ void emit_connect(JsonBuf& b, const ConnectRecord& r) {
     kv_str(b, "steamid", r.steamid);
     b.ch(',');
     kv_str(b, "name", r.name);
+    b.ch(',');
+    kv_u32_or_null(b, "auth_ms", (r.timing_present & kTimingAuthMs) != 0, r.auth_ms);
+    b.ch(',');
+    kv_u32_or_null(b, "steam_ms", (r.timing_present & kTimingSteamMs) != 0, r.steam_ms);
     b.ch('}');
 }
 
@@ -520,6 +663,18 @@ void emit_packet(JsonBuf& b, const PacketStats& r) {
     kv_u64(b, "unique_ips", r.unique_ips);
     b.ch(',');
     kv_str(b, "top_ip", r.top_ip);
+    b.ch(',');
+    kv_key(b, "top_ips");
+    b.ch('[');
+    for (size_t i = 0; i < HLDSMON_TOP_IPS; ++i) {
+        if (i != 0) b.ch(',');
+        b.ch('{');
+        kv_str(b, "ip", r.top_ips[i].ip);
+        b.ch(',');
+        kv_u64(b, "count", r.top_ips[i].count);
+        b.ch('}');
+    }
+    b.ch(']');
     b.ch('}');
 }
 
@@ -540,6 +695,8 @@ void emit_mapchange(JsonBuf& b, const MapChangeRecord& r) {
     kv_fixed(b, "t", r.t, 3);
     b.ch(',');
     kv_str(b, "map", r.map);
+    b.ch(',');
+    kv_u32_or_null(b, "load_ms", r.load_present != 0, r.load_ms);
     b.ch('}');
 }
 
@@ -572,6 +729,26 @@ void emit_crash(JsonBuf& b, const CrashRecord& r) {
     kv_fixed(b, "t", r.t, 3);
     b.ch(',');
     kv_i64(b, "signal", r.signal);
+    b.ch('}');
+}
+
+void emit_degraded(JsonBuf& b, const DegradedRecord& r) {
+    b.ch('{');
+    kv_str(b, "type", "degraded");
+    b.ch(',');
+    kv_fixed(b, "t", r.t, 3);
+    b.ch(',');
+    kv_u64(b, "error_count", r.error_count);
+    b.ch('}');
+}
+
+void emit_retention(JsonBuf& b, const RetentionRecord& r) {
+    b.ch('{');
+    kv_str(b, "type", "retention");
+    b.ch(',');
+    kv_fixed(b, "t", r.t, 3);
+    b.ch(',');
+    kv_u64(b, "removed", r.removed);
     b.ch('}');
 }
 
@@ -705,8 +882,20 @@ size_t write_shutdown_json(char* out, size_t cap, const ShutdownRecord& r) {
 size_t write_crash_json(char* out, size_t cap, const CrashRecord& r) {
     return write_record(out, cap, r, &emit_crash);
 }
+size_t write_degraded_json(char* out, size_t cap, const DegradedRecord& r) {
+    return write_record(out, cap, r, &emit_degraded);
+}
+size_t write_retention_json(char* out, size_t cap, const RetentionRecord& r) {
+    return write_record(out, cap, r, &emit_retention);
+}
 size_t write_modnet_json(char* out, size_t cap, const ModnetRecord& r) {
     return write_record(out, cap, r, &emit_modnet);
+}
+size_t write_config_json(char* out, size_t cap, const ConfigRecord& r) {
+    return write_record(out, cap, r, &emit_config);
+}
+size_t write_host_json(char* out, size_t cap, const HostRecord& r) {
+    return write_record(out, cap, r, &emit_host);
 }
 
 } // namespace hldsmon

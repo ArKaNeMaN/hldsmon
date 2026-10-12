@@ -58,6 +58,7 @@ char s_val_retention_days[] = "3";
 char s_val_modnet[]           = "0";
 char s_val_modnet_targets[]   = "";
 char s_val_modnet_rescan_sec[] = "5";
+char s_val_host[]             = "0";
 
 cvar_t s_cvar_enable;
 cvar_t s_cvar_client_hz;
@@ -73,6 +74,7 @@ cvar_t s_cvar_retention_days;
 cvar_t s_cvar_modnet;
 cvar_t s_cvar_modnet_targets;
 cvar_t s_cvar_modnet_rescan_sec;
+cvar_t s_cvar_host;
 
 void util_log(const char* msg) noexcept {
     if (gpMetaUtilFuncs != nullptr && gpMetaUtilFuncs->pfnLogConsole != nullptr) {
@@ -100,6 +102,15 @@ cvar_t* engine_cvar(const char* name, cvar_t* fallback) noexcept {
     return fallback;
 }
 
+// Engine cvar pointer for the tracked config set; nullptr when the cvar is not
+// registered (design §22.2: absent cvar is not an error, emitted as JSON null).
+cvar_t* tracked_cvar(const char* name) noexcept {
+    if (g_engfuncs.pfnCVarGetPointer != nullptr) {
+        return g_engfuncs.pfnCVarGetPointer(name);
+    }
+    return nullptr;
+}
+
 void register_cvars() noexcept {
     PluginContext& c = ctx();
     reg_cvar(s_cvar_enable,      "hldsmon_enable",      s_val_enable,      FCVAR_ARCHIVE);
@@ -116,6 +127,7 @@ void register_cvars() noexcept {
     reg_cvar(s_cvar_modnet,           "hldsmon_modnet",           s_val_modnet,           FCVAR_ARCHIVE);
     reg_cvar(s_cvar_modnet_targets,   "hldsmon_modnet_targets",   s_val_modnet_targets,   FCVAR_ARCHIVE);
     reg_cvar(s_cvar_modnet_rescan_sec, "hldsmon_modnet_rescan_sec", s_val_modnet_rescan_sec, FCVAR_ARCHIVE);
+    reg_cvar(s_cvar_host,             "hldsmon_host",             s_val_host,             FCVAR_ARCHIVE);
 
     c.cvars.enable      = engine_cvar("hldsmon_enable",      &s_cvar_enable);
     c.cvars.client_hz   = engine_cvar("hldsmon_client_hz",   &s_cvar_client_hz);
@@ -131,6 +143,17 @@ void register_cvars() noexcept {
     c.cvars.modnet           = engine_cvar("hldsmon_modnet",           &s_cvar_modnet);
     c.cvars.modnet_targets   = engine_cvar("hldsmon_modnet_targets",   &s_cvar_modnet_targets);
     c.cvars.modnet_rescan_sec = engine_cvar("hldsmon_modnet_rescan_sec", &s_cvar_modnet_rescan_sec);
+    c.cvars.host              = engine_cvar("hldsmon_host",             &s_cvar_host);
+
+    c.cvars.sys_ticrate      = tracked_cvar("sys_ticrate");
+    c.cvars.host_framerate   = tracked_cvar("host_framerate");
+    c.cvars.sv_timeout       = tracked_cvar("sv_timeout");
+    c.cvars.sv_maxrate       = tracked_cvar("sv_maxrate");
+    c.cvars.sv_minrate       = tracked_cvar("sv_minrate");
+    c.cvars.sv_maxupdaterate = tracked_cvar("sv_maxupdaterate");
+    c.cvars.sv_minupdaterate = tracked_cvar("sv_minupdaterate");
+    c.cvars.sv_maxcmdrate    = tracked_cvar("sv_maxcmdrate");
+    c.cvars.sv_mincmdrate    = tracked_cvar("sv_mincmdrate");
 }
 
 size_t clamp_size(double v, size_t lo, size_t hi) noexcept {
@@ -196,6 +219,13 @@ void release_state() noexcept {
     c.log = nullptr;
     c.layout_ok = false;
     c.layout_checked = 0;
+    c.last_config_valid = false;   // re-baseline the config record on re-attach
+    c.host_has_prev = false;       // re-baseline host Δ on re-attach
+    c.prev_error_count = 0;        // re-baseline log-health pulls on re-attach
+    c.prev_prune_count = 0;
+    c.prev_log_enabled = false;
+    c.edicts_has_prev = false;     // re-baseline edict churn on re-attach
+    c.prev_edicts = 0;
 }
 
 bool resolve_api() noexcept {
@@ -322,6 +352,9 @@ bool plugin_init() noexcept {
         return false;
     }
     register_cvars();
+    // One-shot host environment detection (design §23.3 п.2): the caveat mask
+    // is reused for every `host` record; uncertain environments stay caveated.
+    c.host_caveat_mask = detect_env(probe_env()).caveat;
     if (!allocate_state()) {
         util_log("state allocation failed");
         release_state();

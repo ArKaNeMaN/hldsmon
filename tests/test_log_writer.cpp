@@ -243,6 +243,9 @@ void test_prune_basic()
     check(std::strcmp(w.current_path(), p4) == 0, "current file is day4");
     check(file_exists(marker), "crash marker never pruned");
     check(w.error_count() == 0, "no errors on clean prune");
+    check(w.last_prune_count() == 1, "prune count tracks removed files");
+    w.clear_last_prune_count();
+    check(w.last_prune_count() == 0, "prune count clear");
 }
 
 void test_prune_rotation()
@@ -270,6 +273,7 @@ void test_prune_rotation()
     check(file_exists(p2), "day2 kept after rotation");
     check(std::strcmp(w.current_path(), p2) == 0, "current file is day2");
     check(w.error_count() == 0, "no errors across rotation prune");
+    check(w.last_prune_count() == 1, "rotation prune counted");
 }
 
 void test_prune_symlink()

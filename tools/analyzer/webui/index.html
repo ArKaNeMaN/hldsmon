@@ -360,8 +360,29 @@
   .chart-tip .tt-row .tt-name { color: var(--text-mut); }
   .chart-tip .tt-row .tt-val { margin-left: auto; font-weight: 600; padding-left: 10px; white-space: nowrap; }
   .chart-svg .bars rect { fill-opacity: .85; }
+  /* host overlay: a caveated point is present but not attributable — ring, not fill */
+  .chart-svg .caveat-marker { fill: none; stroke: #fbbf24; stroke-width: 1.3; }
+  .chart-tip .tt-row .tt-note { color: #fbbf24; font-size: 10.5px; white-space: nowrap; }
   .ds-legend { display: flex; flex-wrap: wrap; gap: 6px var(--sp-3); align-items: center; }
   .ds-legend .hint { font-size: 11.5px; color: var(--text-dim); }
+  .ds-legend .leg-sep { color: var(--text-dim); font-size: 11.5px; margin-left: 6px; }
+  .bundle-mins { width: 52px; background: var(--bg-2); color: var(--text);
+    border: 1px solid var(--border-2); border-radius: var(--r-sm); padding: 3px 5px;
+    font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  /* config-diff panel: one row per snapshot, diff chips for tracked changes */
+  .config-list { display: flex; flex-direction: column; gap: 6px; }
+  .config-row { border: 1px solid var(--border); border-radius: var(--r-sm); padding: 7px 9px; background: var(--bg-2); }
+  .config-head { display: flex; gap: var(--sp-3); align-items: baseline; flex-wrap: wrap; }
+  .config-time { font-family: var(--mono); font-size: 12px; color: var(--text-mut); }
+  .config-summary { font-size: 12px; color: var(--text-dim); }
+  .config-baseline { font-size: 11.5px; color: var(--text-dim); margin-top: 4px; }
+  .config-diff { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; }
+  .diff-chip { font-size: 11.5px; font-family: var(--mono); padding: 1px 6px;
+    border: 1px solid var(--border); border-radius: 999px; }
+  .diff-chip.changed { color: #fbbf24; }
+  .diff-chip.added { color: #34d399; }
+  .diff-chip.removed { color: #f87171; }
 
   /* compact «Справка» under the combined chart: metric -> one-line note */
   .metric-help { margin-top: var(--sp-4); border-top: 1px solid var(--border); padding-top: var(--sp-3); }
@@ -927,6 +948,14 @@ function computeView(result) {
     clientSeries[id] = o;
   }
 
+  const rawHost = result.host_series || {};
+  const hIdx = seriesIndices(rawHost.t, lo, hi);
+  const hostSeries = {};
+  for (const k in rawHost) hostSeries[k] = sliceByIdx(rawHost[k], hIdx);
+
+  const config = (Array.isArray(result.config) ? result.config : [])
+    .filter(c => !active || inRangeF(c.t, lo, hi));
+
   const drops = (Array.isArray(result.drops) ? result.drops : [])
     .filter(d => !active || inRangeF(d.t, lo, hi));
 
@@ -1041,7 +1070,8 @@ function computeView(result) {
   });
 
   return {
-    result, series, clientSeries, drops, events, clients, identities, players,
+    result, series, clientSeries, hostSeries, config,
+    drops, events, clients, identities, players,
     active, lo, hi, tRange, fullRange,
     serverSamples: sIdx.length, clientSamples,
   };
@@ -1188,6 +1218,47 @@ async function downloadCsv(type) {
     toast("Экспорт CSV (" + label + ") запущен", "ok");
   } catch (err) {
     toast("Ошибка экспорта: " + (err && err.message ? err.message : String(err)), "error");
+  }
+}
+
+/* Download the incident JSON envelope for one drop (server-side /api/bundle). */
+async function downloadBundle(drop, mins) {
+  if (state.demo || !state.body) {
+    toast("Bundle доступен только при работе с сервером.", "error");
+    return;
+  }
+  const all = (state.result && Array.isArray(state.result.drops)) ? state.result.drops : [];
+  const idx = drop ? all.indexOf(drop) : -1;
+  if (idx < 0) { toast("Drop не найден в полном списке.", "error"); return; }
+  const m = (typeof mins === "number" && isFinite(mins) && mins >= 0) ? mins : 2;
+  try {
+    const url = "/api/bundle?drop=" + idx + "&mins=" + encodeURIComponent(m);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: state.body,
+    });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) { /* not JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    state.urls.push(objUrl);
+    const stamp = (drop && isNum(drop.t))
+      ? new Date(drop.t * 1000).toISOString().replace(/[:.]/g, "-")
+      : String(idx);
+    const a = el("a");
+    a.href = objUrl;
+    a.download = "hldsmon_bundle_" + stamp + ".json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+    toast("Bundle drop #" + idx + " скачан", "ok");
+  } catch (err) {
+    toast("Ошибка bundle: " + (err && err.message ? err.message : String(err)), "error");
   }
 }
 
@@ -2728,7 +2799,30 @@ for (const d of ALL_DATASETS) {
   d.color = ALL_COLORS[d.key];
   if (!d.values) d.values = s => s[d.key];
 }
-const ALL_DATASET_KEYS = ALL_DATASETS.map(d => d.key);
+
+/* host datasets: own samples, resampled onto the server axis for the combined
+   chart; a null sample is a gap (never 0) and a set caveat bit draws a ring. */
+const HOST_COLORS = {
+  udp_rcvbuf_errors: "#f87171", udp_in_errors: "#fb923c",
+  udp_in_csum_errors: "#fbbf24", net_rx_dropped: "#f472b6",
+  net_rx_missed: "#c084fc", net_rx_overruns: "#a78bfa",
+  steal_pct: "#4ea1ff", io_read_bytes: "#22d3ee",
+  io_write_bytes: "#2dd4bf", disk_bavail_mb: "#34d399",
+};
+const HOST_DATASETS = [
+  { key: "udp_rcvbuf_errors", label: "udp rcvbuf err", unit: "", dec: 0 },
+  { key: "udp_in_errors", label: "udp in err", unit: "", dec: 0 },
+  { key: "udp_in_csum_errors", label: "udp csum err", unit: "", dec: 0 },
+  { key: "net_rx_dropped", label: "net rx dropped", unit: "", dec: 0 },
+  { key: "net_rx_missed", label: "net rx missed", unit: "", dec: 0 },
+  { key: "net_rx_overruns", label: "net rx overruns", unit: "", dec: 0 },
+  { key: "steal_pct", label: "CPU steal", unit: "%", dec: 2 },
+  { key: "io_read_bytes", label: "io read", unit: "Б", dec: 0 },
+  { key: "io_write_bytes", label: "io write", unit: "Б", dec: 0 },
+  { key: "disk_bavail_mb", label: "диск свободно", unit: "МБ", dec: 0 },
+];
+for (const d of HOST_DATASETS) d.color = HOST_COLORS[d.key];
+const ALL_DATASET_KEYS = ALL_DATASETS.concat(HOST_DATASETS).map(d => d.key);
 
 /* player (client) metric catalogue for the combined-chart overlay */
 const PLAYER_METRICS = [
@@ -2766,6 +2860,16 @@ const METRIC_NOTES = {
   dloss: "Прирост loss с прошлого сэмпла",
   flow_in_kbps: "Трафик клиента входящий (KB/s)",
   flow_out_kbps: "Трафик клиента исходящий (KB/s)",
+  udp_rcvbuf_errors: "Δ переполнений UDP-приёмного буфера ядра (host); кольцо = caveated",
+  udp_in_errors: "Δ ошибок приёма UDP ядра (host); кольцо = caveated",
+  udp_in_csum_errors: "Δ ошибок UDP-контрольных сумм (host); кольцо = caveated",
+  net_rx_dropped: "Δ дропов NIC на приёме (host); кольцо = caveated",
+  net_rx_missed: "Δ пропусков NIC на приёме (host); кольцо = caveated",
+  net_rx_overruns: "Δ overrun NIC на приёме (host); кольцо = caveated",
+  steal_pct: "CPU steal, % (host); кольцо = caveated",
+  io_read_bytes: "Δ прочитанных байт I/O (host); кольцо = caveated",
+  io_write_bytes: "Δ записанных байт I/O (host); кольцо = caveated",
+  disk_bavail_mb: "Свободно на диске логов, МБ (host); кольцо = caveated",
 };
 function playerMetricDef(key) {
   for (const m of PLAYER_METRICS) if (m.key === key) return m;
@@ -2922,6 +3026,36 @@ function alignToServerTime(clientT, values, t) {
   return out;
 }
 
+/* step-resample a host series onto the server time axis (last sample <= t).
+   A null sample stays null (gap: a missing value is never a zero), past the
+   last host sample the line stops, and markers[i] flags the samples whose
+   caveat bit is set (value present but not attributable). */
+function alignHostToServerTime(hostSeries, key, t, caveatBit) {
+  const n = Array.isArray(t) ? t.length : 0;
+  const values = new Array(n).fill(null);
+  const markers = new Array(n).fill(false);
+  const ht = (hostSeries && Array.isArray(hostSeries.t)) ? hostSeries.t : [];
+  const vals = (hostSeries && Array.isArray(hostSeries[key])) ? hostSeries[key] : [];
+  const masks = (hostSeries && Array.isArray(hostSeries.caveat_mask)) ? hostSeries.caveat_mask : [];
+  const at = [];
+  for (let k = 0; k < ht.length; k++) if (isNum(ht[k])) at.push(k);
+  if (!at.length) return { values: values, markers: markers };
+  const lastT = ht[at[at.length - 1]];
+  let p = 0;
+  for (let i = 0; i < n; i++) {
+    const ts = t[i];
+    if (!isNum(ts) || ts > lastT) continue;
+    while (p < at.length && ht[at[p]] <= ts) p++;
+    if (p === 0) continue;
+    const k = at[p - 1];
+    const v = vals[k];
+    values[i] = (v === undefined) ? null : v;
+    const m = masks[k];
+    markers[i] = isNum(v) && isNum(caveatBit) && caveatBit > 0 && isNum(m) && ((m & caveatBit) !== 0);
+  }
+  return { values: values, markers: markers };
+}
+
 /* resolve the ONE global selection (state.selectedClient) to a player object.
    "player:<key>" -> that player; a session key -> the player owning that session. */
 function selectedPlayer(view) {
@@ -2947,12 +3081,29 @@ function buildAllChart(view) {
   const series = (view && view.series) || {};
   const t = Array.isArray(series.t) ? series.t : [];
   const chosen = ALL_DATASETS.filter(d => state.allSeries.indexOf(d.key) !== -1);
-  if (!chosen.length) return el("div", "empty", "выберите хотя бы один датасет");
+  const chosenHost = HOST_DATASETS.filter(d => state.allSeries.indexOf(d.key) !== -1);
+  if (!chosen.length && !chosenHost.length) return el("div", "empty", "выберите хотя бы один датасет");
   const lines = [];
   for (const d of chosen) {
     const values = d.values(series);
     if (!Array.isArray(values) || !values.some(isNum)) continue;
     lines.push({ name: d.label, color: d.color, values: values, fmt: v => fmtFloat(v, d.dec), unit: d.unit });
+  }
+  /* host rows: aligned to server time, null = gap, caveat bit = ring marker */
+  const hostSeries = (view && view.hostSeries) || null;
+  const hc = (view && view.result && view.result.host_caveats) || {};
+  if (chosenHost.length && hostSeries && Array.isArray(hostSeries.t) && hostSeries.t.length) {
+    for (const d of chosenHost) {
+      const info = hc[d.key] || null;
+      const aligned = alignHostToServerTime(hostSeries, d.key, t, info ? info.bit : 0);
+      if (!aligned.values.some(isNum)) continue;
+      lines.push({
+        name: d.label, color: d.color, values: aligned.values,
+        fmt: v => fmtFloat(v, d.dec), unit: d.unit,
+        markers: aligned.markers,
+        markerNote: "⚠ caveated" + (info && info.source ? " (" + info.source + ")" : ""),
+      });
+    }
   }
   /* overlay the globally-selected player's chosen client metrics, resampled to server time */
   const pl = selectedPlayer(view);
@@ -2984,6 +3135,55 @@ function fillAllChart(host, view) {
   host.textContent = "";
   host.appendChild(buildAllChart(view));
 }
+
+/* ----- config-diff panel: snapshots + diff vs the previous snapshot ----- */
+const CONFIG_LABELS = {
+  map: "карта", maxclients: "maxclients",
+  rehlds_major: "ReHLDS major", rehlds_minor: "ReHLDS minor",
+};
+function configFieldLabel(field) { return CONFIG_LABELS[field] || field; }
+function fmtConfigValue(v) {
+  if (v == null || v === "") return "—";
+  if (typeof v === "number") return fmtFloat(v, Number.isInteger(v) ? 0 : 2);
+  return String(v);
+}
+function configDiffChip(kind, entry) {
+  const name = configFieldLabel(entry.field);
+  if (kind === "added") return name + ": — → " + fmtConfigValue(entry.after) + " (установлено)";
+  if (kind === "removed") return name + ": " + fmtConfigValue(entry.before) + " → — (снято)";
+  return name + ": " + fmtConfigValue(entry.before) + " → " + fmtConfigValue(entry.after);
+}
+function buildConfigRow(c) {
+  const row = el("div", "config-row");
+  const head = el("div", "config-head");
+  head.appendChild(el("span", "config-time", fmtIso(c.t)));
+  const summary = ["map", "maxclients", "rehlds_major", "rehlds_minor"]
+    .filter(k => c[k] != null && c[k] !== "")
+    .map(k => configFieldLabel(k) + " " + fmtConfigValue(c[k]))
+    .join(" · ");
+  if (summary) head.appendChild(el("span", "config-summary", summary));
+  row.appendChild(head);
+  const diff = c.diff;
+  if (!diff || !diff.baseline) {
+    row.appendChild(el("div", "config-baseline", "baseline: нет предыдущего снимка"));
+    return row;
+  }
+  const chips = el("div", "config-diff");
+  for (const e of (diff.changed || [])) chips.appendChild(el("span", "diff-chip changed", configDiffChip("changed", e)));
+  for (const e of (diff.added || [])) chips.appendChild(el("span", "diff-chip added", configDiffChip("added", e)));
+  for (const e of (diff.removed || [])) chips.appendChild(el("span", "diff-chip removed", configDiffChip("removed", e)));
+  row.appendChild(chips.children.length ? chips : el("div", "config-baseline", "без изменений"));
+  return row;
+}
+function buildConfigPanel(view, result) {
+  const list = (view && Array.isArray(view.config)) ? view.config
+    : ((result && Array.isArray(result.config)) ? result.config : []);
+  const body = el("div", "config-list");
+  if (!list.length) body.appendChild(el("div", "empty", "нет config-записей за период"));
+  else for (const c of list) body.appendChild(buildConfigRow(c));
+  return panel("Конфигурация", list.length + " снимк(ов)", body);
+}
+
 function buildAllPanel(view) {
   const host = el("div");
   host.id = "allChart";
@@ -3007,9 +3207,9 @@ function buildAllPanel(view) {
 
   fillAllChart(host, view);
 
-  /* ---- server dataset toggles (title = metric note) ---- */
+  /* ---- dataset toggles (server + host; title = metric note) ---- */
   const legend = el("div", "ds-legend");
-  for (const d of ALL_DATASETS) {
+  function addDatasetToggle(d) {
     const lab = el("label", "evt-toggle");
     if (METRIC_NOTES[d.key]) lab.title = METRIC_NOTES[d.key];
     const cb = el("input");
@@ -3029,6 +3229,12 @@ function buildAllPanel(view) {
     lab.appendChild(sw);
     lab.appendChild(document.createTextNode(" " + d.label));
     legend.appendChild(lab);
+  }
+  for (const d of ALL_DATASETS) addDatasetToggle(d);
+  const hs = view && view.hostSeries;
+  if (hs && Array.isArray(hs.t) && hs.t.length) {
+    legend.appendChild(el("span", "leg-sep", "host:"));
+    for (const d of HOST_DATASETS) addDatasetToggle(d);
   }
 
   const tools = el("div", "head-tools");
@@ -3126,7 +3332,7 @@ function buildAllPanel(view) {
   const helpWrap = el("div", "metric-help");
   helpWrap.hidden = !state.datasetsHelpOpen;
   const helpList = el("div", "metric-help-list");
-  for (const d of ALL_DATASETS.concat(PLAYER_METRICS)) {
+  for (const d of ALL_DATASETS.concat(HOST_DATASETS, PLAYER_METRICS)) {
     if (!METRIC_NOTES[d.key]) continue;
     const row = el("div", "metric-help-row");
     row.appendChild(el("span", "metric-help-key", d.label));
@@ -3298,7 +3504,7 @@ function buildChart(t, spec, opts) {
     }
     svg.appendChild(barsG);
   } else {
-    /* line paths (null breaks the line) */
+    /* line paths (null breaks the line) + caveat ring markers */
     const linesG = svgEl("g");
     for (let li = 0; li < spec.lines.length; li++) {
       const vals = plotVals[li] || [];
@@ -3311,6 +3517,19 @@ function buildChart(t, spec, opts) {
         else { d += "L" + x.toFixed(1) + " " + y.toFixed(1) + " "; }
       }
       linesG.appendChild(svgEl("path", { class: "spark", d: d, stroke: spec.lines[li].color }));
+      const marks = spec.lines[li].markers;
+      if (Array.isArray(marks)) {
+        for (let i = 0; i < n; i++) {
+          if (!marks[i] || !isNum(vals[i])) continue;
+          const mark = svgEl("circle", {
+            class: "caveat-marker", cx: xs[i].toFixed(1), cy: sy(vals[i]).toFixed(1), r: 2.8,
+          });
+          const title = svgEl("title");
+          title.textContent = (spec.lines[li].markerNote || "⚠ caveated") + " · " + fmtIso(t[i]);
+          mark.appendChild(title);
+          linesG.appendChild(mark);
+        }
+      }
     }
     svg.appendChild(linesG);
   }
@@ -3367,7 +3586,9 @@ function buildChart(t, spec, opts) {
         dot.setAttribute("cx", x);
         dot.setAttribute("cy", sy(pv));
         dot.style.opacity = "1";
-        linesHtml += "<div class='tt-row'><i class='swatch' style='background:" + l.color + "'></i><span class='tt-name'>" + l.name + "</span><span class='tt-val'>" + lineFmtValue(l, spec, raw) + "</span></div>";
+        const caveat = (Array.isArray(l.markers) && l.markers[idx])
+          ? "<span class='tt-note'>⚠ caveated</span>" : "";
+        linesHtml += "<div class='tt-row'><i class='swatch' style='background:" + l.color + "'></i><span class='tt-name'>" + l.name + "</span><span class='tt-val'>" + lineFmtValue(l, spec, raw) + "</span>" + caveat + "</div>";
       } else {
         dot.style.opacity = "0";
       }
@@ -3440,6 +3661,9 @@ function render(result) {
   // 6. counts by type
   results.appendChild(panel("Записи по типам", String(digest.records != null ? digest.records : (result.records_count || 0)) + " всего", buildTypes(digest.counts_by_type)));
 
+  // 6b. config snapshots + diffs (stage 10)
+  results.appendChild(buildConfigPanel(view, result));
+
   // 7. server charts (with event bands)
   results.appendChild(buildChartsPanel(view));
 
@@ -3449,9 +3673,33 @@ function render(result) {
   // 9. clients table (identity + period aggregates)
   results.appendChild(buildClientsPanel(view));
 
-  // 10. drops over time (count bars) + drops table
+  // 10. drops over time (count bars) + drops table + incident bundle
   results.appendChild(buildDropsChartPanel(view));
-  results.appendChild(panel("Отключения (drops)", fmtInt(view.drops.length) + " шт.", buildDropsPanel(view.drops)));
+  const bundleMins = el("input");
+  bundleMins.type = "number";
+  bundleMins.id = "bundleMins";
+  bundleMins.className = "bundle-mins";
+  bundleMins.min = "0";
+  bundleMins.max = "1440";
+  bundleMins.step = "1";
+  bundleMins.value = "2";
+  bundleMins.title = "Полуокно bundle вокруг drop, минут";
+  const minsLabel = el("label", "evt-toggle", "± мин ");
+  minsLabel.appendChild(bundleMins);
+  const bundleBtn = el("button", "btn sm ghost", "bundle");
+  bundleBtn.type = "button";
+  bundleBtn.title = "Скачать JSON-конверт инцидента (окно ±N мин) для последнего drop в периоде";
+  bundleBtn.disabled = state.demo || !state.body;
+  bundleBtn.addEventListener("click", () => {
+    const drops = (view && Array.isArray(view.drops)) ? view.drops : [];
+    if (!drops.length) { toast("Нет drop в выбранном периоде.", "error"); return; }
+    const mins = parseFloat(bundleMins.value);
+    downloadBundle(drops[drops.length - 1], isNaN(mins) ? 2 : mins);
+  });
+  const dropTools = el("div", "head-tools");
+  dropTools.appendChild(minsLabel);
+  dropTools.appendChild(bundleBtn);
+  results.appendChild(panel("Отключения (drops)", fmtInt(view.drops.length) + " шт.", buildDropsPanel(view.drops), dropTools));
 
   // 11. anomalies
   results.appendChild(panel("Аномалии", null, buildAnomalies(result.anomalies)));
@@ -3652,6 +3900,62 @@ function makeDemo() {
       drop_after: true, slot: 0, userid: 2, name: "PlayerOne", steamid64: "76561197960266730" },
   ];
 
+  /* demo host series: nulls (gaps), caveat bits (rings) and normal points */
+  const hostSeries = {
+    t: t.slice(), udp_rcvbuf_errors: [], udp_in_errors: [],
+    udp_in_csum_errors: [], net_rx_dropped: [], net_rx_missed: [],
+    net_rx_overruns: [], steal_pct: [], io_read_bytes: [], io_write_bytes: [],
+    disk_bavail_mb: [], present_mask: [], caveat_mask: [],
+  };
+  for (let i = 0; i < N; i++) {
+    const udpV = (i % 29 === 0) ? 12 : 0;
+    const dropV = (i % 13 === 0) ? 2 : ((i % 7 === 0) ? 1 : 0);
+    const missV = (i % 19 === 0) ? 3 : 0;
+    hostSeries.udp_rcvbuf_errors.push(i % 11 === 0 ? null : udpV);
+    hostSeries.udp_in_errors.push(i % 17 === 0 ? null : Math.max(0, udpV - 9));
+    hostSeries.udp_in_csum_errors.push(null);
+    hostSeries.net_rx_dropped.push(dropV);
+    hostSeries.net_rx_missed.push(missV);
+    hostSeries.net_rx_overruns.push(null);
+    hostSeries.steal_pct.push(+(0.4 + 0.3 * Math.abs(Math.sin(i / 9))).toFixed(2));
+    hostSeries.io_read_bytes.push(4096 + Math.round(2048 * Math.abs(Math.sin(i / 5))));
+    hostSeries.io_write_bytes.push(8192 + Math.round(4096 * Math.abs(Math.sin(i / 7))));
+    hostSeries.disk_bavail_mb.push(i % 23 === 0 ? null : (45678 - i * 2));
+    const caveat = 1 | 2 | (i % 6 === 0 ? 4 : 0) | 8 | 16;
+    hostSeries.caveat_mask.push(caveat);
+    hostSeries.present_mask.push(i % 11 === 0 ? caveat & ~1 : 1023);
+  }
+  const host_caveats = {
+    udp_rcvbuf_errors: { source: "udp_netns", bit: 1 },
+    udp_in_errors: { source: "udp_netns", bit: 1 },
+    udp_in_csum_errors: { source: "udp_netns", bit: 1 },
+    net_rx_dropped: { source: "net_dev", bit: 2 },
+    net_rx_missed: { source: "net_dev", bit: 2 },
+    net_rx_overruns: { source: "net_dev", bit: 2 },
+    steal_pct: { source: "steal", bit: 4 },
+    io_read_bytes: { source: "io", bit: 8 },
+    io_write_bytes: { source: "io", bit: 8 },
+    disk_bavail_mb: { source: "disk", bit: 16 },
+  };
+  const configSnap = (t0v, map, ticrate, diff) => ({
+    t: t0v, rehlds_major: 3, rehlds_minor: 14, map: map, maxclients: 32,
+    sys_ticrate: ticrate, host_framerate: 0, sv_timeout: 65,
+    sv_maxrate: 0, sv_minrate: 0, sv_maxupdaterate: 101, sv_minupdaterate: 10,
+    sv_maxcmdrate: 101, sv_mincmdrate: 10, diff: diff,
+  });
+  const config = [
+    configSnap(t0, "de_dust2", 100,
+      { baseline: false, changed: [], added: [], removed: [] }),
+    configSnap(t0 + 40, "de_nuke", 120, {
+      baseline: true,
+      changed: [
+        { field: "sys_ticrate", before: 100, after: 120 },
+        { field: "map", before: "de_dust2", after: "de_nuke" },
+      ],
+      added: [], removed: [],
+    }),
+  ];
+
   const sessionCount = Object.keys(client_identities).length;
   const counts = { server: N, client: 219, drop: drops.length, reject: 4, connect: 9, netcmd: 63, massdrop: 2, packet: N, hitch: 6, mapchange: 1, voice: 14 };
   const records_count = Object.keys(counts).reduce((a, k) => a + counts[k], 0);
@@ -3697,6 +4001,9 @@ function makeDemo() {
     ],
     anomalies_excluded: anomalies_excluded,
     focus_points: focus_points,
+    host_series: hostSeries,
+    host_caveats: host_caveats,
+    config: config,
     records_count: records_count,
   };
 }
@@ -3853,6 +4160,16 @@ function selfTest() {
     ["drops-chart", () => buildDropsChart(view)],
     ["all-chart", () => buildAllChart(view)],
     ["all-panel", () => buildAllPanel(view)],
+    ["host-overlay", () => {
+      const saved = state.allSeries.slice();
+      state.allSeries = state.allSeries.concat(["steal_pct", "net_rx_dropped"]);
+      try {
+        const node = buildAllChart(view);
+        if (node.querySelector && !node.querySelector(".caveat-marker")) throw new Error("нет caveat-маркеров");
+        return node;
+      } finally { state.allSeries = saved; }
+    }],
+    ["config-panel", () => buildConfigPanel(view, demo)],
     ["focus-panel", () => buildFocusPanel(view, demo)],
     ["clients", () => buildClientsTable(view.clients)],
     ["ftp-panel", () => { const p = $("#ftpPanel"); if (!p) throw new Error("нет #ftpPanel"); return p; }],
@@ -3878,7 +4195,7 @@ function selfTest() {
 
 document.addEventListener("DOMContentLoaded", init);
 // expose for manual console verification
-window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers };
+window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime };
 </script>
 </body>
 </html>

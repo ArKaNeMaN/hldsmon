@@ -98,6 +98,8 @@ void cmd_status() {
     ap_u32(out, cap, pos, c.hitch_count);
     ap(out, cap, pos, "\n  write_errors: ");
     ap_u64(out, cap, pos, c.log->error_count());
+    ap(out, cap, pos, " pruned: ");
+    ap_u32(out, cap, pos, c.log->last_prune_count());
     ap(out, cap, pos, " serialize_failures: ");
     ap_u32(out, cap, pos, c.serialize_failures);
     ap(out, cap, pos, "\n  pkt_interval: ");

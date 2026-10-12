@@ -30,9 +30,9 @@ static bool has(const char* hay, const char* needle) {
 static void check_layout_constants() {
     CHECK(sizeof(ShutdownRecord) == 24);
     CHECK(sizeof(CrashRecord) == 12);
-    CHECK(sizeof(ClientSample) == 247);
+    CHECK(sizeof(ClientSample) == 253);
     CHECK(sizeof(NetchanSnapshot) == 62);
-    CHECK(sizeof(DropRecord) == 16413);
+    CHECK(sizeof(DropRecord) == 16872);
 }
 
 static ClientSample make_identified_client() {

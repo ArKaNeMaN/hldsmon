@@ -22,6 +22,7 @@ Importable test surface (no socket required)::
 
     analyze_bytes(data, files=None) -> dict
     export_bytes(data, rtype=None) -> str
+    bundle_bytes(data, drop_index, mins=2.0) -> dict
     make_server(host, port) -> http.server.ThreadingHTTPServer
 """
 from __future__ import annotations
@@ -102,6 +103,13 @@ _SERIES_FIELDS = (
     "fps", "in_kbps", "out_kbps",
 )
 
+#: ``host`` metric field -> ``{source, bit}`` of its caveat bit, sent to the UI
+#: so caveated overlay points can be marked (mirror of ``hldsmon``/C header).
+HOST_CAVEATS = {
+    field: {"source": source, "bit": hldsmon.HOST_CAVEAT_BITS[source]}
+    for field, source in hldsmon.HOST_FIELD_CAVEATS.items()
+}
+
 #: Minimal built-in page used only when ``webui/index.html`` is absent. It is
 #: never written to disk.
 FALLBACK_HTML = """<!DOCTYPE html>
@@ -122,7 +130,8 @@ FALLBACK_HTML = """<!DOCTYPE html>
 <h1>HldsMonitoring — офлайн-анализ</h1>
 <p>Служебная страница-заглушка: файл <code>webui/index.html</code> не найден.</p>
 <p>API доступен: <code>GET /api/health</code>,
-   <code>POST /api/analyze</code>, <code>POST /api/export</code>.</p>
+   <code>POST /api/analyze</code>, <code>POST /api/export</code>,
+   <code>POST /api/bundle</code>.</p>
 <p id="health">Проверка сервиса…</p>
 <pre id="json"></pre>
 <script>
@@ -304,6 +313,9 @@ def analyze_records(records, files=None):
         "anomalies_excluded": hldsmon.find_anomalies_detail(
             records, exclude=True)["excluded"],
         "focus_points": hldsmon.focus_points(records),
+        "host_series": hldsmon.host_series(records),
+        "host_caveats": HOST_CAVEATS,
+        "config": hldsmon.config_series(records),
     }
 
 
@@ -324,6 +336,24 @@ def export_bytes(data, rtype=None):
     buf = io.StringIO()
     hldsmon.export_csv(records, rtype=rtype, stream=buf)
     return buf.getvalue()
+
+
+def bundle_bytes(data, drop_index, mins=2.0):
+    """Return the incident-bundle envelope for raw JSONL ``data``.
+
+    ``drop_index`` is the 0-based position of the drop record in file order
+    (the same order the ``drops`` payload uses). Raises ``ValueError`` when the
+    log has no drops, the index is out of range, or ``mins`` is invalid.
+    """
+    if isinstance(drop_index, bool) or not isinstance(drop_index, int):
+        raise ValueError("drop index must be an integer")
+    records = _records_from_bytes(data)
+    drops = [r for r in records if r.get("type") == "drop"]
+    if not drops:
+        raise ValueError("no drop records in the log")
+    if not 0 <= drop_index < len(drops):
+        raise ValueError("drop index out of range: %d" % drop_index)
+    return hldsmon.incident_bundle(records, drops[drop_index], mins=mins)
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1110,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_analyze(query)
         elif parts.path == "/api/export":
             self._handle_export(query)
+        elif parts.path == "/api/bundle":
+            self._handle_bundle(query)
         elif parts.path == "/api/ftp/connect":
             self._handle_ftp(ftp_connect)
         elif parts.path == "/api/ftp/refresh":
@@ -1141,6 +1173,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
         self._send(200, csv_text, "text/csv; charset=utf-8")
+
+    def _handle_bundle(self, query):
+        data = self._read_body()
+        if data is None:
+            self.close_connection = True
+            self._send_json(413, {"ok": False, "error": "payload too large"})
+            return
+        raw_drop = self._first(query, "drop", None)
+        try:
+            drop_index = int(raw_drop)
+        except (TypeError, ValueError):
+            self._send_json(400, {
+                "ok": False,
+                "error": "drop index required (0-based position in file order)",
+            })
+            return
+        raw_mins = self._first(query, "mins", None)
+        mins = 2.0
+        if raw_mins not in (None, ""):
+            try:
+                mins = float(raw_mins)
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "invalid mins"})
+                return
+        try:
+            payload = bundle_bytes(data, drop_index, mins)
+        except Exception as exc:  # noqa: BLE001 - surface any analyzer error
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, payload)
 
     def _body_or_error(self):
         """Return the raw body, sending a 413/400 and ``None`` on failure."""
