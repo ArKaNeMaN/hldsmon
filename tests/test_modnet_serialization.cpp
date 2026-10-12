@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <span>
 
 static int g_fail = 0;
 
@@ -43,7 +44,7 @@ int main() {
         r.in_kbps = 1.5f;
         r.out_kbps = 3.25f;
 
-        const size_t n = write_modnet_json(buf, sizeof buf, r);
+        const size_t n = write_modnet_json(buf, r);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(buf[0] == '{');
@@ -66,7 +67,7 @@ int main() {
     {
         ModnetRecord z;
         std::memset(&z, 0, sizeof(z));
-        const size_t n = write_modnet_json(buf, sizeof buf, z);
+        const size_t n = write_modnet_json(buf, z);
         CHECK(n > 0);
         CHECK(has(buf, "\"conns\":0"));
         CHECK(has(buf, "\"conn_fail\":0"));
@@ -85,7 +86,7 @@ int main() {
         std::memset(&e, 0, sizeof(e));
         std::strcpy(e.module, "a\"b\\c");
         std::strcpy(e.so, "tab\tname.so");
-        const size_t n = write_modnet_json(buf, sizeof buf, e);
+        const size_t n = write_modnet_json(buf, e);
         CHECK(n > 0);
         CHECK(has(buf, "\"module\":\"a\\\"b\\\\c\""));
         CHECK(has(buf, "\"so\":\"tab\\tname.so\""));
@@ -101,12 +102,12 @@ int main() {
         r.in_bytes = 42;
 
         char big[1024];
-        const size_t need = write_modnet_json(big, sizeof big, r);
+        const size_t need = write_modnet_json(big, r);
         CHECK(need > 0);
 
         char sink[1024];
         std::memset(sink, 0x7f, sizeof sink);
-        CHECK(write_modnet_json(sink, need, r) == 0);
+        CHECK(write_modnet_json(std::span<char>(sink, need), r) == 0);
         bool touched = false;
         for (size_t i = 0; i < sizeof sink; ++i) {
             if (static_cast<unsigned char>(sink[i]) != 0x7f) {
@@ -118,10 +119,10 @@ int main() {
 
         char zero[8];
         std::memset(zero, 0x7f, sizeof zero);
-        CHECK(write_modnet_json(zero, 0, r) == 0);
+        CHECK(write_modnet_json(std::span<char>(zero, 0), r) == 0);
 
         char exact[1024];
-        CHECK(write_modnet_json(exact, need + 1, r) == need);
+        CHECK(write_modnet_json(std::span<char>(exact, need + 1), r) == need);
         CHECK(exact[need] == '\0');
     }
 

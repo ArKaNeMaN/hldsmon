@@ -1117,10 +1117,11 @@ ModnetState modnet_got_status() noexcept {
     return g_state;
 }
 
-size_t modnet_got_collect_emit(ModnetEmitItem* out, size_t cap, double now) noexcept {
-    if (out == nullptr || cap == 0) {
+size_t modnet_got_collect_emit(std::span<ModnetEmitItem> out, double now) noexcept {
+    if (out.empty()) {
         return 0;
     }
+    const size_t cap = out.size();
     size_t n = 0;
     for (ObjectEntry& o : g_objects) {
         if (!o.used || o.live_slots == 0 || n >= cap) {

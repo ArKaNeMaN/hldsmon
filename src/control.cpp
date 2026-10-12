@@ -19,12 +19,12 @@ void ap(char* out, size_t cap, size_t& pos, const char* s) noexcept {
 }
 
 void ap_u32(char* out, size_t cap, size_t& pos, uint32_t v) noexcept {
-    append_u32_dec(out, cap, pos, v);
+    append_u32_dec(std::span<char>(out, cap), pos, v);
 }
 
 void ap_u64(char* out, size_t cap, size_t& pos, uint64_t v) noexcept {
     if (v == 0) {
-        append_u32_dec(out, cap, pos, 0);
+        append_u32_dec(std::span<char>(out, cap), pos, 0);
         return;
     }
     char tmp[20];

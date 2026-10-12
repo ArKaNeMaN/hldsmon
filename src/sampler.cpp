@@ -10,6 +10,8 @@
 #include "delta.h"
 #include "events.h"
 
+#include <utility>
+
 namespace hldsmon {
 namespace {
 
@@ -81,7 +83,7 @@ void parse_userinfo(client_t* ct, ClientRuntime& cr, ClientSample& cs) noexcept 
     if (parse_uint(g_engfuncs.pfnInfoKeyValue(info, "cl_cmdrate"), &v)) {
         cs.cmdrate = static_cast<uint16_t>(v > 0xFFFFu ? 0xFFFFu : v);
     }
-    copy_str(cr.name, sizeof(cr.name), g_engfuncs.pfnInfoKeyValue(info, "name"));
+    copy_str(cr.name, g_engfuncs.pfnInfoKeyValue(info, "name"));
 }
 
 bool build_client_sample(int id, double now_epoch, ClientSample& cs) noexcept {
@@ -175,7 +177,7 @@ void emit_packet_interval(double now_epoch) noexcept {
             ps.top_ips[k] = top[k];
         }
         if (ntop > 0) {
-            copy_str(ps.top_ip, sizeof(ps.top_ip), top[0].ip);
+            copy_str(ps.top_ip, top[0].ip);
         }
         events::write_packet(ps);
         ++c.packet_records;
@@ -232,7 +234,7 @@ void emit_pending_mapchange(double now_real, double now_epoch) noexcept {
     MapChangeRecord rec;
     std::memset(&rec, 0, sizeof(rec));
     rec.t = now_epoch;
-    copy_str(rec.map, sizeof(rec.map), c.map_ctx.pending_map);
+    copy_str(rec.map, c.map_ctx.pending_map);
     if (ready && c.map_ctx.t_spawn > 0.0) {
         uint32_t load_ms = 0;
         if (timing_delta_ms(now_real - c.map_ctx.t_spawn, load_ms)) {
@@ -251,13 +253,13 @@ void modnet_emit_interval(double now_epoch, double now_real) noexcept {
         return;
     }
     static ModnetEmitItem items[HLDSMON_MODNET_MAX_OBJECTS];
-    const size_t n = modnet_got_collect_emit(items, HLDSMON_MODNET_MAX_OBJECTS, now_real);
+    const size_t n = modnet_got_collect_emit(items, now_real);
     for (size_t k = 0; k < n; ++k) {
         ModnetRecord r;
         std::memset(&r, 0, sizeof(r));
         r.t = now_epoch;
-        copy_str(r.module, sizeof(r.module), items[k].module);
-        copy_str(r.so, sizeof(r.so), items[k].so);
+        copy_str(r.module, items[k].module);
+        copy_str(r.so, items[k].so);
         modnet_diff(items[k].prev, items[k].cur, items[k].dt, r);
         if (!modnet_has_activity(r)) {
             continue;
@@ -276,7 +278,7 @@ void resolve_host_dir(char* out, size_t cap) noexcept {
         dir = c.cvars.dir->string;
     }
     if (dir[0] == '/' || cap == 0) {
-        copy_str(out, cap, dir);
+        copy_str(std::span<char>(out, cap), dir);
         return;
     }
     char game_dir[512];
@@ -285,7 +287,7 @@ void resolve_host_dir(char* out, size_t cap) noexcept {
         g_engfuncs.pfnGetGameDir(game_dir);
     }
     if (game_dir[0] == '\0') {
-        copy_str(out, cap, dir);
+        copy_str(std::span<char>(out, cap), dir);
         return;
     }
     size_t pos = 0;
@@ -297,7 +299,7 @@ void resolve_host_dir(char* out, size_t cap) noexcept {
         out[pos] = '/';
         ++pos;
     }
-    copy_str(out + pos, cap - pos, dir);
+    copy_str(std::span<char>(out + pos, cap - pos), dir);
 }
 
 // 1 Hz host/kernel telemetry (design §23.3): gather -> Δ -> emit `host`.
@@ -316,22 +318,22 @@ void host_emit_interval(double now_epoch) noexcept {
     bool truncated = false;
     bool any_truncated = false;
 
-    if (read_file("/proc/net/snmp", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/net/snmp", buf, &len, &truncated)) {
         parse_snmp_udp(buf, cur);
     }
     any_truncated = any_truncated || truncated;
 
-    if (read_file("/proc/net/dev", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/net/dev", buf, &len, &truncated)) {
         parse_net_dev(buf, cur);
     }
     any_truncated = any_truncated || truncated;
 
-    if (read_file("/proc/stat", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/stat", buf, &len, &truncated)) {
         parse_stat(buf, cur);
     }
     any_truncated = any_truncated || truncated;
 
-    if (read_file("/proc/self/io", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/self/io", buf, &len, &truncated)) {
         parse_self_io(buf, cur);
     }
     any_truncated = any_truncated || truncated;
@@ -341,7 +343,7 @@ void host_emit_interval(double now_epoch) noexcept {
     uint64_t avail_mb = 0;
     if (statvfs_bavail(dir, &avail_mb)) {
         cur.disk_bavail_mb = avail_mb;
-        cur.present |= kHostDiskBavailMb;
+        cur.present |= std::to_underlying(HostPresent::kHostDiskBavailMb);
     }
 
     HostRecord r;
@@ -468,7 +470,7 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
     }
     c.prev_edicts = edicts_now;
     c.edicts_has_prev = true;
-    copy_str(s.map, sizeof(s.map), current_map());
+    copy_str(s.map, current_map());
     s.uptime_s = gpGlobals != nullptr ? static_cast<uint32_t>(gpGlobals->time) : 0;
     s.fps = static_cast<float>(c.frame_count);
     s.maxclients = static_cast<uint8_t>(c.maxclients > 0 ? c.maxclients : 0);
@@ -488,7 +490,7 @@ void do_server_tick(double now_real, double now_epoch) noexcept {
             cr.rehlds_major = c.api->GetMajorVersion();
             cr.rehlds_minor = c.api->GetMinorVersion();
         }
-        copy_str(cr.map, sizeof(cr.map), current_map());
+        copy_str(cr.map, current_map());
         cr.maxclients = static_cast<uint8_t>(c.maxclients > 0 ? c.maxclients : 0);
         cr.config = cfg;
         events::write_config(cr);
@@ -599,39 +601,39 @@ void build_config_snapshot(ConfigSnapshot& out) noexcept {
     std::memset(&out, 0, sizeof(out));
     const CvarRefs& cv = c.cvars;
     if (cv.sys_ticrate != nullptr) {
-        out.present |= kCfgSysTicrate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSysTicrate);
         out.sys_ticrate = cv.sys_ticrate->value;
     }
     if (cv.host_framerate != nullptr) {
-        out.present |= kCfgHostFramerate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgHostFramerate);
         out.host_framerate = cv.host_framerate->value;
     }
     if (cv.sv_timeout != nullptr) {
-        out.present |= kCfgSvTimeout;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvTimeout);
         out.sv_timeout = cv.sv_timeout->value;
     }
     if (cv.sv_maxrate != nullptr) {
-        out.present |= kCfgSvMaxrate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMaxrate);
         out.sv_maxrate = cv.sv_maxrate->value;
     }
     if (cv.sv_minrate != nullptr) {
-        out.present |= kCfgSvMinrate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMinrate);
         out.sv_minrate = cv.sv_minrate->value;
     }
     if (cv.sv_maxupdaterate != nullptr) {
-        out.present |= kCfgSvMaxupdaterate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMaxupdaterate);
         out.sv_maxupdaterate = cv.sv_maxupdaterate->value;
     }
     if (cv.sv_minupdaterate != nullptr) {
-        out.present |= kCfgSvMinupdaterate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMinupdaterate);
         out.sv_minupdaterate = cv.sv_minupdaterate->value;
     }
     if (cv.sv_maxcmdrate != nullptr) {
-        out.present |= kCfgSvMaxcmdrate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMaxcmdrate);
         out.sv_maxcmdrate = cv.sv_maxcmdrate->value;
     }
     if (cv.sv_mincmdrate != nullptr) {
-        out.present |= kCfgSvMincmdrate;
+        out.present |= std::to_underlying(ConfigPresent::kCfgSvMincmdrate);
         out.sv_mincmdrate = cv.sv_mincmdrate->value;
     }
 }

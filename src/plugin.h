@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 
 #include <extdll.h>
 #include <eiface.h>
@@ -313,14 +314,14 @@ inline bool plugin_enabled() noexcept {
 
 // ---- allocation-free text helpers (hot-path safe) ----
 
-// Bounded NUL-terminating copy (never writes past cap).
-inline void copy_str(char* dst, size_t cap, const char* src) noexcept {
-    if (cap == 0) {
+// Bounded NUL-terminating copy (never writes past dst.size()).
+inline void copy_str(std::span<char> dst, const char* src) noexcept {
+    if (dst.empty()) {
         return;
     }
     size_t i = 0;
     if (src != nullptr) {
-        for (; src[i] != '\0' && i + 1 < cap; ++i) {
+        for (; src[i] != '\0' && i + 1 < dst.size(); ++i) {
             dst[i] = src[i];
         }
     }
@@ -329,13 +330,13 @@ inline void copy_str(char* dst, size_t cap, const char* src) noexcept {
 
 // UTF-8-safe copy: like copy_str, but when truncation would split a multibyte
 // sequence it backs off to the last complete character boundary.
-inline void copy_str_utf8(char* dst, size_t cap, const char* src) noexcept {
-    if (cap == 0) {
+inline void copy_str_utf8(std::span<char> dst, const char* src) noexcept {
+    if (dst.empty()) {
         return;
     }
     size_t i = 0;
     if (src != nullptr) {
-        for (; src[i] != '\0' && i + 1 < cap; ++i) {
+        for (; src[i] != '\0' && i + 1 < dst.size(); ++i) {
             dst[i] = src[i];
         }
     }
@@ -364,7 +365,7 @@ inline void copy_str_utf8(char* dst, size_t cap, const char* src) noexcept {
     dst[i] = '\0';
 }
 
-inline void append_u32_dec(char* out, size_t cap, size_t& pos, uint32_t v) noexcept {
+inline void append_u32_dec(std::span<char> out, size_t& pos, uint32_t v) noexcept {
     char tmp[10];
     int n = 0;
     if (v == 0) {
@@ -375,7 +376,7 @@ inline void append_u32_dec(char* out, size_t cap, size_t& pos, uint32_t v) noexc
             v /= 10u;
         }
     }
-    while (n > 0 && pos + 1 < cap) {
+    while (n > 0 && pos + 1 < out.size()) {
         out[pos++] = tmp[--n];
     }
 }
@@ -389,22 +390,23 @@ inline uint32_t pack_ip4(const unsigned char ip[4]) noexcept {
 }
 
 // "a.b.c.d" into out (NUL-terminated).
-inline void format_ip(const netadr_t& a, char* out, size_t cap) noexcept {    if (cap == 0) {
+inline void format_ip(const netadr_t& a, std::span<char> out) noexcept {
+    if (out.empty()) {
         return;
     }
     size_t pos = 0;
     for (int k = 0; k < 4; ++k) {
-        append_u32_dec(out, cap, pos, static_cast<uint32_t>(a.ip[k]));
-        if (k != 3 && pos + 1 < cap) {
+        append_u32_dec(out, pos, static_cast<uint32_t>(a.ip[k]));
+        if (k != 3 && pos + 1 < out.size()) {
             out[pos++] = '.';
         }
     }
-    out[pos < cap ? pos : cap - 1] = '\0';
+    out[pos < out.size() ? pos : out.size() - 1] = '\0';
 }
 
 // Decimal string of an unsigned 64-bit value (NUL-terminated).
-inline void format_u64_dec(uint64_t v, char* out, size_t cap) noexcept {
-    if (cap == 0) {
+inline void format_u64_dec(uint64_t v, std::span<char> out) noexcept {
+    if (out.empty()) {
         return;
     }
     char tmp[20];
@@ -418,10 +420,10 @@ inline void format_u64_dec(uint64_t v, char* out, size_t cap) noexcept {
         }
     }
     size_t pos = 0;
-    while (n > 0 && pos + 1 < cap) {
+    while (n > 0 && pos + 1 < out.size()) {
         out[pos++] = tmp[--n];
     }
-    out[pos < cap ? pos : cap - 1] = '\0';
+    out[pos < out.size() ? pos : out.size() - 1] = '\0';
 }
 
 // "STEAM_x:y:z" from a SteamID64, or "STEAM_ID_PENDING"/"NOSTEAM".
@@ -429,13 +431,14 @@ inline void format_steamid(uint64_t sid, char* out, size_t cap) noexcept {
     if (cap == 0) {
         return;
     }
+    std::span<char> dst(out, cap);
     if (sid == 0) {
-        copy_str(out, cap, "STEAM_ID_PENDING");
+        copy_str(dst, "STEAM_ID_PENDING");
         return;
     }
     const uint64_t kBase = 76561197960265728ULL;
     if (sid < kBase) {
-        copy_str(out, cap, "NOSTEAM");
+        copy_str(dst, "NOSTEAM");
         return;
     }
     const uint64_t acc = sid - kBase;
@@ -446,11 +449,11 @@ inline void format_steamid(uint64_t sid, char* out, size_t cap) noexcept {
     for (const char* p = prefix; *p != '\0' && pos + 1 < cap; ++p) {
         out[pos++] = *p;
     }
-    append_u32_dec(out, cap, pos, y);
+    append_u32_dec(dst, pos, y);
     if (pos + 1 < cap) {
         out[pos++] = ':';
     }
-    append_u32_dec(out, cap, pos, z);
+    append_u32_dec(dst, pos, z);
     out[pos < cap ? pos : cap - 1] = '\0';
 }
 
@@ -469,7 +472,7 @@ inline void classify_reason(const char* reason, char* out, size_t cap) noexcept 
             cat = "error";
         }
     }
-    copy_str(out, cap, cat);
+    copy_str(std::span<char>(out, cap), cat);
 }
 
 // Fills the identity block shared by ClientSample and DropRecord (same member
@@ -487,12 +490,12 @@ inline void fill_identity(Rec& out, IGameClient* live, int id, double now_epoch)
     out.proxy = false;
 
     if (live != nullptr) {
-        copy_str_utf8(out.name, sizeof out.name, live->GetName());
+        copy_str_utf8(out.name, live->GetName());
         INetChan* nc = live->GetNetChan();
         if (nc != nullptr) {
             const netadr_t* a = nc->GetRemoteAdr();
             if (a != nullptr) {
-                format_ip(*a, out.ip, sizeof out.ip);
+                format_ip(*a, out.ip);
                 if (a->type == NA_IP) {
                     const uint16_t p = a->port;
                     out.port = static_cast<int32_t>(
@@ -513,10 +516,10 @@ inline void fill_identity(Rec& out, IGameClient* live, int id, double now_epoch)
         (slot >= 1 && slot <= kMaxSlots) ? &c.ident[slot] : nullptr;
     if (ci != nullptr && ci->valid) {
         if (out.name[0] == '\0') {
-            copy_str_utf8(out.name, sizeof out.name, ci->name);
+            copy_str_utf8(out.name, ci->name);
         }
         if (out.ip[0] == '\0') {
-            copy_str_utf8(out.ip, sizeof out.ip, ci->ip);
+            copy_str_utf8(out.ip, ci->ip);
         }
         if (out.port < 0) {
             out.port = ci->port;
@@ -526,8 +529,8 @@ inline void fill_identity(Rec& out, IGameClient* live, int id, double now_epoch)
         }
         out.fake = out.fake || ci->fake;
         out.proxy = out.proxy || ci->proxy;
-        copy_str_utf8(out.authid, sizeof out.authid, ci->authid);
-        copy_str_utf8(out.steamid64, sizeof out.steamid64, ci->steamid64);
+        copy_str_utf8(out.authid, ci->authid);
+        copy_str_utf8(out.steamid64, ci->steamid64);
         if (ci->connect_at > 0.0 && now_epoch >= ci->connect_at) {
             out.conn_s = now_epoch - ci->connect_at;
         }

@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <span>
+#include <utility>
 
 namespace hldsmon {
 namespace {
@@ -444,23 +446,23 @@ void emit_server(JsonBuf& b, const ServerSample& r) {
 // `drop.config` object (CFG-8). Emits bare key/value pairs (no braces) in P1
 // order; absent cvar => literal null (CFG-2).
 void emit_config_numbers(JsonBuf& b, const ConfigSnapshot& c) {
-    kv_fixed_or_null(b, "sys_ticrate", (c.present & kCfgSysTicrate) != 0, c.sys_ticrate);
+    kv_fixed_or_null(b, "sys_ticrate", (c.present & std::to_underlying(ConfigPresent::kCfgSysTicrate)) != 0, c.sys_ticrate);
     b.ch(',');
-    kv_fixed_or_null(b, "host_framerate", (c.present & kCfgHostFramerate) != 0, c.host_framerate);
+    kv_fixed_or_null(b, "host_framerate", (c.present & std::to_underlying(ConfigPresent::kCfgHostFramerate)) != 0, c.host_framerate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_timeout", (c.present & kCfgSvTimeout) != 0, c.sv_timeout);
+    kv_fixed_or_null(b, "sv_timeout", (c.present & std::to_underlying(ConfigPresent::kCfgSvTimeout)) != 0, c.sv_timeout);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_maxrate", (c.present & kCfgSvMaxrate) != 0, c.sv_maxrate);
+    kv_fixed_or_null(b, "sv_maxrate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMaxrate)) != 0, c.sv_maxrate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_minrate", (c.present & kCfgSvMinrate) != 0, c.sv_minrate);
+    kv_fixed_or_null(b, "sv_minrate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMinrate)) != 0, c.sv_minrate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_maxupdaterate", (c.present & kCfgSvMaxupdaterate) != 0, c.sv_maxupdaterate);
+    kv_fixed_or_null(b, "sv_maxupdaterate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMaxupdaterate)) != 0, c.sv_maxupdaterate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_minupdaterate", (c.present & kCfgSvMinupdaterate) != 0, c.sv_minupdaterate);
+    kv_fixed_or_null(b, "sv_minupdaterate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMinupdaterate)) != 0, c.sv_minupdaterate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_maxcmdrate", (c.present & kCfgSvMaxcmdrate) != 0, c.sv_maxcmdrate);
+    kv_fixed_or_null(b, "sv_maxcmdrate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMaxcmdrate)) != 0, c.sv_maxcmdrate);
     b.ch(',');
-    kv_fixed_or_null(b, "sv_mincmdrate", (c.present & kCfgSvMincmdrate) != 0, c.sv_mincmdrate);
+    kv_fixed_or_null(b, "sv_mincmdrate", (c.present & std::to_underlying(ConfigPresent::kCfgSvMincmdrate)) != 0, c.sv_mincmdrate);
 }
 
 void emit_config(JsonBuf& b, const ConfigRecord& r) {
@@ -491,25 +493,25 @@ void emit_host(JsonBuf& b, const HostRecord& r) {
     b.ch(',');
     kv_fixed(b, "t", r.t, 3);
     b.ch(',');
-    kv_u64_or_null(b, "udp_rcvbuf_errors", (p & kHostUdpRcvbufErrors) != 0, r.udp_rcvbuf_errors);
+    kv_u64_or_null(b, "udp_rcvbuf_errors", (p & std::to_underlying(HostPresent::kHostUdpRcvbufErrors)) != 0, r.udp_rcvbuf_errors);
     b.ch(',');
-    kv_u64_or_null(b, "udp_in_errors", (p & kHostUdpInErrors) != 0, r.udp_in_errors);
+    kv_u64_or_null(b, "udp_in_errors", (p & std::to_underlying(HostPresent::kHostUdpInErrors)) != 0, r.udp_in_errors);
     b.ch(',');
-    kv_u64_or_null(b, "udp_in_csum_errors", (p & kHostUdpInCsumErrors) != 0, r.udp_in_csum_errors);
+    kv_u64_or_null(b, "udp_in_csum_errors", (p & std::to_underlying(HostPresent::kHostUdpInCsumErrors)) != 0, r.udp_in_csum_errors);
     b.ch(',');
-    kv_u64_or_null(b, "net_rx_dropped", (p & kHostNetRxDropped) != 0, r.net_rx_dropped);
+    kv_u64_or_null(b, "net_rx_dropped", (p & std::to_underlying(HostPresent::kHostNetRxDropped)) != 0, r.net_rx_dropped);
     b.ch(',');
-    kv_u64_or_null(b, "net_rx_missed", (p & kHostNetRxMissed) != 0, r.net_rx_missed);
+    kv_u64_or_null(b, "net_rx_missed", (p & std::to_underlying(HostPresent::kHostNetRxMissed)) != 0, r.net_rx_missed);
     b.ch(',');
-    kv_u64_or_null(b, "net_rx_overruns", (p & kHostNetRxOverruns) != 0, r.net_rx_overruns);
+    kv_u64_or_null(b, "net_rx_overruns", (p & std::to_underlying(HostPresent::kHostNetRxOverruns)) != 0, r.net_rx_overruns);
     b.ch(',');
-    kv_fixed_or_null(b, "steal_pct", (p & kHostStealPct) != 0, r.steal_pct);
+    kv_fixed_or_null(b, "steal_pct", (p & std::to_underlying(HostPresent::kHostStealPct)) != 0, r.steal_pct);
     b.ch(',');
-    kv_u64_or_null(b, "io_read_bytes", (p & kHostIoReadBytes) != 0, r.io_read_bytes);
+    kv_u64_or_null(b, "io_read_bytes", (p & std::to_underlying(HostPresent::kHostIoReadBytes)) != 0, r.io_read_bytes);
     b.ch(',');
-    kv_u64_or_null(b, "io_write_bytes", (p & kHostIoWriteBytes) != 0, r.io_write_bytes);
+    kv_u64_or_null(b, "io_write_bytes", (p & std::to_underlying(HostPresent::kHostIoWriteBytes)) != 0, r.io_write_bytes);
     b.ch(',');
-    kv_u64_or_null(b, "disk_bavail_mb", (p & kHostDiskBavailMb) != 0, r.disk_bavail_mb);
+    kv_u64_or_null(b, "disk_bavail_mb", (p & std::to_underlying(HostPresent::kHostDiskBavailMb)) != 0, r.disk_bavail_mb);
     b.ch(',');
     kv_u64(b, "present_mask", r.present_mask);
     b.ch(',');
@@ -583,9 +585,9 @@ void emit_reject(JsonBuf& b, const RejectRecord& r) {
     b.ch(',');
     kv_str(b, "detail", r.detail);
     b.ch(',');
-    kv_u32_or_null(b, "stage_ms", (r.timing_present & kTimingStageMs) != 0, r.stage_ms);
+    kv_u32_or_null(b, "stage_ms", (r.timing_present & std::to_underlying(TimingPresent::kTimingStageMs)) != 0, r.stage_ms);
     b.ch(',');
-    kv_u32_or_null(b, "total_ms", (r.timing_present & kTimingTotalMs) != 0, r.total_ms);
+    kv_u32_or_null(b, "total_ms", (r.timing_present & std::to_underlying(TimingPresent::kTimingTotalMs)) != 0, r.total_ms);
     b.ch('}');
 }
 
@@ -603,9 +605,9 @@ void emit_connect(JsonBuf& b, const ConnectRecord& r) {
     b.ch(',');
     kv_str(b, "name", r.name);
     b.ch(',');
-    kv_u32_or_null(b, "auth_ms", (r.timing_present & kTimingAuthMs) != 0, r.auth_ms);
+    kv_u32_or_null(b, "auth_ms", (r.timing_present & std::to_underlying(TimingPresent::kTimingAuthMs)) != 0, r.auth_ms);
     b.ch(',');
-    kv_u32_or_null(b, "steam_ms", (r.timing_present & kTimingSteamMs) != 0, r.steam_ms);
+    kv_u32_or_null(b, "steam_ms", (r.timing_present & std::to_underlying(TimingPresent::kTimingSteamMs)) != 0, r.steam_ms);
     b.ch('}');
 }
 
@@ -785,12 +787,13 @@ template <class Record>
 using EmitFn = void (*)(JsonBuf&, const Record&);
 
 template <class Record>
-size_t write_record(char* out, size_t cap, const Record& r, EmitFn<Record> emit) {
+size_t write_record(std::span<char> out, const Record& r, EmitFn<Record> emit) {
     JsonBuf measure{nullptr, SIZE_MAX, 0, false};
     emit(measure, r);
     const size_t need = measure.pos;
+    const size_t cap = out.size();
     if (need + 1 > cap) return 0;
-    JsonBuf writer{out, cap, 0, false};
+    JsonBuf writer{out.data(), cap, 0, false};
     emit(writer, r);
     if (writer.overflow || writer.pos != need) return 0;
     out[need] = '\0';
@@ -799,7 +802,7 @@ size_t write_record(char* out, size_t cap, const Record& r, EmitFn<Record> emit)
 
 } // namespace
 
-size_t json_escape(const char* in, char* out, size_t cap) {
+size_t json_escape(const char* in, std::span<char> out) {
     if (!in) in = "";
     size_t need = 0;
     for (const char* p = in; *p != '\0'; ++p) {
@@ -813,7 +816,7 @@ size_t json_escape(const char* in, char* out, size_t cap) {
             need += 1;
         }
     }
-    if (need + 1 > cap) return 0;
+    if (need + 1 > out.size()) return 0;
 
     size_t k = 0;
     for (const char* p = in; *p != '\0'; ++p) {
@@ -843,59 +846,59 @@ size_t json_escape(const char* in, char* out, size_t cap) {
     return k;
 }
 
-size_t write_client_json(char* out, size_t cap, const ClientSample& r) {
-    return write_record(out, cap, r, &emit_client);
+size_t write_client_json(std::span<char> out, const ClientSample& r) {
+    return write_record(out, r, &emit_client);
 }
-size_t write_server_json(char* out, size_t cap, const ServerSample& r) {
-    return write_record(out, cap, r, &emit_server);
+size_t write_server_json(std::span<char> out, const ServerSample& r) {
+    return write_record(out, r, &emit_server);
 }
-size_t write_drop_json(char* out, size_t cap, const DropRecord& r) {
-    return write_record(out, cap, r, &emit_drop);
+size_t write_drop_json(std::span<char> out, const DropRecord& r) {
+    return write_record(out, r, &emit_drop);
 }
-size_t write_reject_json(char* out, size_t cap, const RejectRecord& r) {
-    return write_record(out, cap, r, &emit_reject);
+size_t write_reject_json(std::span<char> out, const RejectRecord& r) {
+    return write_record(out, r, &emit_reject);
 }
-size_t write_connect_json(char* out, size_t cap, const ConnectRecord& r) {
-    return write_record(out, cap, r, &emit_connect);
+size_t write_connect_json(std::span<char> out, const ConnectRecord& r) {
+    return write_record(out, r, &emit_connect);
 }
-size_t write_netcmd_json(char* out, size_t cap, const NetCmdRecord& r) {
-    return write_record(out, cap, r, &emit_netcmd);
+size_t write_netcmd_json(std::span<char> out, const NetCmdRecord& r) {
+    return write_record(out, r, &emit_netcmd);
 }
-size_t write_massdrop_json(char* out, size_t cap, const MassDropRecord& r) {
-    return write_record(out, cap, r, &emit_massdrop);
+size_t write_massdrop_json(std::span<char> out, const MassDropRecord& r) {
+    return write_record(out, r, &emit_massdrop);
 }
-size_t write_packet_json(char* out, size_t cap, const PacketStats& r) {
-    return write_record(out, cap, r, &emit_packet);
+size_t write_packet_json(std::span<char> out, const PacketStats& r) {
+    return write_record(out, r, &emit_packet);
 }
-size_t write_hitch_json(char* out, size_t cap, const HitchRecord& r) {
-    return write_record(out, cap, r, &emit_hitch);
+size_t write_hitch_json(std::span<char> out, const HitchRecord& r) {
+    return write_record(out, r, &emit_hitch);
 }
-size_t write_mapchange_json(char* out, size_t cap, const MapChangeRecord& r) {
-    return write_record(out, cap, r, &emit_mapchange);
+size_t write_mapchange_json(std::span<char> out, const MapChangeRecord& r) {
+    return write_record(out, r, &emit_mapchange);
 }
-size_t write_voice_json(char* out, size_t cap, const VoiceRecord& r) {
-    return write_record(out, cap, r, &emit_voice);
+size_t write_voice_json(std::span<char> out, const VoiceRecord& r) {
+    return write_record(out, r, &emit_voice);
 }
-size_t write_shutdown_json(char* out, size_t cap, const ShutdownRecord& r) {
-    return write_record(out, cap, r, &emit_shutdown);
+size_t write_shutdown_json(std::span<char> out, const ShutdownRecord& r) {
+    return write_record(out, r, &emit_shutdown);
 }
-size_t write_crash_json(char* out, size_t cap, const CrashRecord& r) {
-    return write_record(out, cap, r, &emit_crash);
+size_t write_crash_json(std::span<char> out, const CrashRecord& r) {
+    return write_record(out, r, &emit_crash);
 }
-size_t write_degraded_json(char* out, size_t cap, const DegradedRecord& r) {
-    return write_record(out, cap, r, &emit_degraded);
+size_t write_degraded_json(std::span<char> out, const DegradedRecord& r) {
+    return write_record(out, r, &emit_degraded);
 }
-size_t write_retention_json(char* out, size_t cap, const RetentionRecord& r) {
-    return write_record(out, cap, r, &emit_retention);
+size_t write_retention_json(std::span<char> out, const RetentionRecord& r) {
+    return write_record(out, r, &emit_retention);
 }
-size_t write_modnet_json(char* out, size_t cap, const ModnetRecord& r) {
-    return write_record(out, cap, r, &emit_modnet);
+size_t write_modnet_json(std::span<char> out, const ModnetRecord& r) {
+    return write_record(out, r, &emit_modnet);
 }
-size_t write_config_json(char* out, size_t cap, const ConfigRecord& r) {
-    return write_record(out, cap, r, &emit_config);
+size_t write_config_json(std::span<char> out, const ConfigRecord& r) {
+    return write_record(out, r, &emit_config);
 }
-size_t write_host_json(char* out, size_t cap, const HostRecord& r) {
-    return write_record(out, cap, r, &emit_host);
+size_t write_host_json(std::span<char> out, const HostRecord& r) {
+    return write_record(out, r, &emit_host);
 }
 
 } // namespace hldsmon

@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <utility>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -104,19 +105,19 @@ struct DeltaField {
 };
 
 const DeltaField kDeltaFields[] = {
-    {kHostUdpRcvbufErrors, &HostSnapshot::udp_rcvbuf_errors,
+    {std::to_underlying(HostPresent::kHostUdpRcvbufErrors), &HostSnapshot::udp_rcvbuf_errors,
      &HostRecord::udp_rcvbuf_errors},
-    {kHostUdpInErrors, &HostSnapshot::udp_in_errors, &HostRecord::udp_in_errors},
-    {kHostUdpInCsumErrors, &HostSnapshot::udp_in_csum_errors,
+    {std::to_underlying(HostPresent::kHostUdpInErrors), &HostSnapshot::udp_in_errors, &HostRecord::udp_in_errors},
+    {std::to_underlying(HostPresent::kHostUdpInCsumErrors), &HostSnapshot::udp_in_csum_errors,
      &HostRecord::udp_in_csum_errors},
-    {kHostNetRxDropped, &HostSnapshot::net_rx_dropped,
+    {std::to_underlying(HostPresent::kHostNetRxDropped), &HostSnapshot::net_rx_dropped,
      &HostRecord::net_rx_dropped},
-    {kHostNetRxMissed, &HostSnapshot::net_rx_missed,
+    {std::to_underlying(HostPresent::kHostNetRxMissed), &HostSnapshot::net_rx_missed,
      &HostRecord::net_rx_missed},
-    {kHostNetRxOverruns, &HostSnapshot::net_rx_overruns,
+    {std::to_underlying(HostPresent::kHostNetRxOverruns), &HostSnapshot::net_rx_overruns,
      &HostRecord::net_rx_overruns},
-    {kHostIoReadBytes, &HostSnapshot::io_read_bytes, &HostRecord::io_read_bytes},
-    {kHostIoWriteBytes, &HostSnapshot::io_write_bytes,
+    {std::to_underlying(HostPresent::kHostIoReadBytes), &HostSnapshot::io_read_bytes, &HostRecord::io_read_bytes},
+    {std::to_underlying(HostPresent::kHostIoWriteBytes), &HostSnapshot::io_write_bytes,
      &HostRecord::io_write_bytes},
 };
 
@@ -170,13 +171,13 @@ void parse_snmp_udp(const char* buf, HostSnapshot& out) noexcept {
             while (next_token(q, le, tb, te)) {
                 if (index == idx_in_errors && parse_u64_token(tb, te, &v)) {
                     out.udp_in_errors = v;
-                    out.present |= kHostUdpInErrors;
+                    out.present |= std::to_underlying(HostPresent::kHostUdpInErrors);
                 } else if (index == idx_rcvbuf && parse_u64_token(tb, te, &v)) {
                     out.udp_rcvbuf_errors = v;
-                    out.present |= kHostUdpRcvbufErrors;
+                    out.present |= std::to_underlying(HostPresent::kHostUdpRcvbufErrors);
                 } else if (index == idx_csum && parse_u64_token(tb, te, &v)) {
                     out.udp_in_csum_errors = v;
-                    out.present |= kHostUdpInCsumErrors;
+                    out.present |= std::to_underlying(HostPresent::kHostUdpInCsumErrors);
                 }
                 ++index;
             }
@@ -253,13 +254,13 @@ void parse_net_dev(const char* buf, HostSnapshot& out) noexcept {
             if (parse_u64_token(tb, te, &v)) {
                 if (vi == idx_drop) {
                     out.net_rx_dropped += v;
-                    out.present |= kHostNetRxDropped;
+                    out.present |= std::to_underlying(HostPresent::kHostNetRxDropped);
                 } else if (vi == idx_missed) {
                     out.net_rx_missed += v;
-                    out.present |= kHostNetRxMissed;
+                    out.present |= std::to_underlying(HostPresent::kHostNetRxMissed);
                 } else if (vi == idx_ovr) {
                     out.net_rx_overruns += v;
-                    out.present |= kHostNetRxOverruns;
+                    out.present |= std::to_underlying(HostPresent::kHostNetRxOverruns);
                 }
             }
             ++vi;
@@ -307,7 +308,7 @@ void parse_stat(const char* buf, HostSnapshot& out) noexcept {
             }
             out.stat_steal_jiffies = vals[7];
             out.stat_total_jiffies = total;
-            out.present |= kHostStealPct;
+            out.present |= std::to_underlying(HostPresent::kHostStealPct);
         }
         break;
     }
@@ -334,10 +335,10 @@ void parse_self_io(const char* buf, HostSnapshot& out) noexcept {
         uint16_t bit = 0;
         uint64_t HostSnapshot::*member = nullptr;
         if (token_eq(tb, te, "read_bytes:")) {
-            bit = kHostIoReadBytes;
+            bit = std::to_underlying(HostPresent::kHostIoReadBytes);
             member = &HostSnapshot::io_read_bytes;
         } else if (token_eq(tb, te, "write_bytes:")) {
-            bit = kHostIoWriteBytes;
+            bit = std::to_underlying(HostPresent::kHostIoWriteBytes);
             member = &HostSnapshot::io_write_bytes;
         } else {
             continue;
@@ -372,14 +373,14 @@ EnvVerdict detect_env(const EnvInputs& in) noexcept {
     v.netns_authoritative =
         dedicated || (in.container == Tri::kYes && private_confirmed);
     if (!v.netns_authoritative) {
-        v.caveat |= kCaveatUdpNetns;
+        v.caveat |= std::to_underlying(HostCaveat::kCaveatUdpNetns);
     }
-    v.caveat |= kCaveatNetDev;  // M2: driver-dependent zeroes
+    v.caveat |= std::to_underlying(HostCaveat::kCaveatNetDev);  // M2: driver-dependent zeroes
     if (!dedicated) {
-        v.caveat |= kCaveatSteal;  // lxcfs/OpenVZ zero the field; unknown => caveat
+        v.caveat |= std::to_underlying(HostCaveat::kCaveatSteal);  // lxcfs/OpenVZ zero the field; unknown => caveat
     }
-    v.caveat |= kCaveatIo;
-    v.caveat |= kCaveatDisk;
+    v.caveat |= std::to_underlying(HostCaveat::kCaveatIo);
+    v.caveat |= std::to_underlying(HostCaveat::kCaveatDisk);
     return v;
 }
 
@@ -397,7 +398,7 @@ EnvInputs probe_env() noexcept {
     size_t len = 0;
     bool truncated = false;
 
-    if (read_file("/proc/mounts", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/mounts", buf, &len, &truncated)) {
         if (buf_contains(buf, len, "lxcfs")) {
             in.container = Tri::kYes;
         }
@@ -405,7 +406,7 @@ EnvInputs probe_env() noexcept {
         in.container = Tri::kUnknown;  // could not check an auxiliary sign
     }
 
-    if (read_file("/proc/self/cgroup", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/self/cgroup", buf, &len, &truncated)) {
         static const char* const kMarkers[] = {"docker", "lxc", "kubepods",
                                                "containerd", "libpod"};
         for (const char* marker : kMarkers) {
@@ -420,7 +421,7 @@ EnvInputs probe_env() noexcept {
 
     // Best-effort: PID1's environment may be unreadable (ptrace/EACCES); that
     // is absence of evidence, not evidence of a container.
-    if (read_file("/proc/1/environ", buf, sizeof(buf), &len, &truncated)) {
+    if (read_file("/proc/1/environ", buf, &len, &truncated)) {
         if (buf_contains(buf, len, "container=")) {
             in.container = Tri::kYes;
         }
@@ -445,7 +446,7 @@ EnvInputs probe_env() noexcept {
 
 // ---- bounded I/O ---------------------------------------------------------
 
-bool read_file(const char* path, char* buf, size_t cap, size_t* out_len,
+bool read_file(const char* path, std::span<char> buf, size_t* out_len,
                bool* out_truncated) noexcept {
     if (out_len != nullptr) {
         *out_len = 0;
@@ -453,9 +454,10 @@ bool read_file(const char* path, char* buf, size_t cap, size_t* out_len,
     if (out_truncated != nullptr) {
         *out_truncated = false;
     }
-    if (path == nullptr || buf == nullptr || cap == 0 || out_len == nullptr) {
+    if (path == nullptr || buf.empty() || out_len == nullptr) {
         return false;
     }
+    const size_t cap = buf.size();
 
     int fd = -1;
     do {
@@ -485,7 +487,7 @@ bool read_file(const char* path, char* buf, size_t cap, size_t* out_len,
         }
         ssize_t r = -1;
         do {
-            r = ::read(fd, buf + total, cap - 1 - total);
+            r = ::read(fd, buf.data() + total, cap - 1 - total);
         } while (r < 0 && errno == EINTR);
         if (r < 0) {
             ::close(fd);
@@ -536,13 +538,13 @@ void build_host_record(const HostSnapshot& prev, bool has_prev,
     out.t = t;
     out.caveat_mask = caveat_mask;
     if (truncated) {
-        out.caveat_mask |= kCaveatTruncated;
+        out.caveat_mask |= std::to_underlying(HostCaveat::kCaveatTruncated);
     }
 
     // Instantaneous fields do not need a baseline.
-    if ((cur.present & kHostDiskBavailMb) != 0) {
+    if ((cur.present & std::to_underlying(HostPresent::kHostDiskBavailMb)) != 0) {
         out.disk_bavail_mb = cur.disk_bavail_mb;
-        out.present_mask |= kHostDiskBavailMb;
+        out.present_mask |= std::to_underlying(HostPresent::kHostDiskBavailMb);
     }
 
     if (!has_prev) {
@@ -562,7 +564,7 @@ void build_host_record(const HostSnapshot& prev, bool has_prev,
     }
 
     // steal as a percentage of the interval's total CPU time.
-    const uint16_t steal_bit = kHostStealPct;
+    const uint16_t steal_bit = std::to_underlying(HostPresent::kHostStealPct);
     if (((prev.present & cur.present) & steal_bit) != 0) {
         uint64_t dsteal = 0;
         uint64_t dtotal = 0;

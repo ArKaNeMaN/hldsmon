@@ -106,7 +106,7 @@ void test_rotation()
     check(std::strcmp(w.current_path(), p1) == 0, "current_path is day-1 file");
 
     const char* line = "{\"type\":\"server\",\"t\":1}";
-    w.write(line, std::strlen(line));
+    w.write(std::span<const char>(line, std::strlen(line)));
     w.flush();
 
     check(w.bytes_today() == std::strlen(line) + 1, "bytes_today counts line+nl");
@@ -123,7 +123,7 @@ void test_rotation()
     check(file_exists(p2), "day-2 file exists");
     check(w.bytes_today() == 0, "byte counter reset on rotation");
 
-    w.write(line, std::strlen(line));
+    w.write(std::span<const char>(line, std::strlen(line)));
     w.flush();
     check(file_exists(p1) && file_exists(p2), "both day files present");
 
@@ -164,7 +164,7 @@ void test_unavailable_dir()
     check(w.error_count() > 0, "error counted");
     check(w.current_path()[0] == '\0', "no current path");
     // Must remain callable without crashing.
-    w.write("{}", 2);
+    w.write(std::span<const char>("{}", 2));
     w.flush();
     w.maybe_rotate(kDay2);
     check(!w.enabled(), "still disabled after no-op calls");
@@ -190,7 +190,7 @@ void test_size_cap()
 
     unsigned attempts = 0;
     while (!w.size_capped() && attempts < 20000) {
-        w.write(line, len);
+        w.write(std::span<const char>(line, len));
         ++attempts;
     }
 
@@ -200,7 +200,7 @@ void test_size_cap()
 
     const uint64_t frozen = w.bytes_today();
     for (int i = 0; i < 10; ++i) {
-        w.write(line, len);
+        w.write(std::span<const char>(line, len));
     }
     check(w.bytes_today() == frozen, "further writes are no-ops");
     check(w.error_count() == 0, "no spurious errors on clean cap");
@@ -265,7 +265,7 @@ void test_prune_rotation()
     w.set_retention_days(1);
     check(w.open(dir, kDay1), "open day1 with retention 1");
     const char* line = "{\"type\":\"server\",\"t\":1}";
-    w.write(line, std::strlen(line));
+    w.write(std::span<const char>(line, std::strlen(line)));
     w.flush();
 
     w.maybe_rotate(kDay2);

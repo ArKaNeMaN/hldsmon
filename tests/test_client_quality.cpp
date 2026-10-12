@@ -121,7 +121,7 @@ static void test_serialization() {
     c.jit_max_ms = 56;
 
     char buf[4096];
-    const size_t n = write_client_json(buf, sizeof buf, c);
+    const size_t n = write_client_json(buf, c);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(has(buf, "\"jit_min_ms\":12,\"jit_avg_ms\":34,\"jit_max_ms\":56,"));
@@ -155,7 +155,7 @@ static void test_drop_line_headroom() {
     d.window_count = 64;
 
     char buf[65536];
-    const size_t n = write_drop_json(buf, sizeof buf, d);
+    const size_t n = write_drop_json(buf, d);
     CHECK(n > 0);
     CHECK(n < sizeof buf);
     CHECK(std::strlen(buf) == n);

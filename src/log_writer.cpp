@@ -157,17 +157,18 @@ bool LogWriter::open(const char* dir, double now_utc)
     return open_day(y, m, d);
 }
 
-void LogWriter::write(const char* line, size_t len)
+void LogWriter::write(std::span<const char> line)
 {
     if (!enabled_ || file_ == nullptr) {
         return;
     }
-    if (line == nullptr && len != 0) {
+    if (line.data() == nullptr && !line.empty()) {
         ++error_count_;
         return;
     }
+    const size_t len = line.size();
 
-    if (len > 0 && std::fwrite(line, 1, len, file_) != len) {
+    if (len > 0 && std::fwrite(line.data(), 1, len, file_) != len) {
         ++error_count_;
         enabled_ = false;
         return;

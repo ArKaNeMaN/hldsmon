@@ -61,7 +61,7 @@ static void test_shutdown() {
     r.t = 1.5;
     std::strcpy(r.reason, "graceful");
 
-    const size_t n = write_shutdown_json(buf, sizeof buf, r);
+    const size_t n = write_shutdown_json(buf, r);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(std::strcmp(buf, "{\"type\":\"shutdown\",\"t\":1.500,\"reason\":\"graceful\"}") == 0);
@@ -72,14 +72,14 @@ static void test_shutdown() {
     std::memset(&e, 0, sizeof e);
     e.t = 0.0;
     std::strcpy(e.reason, "a\"b");
-    const size_t m = write_shutdown_json(buf, sizeof buf, e);
+    const size_t m = write_shutdown_json(buf, e);
     CHECK(m > 0);
     CHECK(std::strcmp(buf, "{\"type\":\"shutdown\",\"t\":0.000,\"reason\":\"a\\\"b\"}") == 0);
 
     // short buffer => nothing written, no partial line.
     char tiny[8];
     std::memset(tiny, 0x7f, sizeof tiny);
-    CHECK(write_shutdown_json(tiny, sizeof tiny, r) == 0);
+    CHECK(write_shutdown_json(tiny, r) == 0);
     CHECK(static_cast<unsigned char>(tiny[0]) == 0x7f);
 }
 
@@ -90,7 +90,7 @@ static void test_crash() {
     r.t = 12.0;
     r.signal = 11;
 
-    const size_t n = write_crash_json(buf, sizeof buf, r);
+    const size_t n = write_crash_json(buf, r);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(std::strcmp(buf, "{\"type\":\"crash\",\"t\":12.000,\"signal\":11}") == 0);
@@ -98,7 +98,7 @@ static void test_crash() {
 
     char tiny[4];
     std::memset(tiny, 0x7f, sizeof tiny);
-    CHECK(write_crash_json(tiny, sizeof tiny, r) == 0);
+    CHECK(write_crash_json(tiny, r) == 0);
     CHECK(static_cast<unsigned char>(tiny[0]) == 0x7f);
 }
 
@@ -106,7 +106,7 @@ static void test_client_identity() {
     char buf[2048];
     const ClientSample c = make_identified_client();
 
-    const size_t n = write_client_json(buf, sizeof buf, c);
+    const size_t n = write_client_json(buf, c);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(has(buf, "\"type\":\"client\""));
@@ -127,7 +127,7 @@ static void test_client_identity() {
     u.t = 0.0;
     u.port = -1;
     u.userid = -1;
-    const size_t m = write_client_json(buf, sizeof buf, u);
+    const size_t m = write_client_json(buf, u);
     CHECK(m > 0);
     CHECK(has(buf, "\"port\":-1"));
     CHECK(has(buf, "\"userid\":-1"));
@@ -154,7 +154,7 @@ static void test_drop_identity() {
     d.fake = false;
     d.proxy = false;
 
-    const size_t n = write_drop_json(buf, sizeof buf, d);
+    const size_t n = write_drop_json(buf, d);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(has(buf, "\"type\":\"drop\""));
@@ -181,7 +181,7 @@ static void test_timeout_fields() {
     c.msg_flags = 1;
     c.idle_ms = 2500;
 
-    const size_t cn = write_client_json(buf, sizeof buf, c);
+    const size_t cn = write_client_json(buf, c);
     CHECK(cn > 0);
     CHECK(has(buf, "\"idle_ms\":2500"));
     CHECK(has(buf, "\"msg_flags\":1,\"idle_ms\":2500,"));
@@ -210,7 +210,7 @@ static void test_timeout_fields() {
     d.netchan.idle_ms = 2500;
     d.netchan.sv_timeout = 60.0f;
 
-    const size_t n = write_drop_json(buf, sizeof buf, d);
+    const size_t n = write_drop_json(buf, d);
     CHECK(n > 0);
     const char* expect =
         "\"netchan\":{\"in_seq\":12345,\"in_ack\":12300,\"in_rel_ack\":1,"

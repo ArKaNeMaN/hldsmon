@@ -14,7 +14,8 @@ namespace hldsmon {
 struct CounterDelta {
     // Returns (cur - prev) modulo 2^32. If the counter did not wrap this is the
     // plain non-negative difference; if it wrapped, the wrapped distance.
-    static uint32_t compute_delta(uint32_t prev, uint32_t cur) noexcept {
+    [[nodiscard]] static constexpr uint32_t compute_delta(uint32_t prev,
+                                                          uint32_t cur) noexcept {
         return cur >= prev
                    ? (cur - prev)
                    : (UINT32_MAX - prev) + cur + 1u;

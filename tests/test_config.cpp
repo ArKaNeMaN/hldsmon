@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 static int g_fail = 0;
 
@@ -61,9 +62,9 @@ int main() {
     {
         uint16_t acc = 0;
         const uint16_t bits[] = {
-            kCfgSysTicrate, kCfgHostFramerate, kCfgSvTimeout,
-            kCfgSvMaxrate, kCfgSvMinrate, kCfgSvMaxupdaterate,
-            kCfgSvMinupdaterate, kCfgSvMaxcmdrate, kCfgSvMincmdrate,
+            std::to_underlying(ConfigPresent::kCfgSysTicrate), std::to_underlying(ConfigPresent::kCfgHostFramerate), std::to_underlying(ConfigPresent::kCfgSvTimeout),
+            std::to_underlying(ConfigPresent::kCfgSvMaxrate), std::to_underlying(ConfigPresent::kCfgSvMinrate), std::to_underlying(ConfigPresent::kCfgSvMaxupdaterate),
+            std::to_underlying(ConfigPresent::kCfgSvMinupdaterate), std::to_underlying(ConfigPresent::kCfgSvMaxcmdrate), std::to_underlying(ConfigPresent::kCfgSvMincmdrate),
         };
         for (uint16_t bit : bits) {
             CHECK(bit != 0);
@@ -87,10 +88,10 @@ int main() {
         CHECK(config_changed(full, make_full(20.0f)));
 
         // Presence mask alone is a change, even when the value slots agree.
-        a.present = kCfgSvTimeout;
+        a.present = std::to_underlying(ConfigPresent::kCfgSvTimeout);
         a.sv_timeout = 0.0f;
         CHECK(config_changed(a, b));
-        b.present = kCfgSvTimeout;
+        b.present = std::to_underlying(ConfigPresent::kCfgSvTimeout);
         CHECK(!config_changed(a, b));
 
         // Every tracked value participates in the comparison.
@@ -102,7 +103,7 @@ int main() {
 
         // A stale value behind a cleared presence bit still counts as a change.
         ConfigSnapshot stale = full;
-        stale.present &= static_cast<uint16_t>(~kCfgSvTimeout);
+        stale.present &= static_cast<uint16_t>(~ConfigPresent::kCfgSvTimeout);
         CHECK(config_changed(full, stale));
     }
 

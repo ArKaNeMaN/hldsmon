@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <span>
+#include <utility>
 
 static int g_fail = 0;
 
@@ -133,7 +135,7 @@ int main() {
     // ---------------- client ----------------
     {
         const ClientSample c = make_client(7, 2.0);
-        const size_t n = write_client_json(buf, sizeof buf, c);
+        const size_t n = write_client_json(buf, c);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(buf[0] == '{');
@@ -175,7 +177,7 @@ int main() {
     // ---------------- server ----------------
     {
         const ServerSample s = make_server();
-        const size_t n = write_server_json(buf, sizeof buf, s);
+        const size_t n = write_server_json(buf, s);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(has(buf, "\"type\":\"server\""));
@@ -203,7 +205,7 @@ int main() {
     // ---------------- config (all fields present) ----------------
     {
         const ConfigRecord r = make_config(0x1FFu);
-        const size_t n = write_config_json(buf, sizeof buf, r);
+        const size_t n = write_config_json(buf, r);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(buf[0] == '{');
@@ -229,8 +231,8 @@ int main() {
 
     // ---------------- config (absent cvars => literal null) ----------------
     {
-        const ConfigRecord r = make_config(kCfgSvTimeout | kCfgSvMaxrate);
-        const size_t n = write_config_json(buf, sizeof buf, r);
+        const ConfigRecord r = make_config(std::to_underlying(ConfigPresent::kCfgSvTimeout | ConfigPresent::kCfgSvMaxrate));
+        const size_t n = write_config_json(buf, r);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(has(buf, "\"sys_ticrate\":null"));
@@ -260,8 +262,8 @@ int main() {
         r.io_write_bytes = 8;
         r.disk_bavail_mb = 12345;
         r.present_mask = 0x03FFu;
-        r.caveat_mask = kCaveatUdpNetns | kCaveatNetDev;
-        const size_t n = write_host_json(buf, sizeof buf, r);
+        r.caveat_mask = std::to_underlying(HostCaveat::kCaveatUdpNetns | HostCaveat::kCaveatNetDev);
+        const size_t n = write_host_json(buf, r);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(buf[0] == '{');
@@ -283,9 +285,9 @@ int main() {
         std::memset(&r, 0, sizeof r);
         r.t = 1.0;
         r.disk_bavail_mb = 12345;
-        r.present_mask = kHostDiskBavailMb;  // only the instantaneous field
-        r.caveat_mask = kCaveatUdpNetns;     // caveated != null (M4)
-        const size_t n = write_host_json(buf, sizeof buf, r);
+        r.present_mask = std::to_underlying(HostPresent::kHostDiskBavailMb);  // only the instantaneous field
+        r.caveat_mask = std::to_underlying(HostCaveat::kCaveatUdpNetns);     // caveated != null (M4)
+        const size_t n = write_host_json(buf, r);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(has(buf, "\"udp_rcvbuf_errors\":null"));
@@ -307,9 +309,9 @@ int main() {
         std::memset(&r, 0, sizeof r);
         r.t = 1.0;
         r.udp_rcvbuf_errors = 7;
-        r.present_mask = kHostUdpRcvbufErrors;
-        r.caveat_mask = kCaveatUdpNetns;
-        const size_t n = write_host_json(buf, sizeof buf, r);
+        r.present_mask = std::to_underlying(HostPresent::kHostUdpRcvbufErrors);
+        r.caveat_mask = std::to_underlying(HostCaveat::kCaveatUdpNetns);
+        const size_t n = write_host_json(buf, r);
         CHECK(n > 0);
         CHECK(has(buf, "\"udp_rcvbuf_errors\":7,\"udp_in_errors\":null"));
         CHECK(has(buf, "\"present_mask\":1,\"caveat_mask\":1"));
@@ -363,7 +365,7 @@ int main() {
         d.neighbors.avg_ping = 45.0f;
         d.neighbors.max_loss = 4.0f;
 
-        const size_t n = write_drop_json(buf, sizeof buf, d);
+        const size_t n = write_drop_json(buf, d);
         CHECK(n > 0);
         CHECK(std::strlen(buf) == n);
         CHECK(buf[0] == '{');
@@ -395,7 +397,7 @@ int main() {
         std::strcpy(r.steamid, "STEAM_0:0:1");
         std::strcpy(r.stage, "SV_CheckUserInfo:password");
         std::strcpy(r.detail, "bad password");
-        const size_t n = write_reject_json(buf, sizeof buf, r);
+        const size_t n = write_reject_json(buf, r);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"reject\""));
         CHECK(has(buf, "\"ip\":\"1.2.3.4\""));
@@ -412,7 +414,7 @@ int main() {
         std::strcpy(c.ip, "10.0.0.9");
         std::strcpy(c.steamid, "STEAM_0:1:42");
         std::strcpy(c.name, "Bob");
-        const size_t n = write_connect_json(buf, sizeof buf, c);
+        const size_t n = write_connect_json(buf, c);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"connect\""));
         CHECK(has(buf, "\"id\":5"));
@@ -428,7 +430,7 @@ int main() {
         r.id = 1;
         r.cmd = 8;
         r.count = 42;
-        const size_t n = write_netcmd_json(buf, sizeof buf, r);
+        const size_t n = write_netcmd_json(buf, r);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"netcmd\""));
         CHECK(has(buf, "\"id\":1"));
@@ -444,7 +446,7 @@ int main() {
         r.count = 5;
         std::strcpy(r.reason, "Timed out");
         std::strcpy(r.category, "timeout");
-        const size_t n = write_massdrop_json(buf, sizeof buf, r);
+        const size_t n = write_massdrop_json(buf, r);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"massdrop\""));
         CHECK(has(buf, "\"window_s\":10"));
@@ -471,7 +473,7 @@ int main() {
         p.top_ips[1].count = 20;
         std::strcpy(p.top_ips[2].ip, "7.7.7.7");
         p.top_ips[2].count = 10;
-        const size_t n = write_packet_json(buf, sizeof buf, p);
+        const size_t n = write_packet_json(buf, p);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"packet\""));
         CHECK(has(buf, "\"pps\":1000"));
@@ -489,7 +491,7 @@ int main() {
         HitchRecord h;
         std::memset(&h, 0, sizeof h);
         h.duration_ms = 120;
-        const size_t n = write_hitch_json(buf, sizeof buf, h);
+        const size_t n = write_hitch_json(buf, h);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"hitch\""));
         CHECK(has(buf, "\"duration_ms\":120"));
@@ -500,7 +502,7 @@ int main() {
         MapChangeRecord m;
         std::memset(&m, 0, sizeof m);
         std::strcpy(m.map, "de_nuke");
-        const size_t n = write_mapchange_json(buf, sizeof buf, m);
+        const size_t n = write_mapchange_json(buf, m);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"mapchange\""));
         CHECK(has(buf, "\"map\":\"de_nuke\""));
@@ -512,7 +514,7 @@ int main() {
         std::memset(&v, 0, sizeof v);
         v.id = 3;
         v.last_voice_time = 12.5f;
-        const size_t n = write_voice_json(buf, sizeof buf, v);
+        const size_t n = write_voice_json(buf, v);
         CHECK(n > 0);
         CHECK(has(buf, "\"type\":\"voice\""));
         CHECK(has(buf, "\"id\":3"));
@@ -523,13 +525,13 @@ int main() {
     {
         char esc[64];
         const char* raw = "a\"b\\c\n\t\x01";
-        const size_t m = json_escape(raw, esc, sizeof esc);
+        const size_t m = json_escape(raw, esc);
         CHECK(m == 17u);
         CHECK(std::strcmp(esc, "a\\\"b\\\\c\\n\\t\\u0001") == 0);
         // escape buffer too small => 0 and untouched
         char tiny[4];
         std::memset(tiny, 0x7f, sizeof tiny);
-        CHECK(json_escape("abcd", tiny, sizeof tiny) == 0);
+        CHECK(json_escape("abcd", tiny) == 0);
         CHECK(static_cast<unsigned char>(tiny[0]) == 0x7f);
     }
 
@@ -541,7 +543,7 @@ int main() {
         d.id = 1;
         std::strcpy(d.reason, "quote \" backslash \\ nl\n ctrl\x01");
         d.window_count = 0;
-        const size_t n = write_drop_json(buf, sizeof buf, d);
+        const size_t n = write_drop_json(buf, d);
         CHECK(n > 0);
         CHECK(has(buf, "quote \\\" backslash \\\\ nl\\n ctrl\\u0001"));
     }
@@ -557,13 +559,13 @@ int main() {
         for (uint8_t i = 0; i < 2; ++i) d.window[i] = make_client(i, 1.0);
 
         char big[8192];
-        const size_t need = write_drop_json(big, sizeof big, d);
+        const size_t need = write_drop_json(big, d);
         CHECK(need > 0);
 
         // cap == need is one byte short (no room for NUL): reject, write nothing.
         char sink[8192];
         std::memset(sink, 0x7f, sizeof sink);
-        CHECK(write_drop_json(sink, need, d) == 0);
+        CHECK(write_drop_json(std::span<char>(sink, need), d) == 0);
         bool touched = false;
         for (size_t i = 0; i < sizeof sink; ++i) {
             if (static_cast<unsigned char>(sink[i]) != 0x7f) {
@@ -576,22 +578,22 @@ int main() {
         // cap == 0: reject, write nothing.
         char zero[8];
         std::memset(zero, 0x7f, sizeof zero);
-        CHECK(write_drop_json(zero, 0, d) == 0);
+        CHECK(write_drop_json(std::span<char>(zero, 0), d) == 0);
 
         // exact fit (need + NUL) succeeds.
         char exact[8192];
-        const size_t got = write_drop_json(exact, need + 1, d);
+        const size_t got = write_drop_json(std::span<char>(exact, need + 1), d);
         CHECK(got == need);
         CHECK(exact[need] == '\0');
 
         // client writer also rejects a short buffer.
         const ClientSample c = make_client(1, 1.0);
         char cbig[1024];
-        const size_t cneed = write_client_json(cbig, sizeof cbig, c);
+        const size_t cneed = write_client_json(cbig, c);
         CHECK(cneed > 0);
         char csink[1024];
         std::memset(csink, 0x7f, sizeof csink);
-        CHECK(write_client_json(csink, cneed, c) == 0);
+        CHECK(write_client_json(std::span<char>(csink, cneed), c) == 0);
         CHECK(static_cast<unsigned char>(csink[0]) == 0x7f);
 
         // host writer rejects a short buffer too.
@@ -599,11 +601,11 @@ int main() {
         std::memset(&h, 0, sizeof h);
         h.present_mask = 0x03FFu;
         char hbig[1024];
-        const size_t hneed = write_host_json(hbig, sizeof hbig, h);
+        const size_t hneed = write_host_json(hbig, h);
         CHECK(hneed > 0);
         char hsink[1024];
         std::memset(hsink, 0x7f, sizeof hsink);
-        CHECK(write_host_json(hsink, hneed, h) == 0);
+        CHECK(write_host_json(std::span<char>(hsink, hneed), h) == 0);
         CHECK(static_cast<unsigned char>(hsink[0]) == 0x7f);
     }
 

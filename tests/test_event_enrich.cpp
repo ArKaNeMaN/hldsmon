@@ -41,40 +41,40 @@ static void check_layout_constants() {
 static void test_detector_match() {
     char buf[32];
 
-    classify_detector("Kicked for move commands flooding (burst)", buf, sizeof buf);
+    classify_detector("Kicked for move commands flooding (burst)", buf);
     CHECK(std::strcmp(buf, "movecmd") == 0);
-    classify_detector("Banned for move commands flooding (Avg)", buf, sizeof buf);
+    classify_detector("Banned for move commands flooding (Avg)", buf);
     CHECK(std::strcmp(buf, "movecmd") == 0);
 
-    classify_detector("Kicked for string commands flooding (burst)", buf, sizeof buf);
+    classify_detector("Kicked for string commands flooding (burst)", buf);
     CHECK(std::strcmp(buf, "stringcmd") == 0);
-    classify_detector("Banned for string commands flooding (Avg)", buf, sizeof buf);
+    classify_detector("Banned for string commands flooding (Avg)", buf);
     CHECK(std::strcmp(buf, "stringcmd") == 0);
 
-    classify_detector("Kicked for dlfile flooding", buf, sizeof buf);
+    classify_detector("Kicked for dlfile flooding", buf);
     CHECK(std::strcmp(buf, "dlfile") == 0);
-    classify_detector("Banned for dlfile flooding", buf, sizeof buf);
+    classify_detector("Banned for dlfile flooding", buf);
     CHECK(std::strcmp(buf, "dlfile") == 0);
 
-    classify_detector("Kicked for speedhack", buf, sizeof buf);
+    classify_detector("Kicked for speedhack", buf);
     CHECK(std::strcmp(buf, "speedhack") == 0);
-    classify_detector("Banned for speedhack", buf, sizeof buf);
+    classify_detector("Banned for speedhack", buf);
     CHECK(std::strcmp(buf, "speedhack") == 0);
 
     // Miss => empty; the drop record itself is unaffected (best-effort).
-    classify_detector("Reliable channel overflowed", buf, sizeof buf);
+    classify_detector("Reliable channel overflowed", buf);
     CHECK(buf[0] == '\0');
-    classify_detector("Timed out", buf, sizeof buf);
+    classify_detector("Timed out", buf);
     CHECK(buf[0] == '\0');
-    classify_detector(nullptr, buf, sizeof buf);
+    classify_detector(nullptr, buf);
     CHECK(buf[0] == '\0');
-    classify_detector("Steam_NotifyClientDisconnect", buf, sizeof buf);
+    classify_detector("Steam_NotifyClientDisconnect", buf);
     CHECK(buf[0] == '\0');
 
     // Bounded copy never runs past the small buffer.
     char tiny[5];
     std::memset(tiny, 0x7f, sizeof tiny);
-    classify_detector("Kicked for speedhack", tiny, sizeof tiny);
+    classify_detector("Kicked for speedhack", tiny);
     CHECK(std::strcmp(tiny, "spee") == 0);
 }
 
@@ -126,13 +126,13 @@ static void test_server_churn_json() {
     std::memset(&s, 0, sizeof s);
     s.t = 3.0;
     s.edicts = 245;
-    size_t n = write_server_json(buf, sizeof buf, s);
+    size_t n = write_server_json(buf, s);
     CHECK(n > 0);
     CHECK(has(buf, "\"edicts\":245,\"edicts_churn\":null,\"map\":\"\""));
 
     s.edicts_churn = -7;
     s.edicts_churn_present = 1;
-    n = write_server_json(buf, sizeof buf, s);
+    n = write_server_json(buf, s);
     CHECK(n > 0);
     CHECK(has(buf, "\"edicts\":245,\"edicts_churn\":-7,"));
 }
@@ -142,7 +142,7 @@ static void test_packet_empty_top_ips() {
     PacketStats p;
     std::memset(&p, 0, sizeof p);
     p.t = 1.0;
-    const size_t n = write_packet_json(buf, sizeof buf, p);
+    const size_t n = write_packet_json(buf, p);
     CHECK(n > 0);
     CHECK(has(buf, "\"top_ip\":\"\",\"top_ips\":[{\"ip\":\"\",\"count\":0},"
                    "{\"ip\":\"\",\"count\":0},{\"ip\":\"\",\"count\":0}]"));
@@ -156,7 +156,7 @@ static void test_drop_empty_detector() {
     std::strcpy(d.reason, "Timed out");
     std::strcpy(d.category, "timeout");
     std::strcpy(d.observed_via, "sv_dropclient");
-    const size_t n = write_drop_json(buf, sizeof buf, d);
+    const size_t n = write_drop_json(buf, d);
     CHECK(n > 0);
     CHECK(has(buf, "\"observed_via\":\"sv_dropclient\",\"detector\":\"\","));
 }
@@ -168,7 +168,7 @@ static void test_degraded_retention_json() {
     std::memset(&d, 0, sizeof d);
     d.t = 1.5;
     d.error_count = 7;
-    size_t n = write_degraded_json(buf, sizeof buf, d);
+    size_t n = write_degraded_json(buf, d);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(std::strcmp(buf, "{\"type\":\"degraded\",\"t\":1.500,\"error_count\":7}") == 0);
@@ -177,15 +177,15 @@ static void test_degraded_retention_json() {
     std::memset(&r, 0, sizeof r);
     r.t = 2.0;
     r.removed = 3;
-    n = write_retention_json(buf, sizeof buf, r);
+    n = write_retention_json(buf, r);
     CHECK(n > 0);
     CHECK(std::strcmp(buf, "{\"type\":\"retention\",\"t\":2.000,\"removed\":3}") == 0);
 
     char tiny[8];
     std::memset(tiny, 0x7f, sizeof tiny);
-    CHECK(write_degraded_json(tiny, sizeof tiny, d) == 0);
+    CHECK(write_degraded_json(tiny, d) == 0);
     CHECK(static_cast<unsigned char>(tiny[0]) == 0x7f);
-    CHECK(write_retention_json(tiny, sizeof tiny, r) == 0);
+    CHECK(write_retention_json(tiny, r) == 0);
 }
 
 int main() {

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <span>
 
 #ifndef HLDSMON_LOGWRITER_PATH_MAX
 #define HLDSMON_LOGWRITER_PATH_MAX 4096
@@ -47,7 +48,7 @@ public:
     bool open(const char* dir, double now_utc);
 
     // Append `line` followed by '\n'. No-op if not enabled. Errors counted.
-    void write(const char* line, size_t len);
+    void write(std::span<const char> line);
 
     // fflush the current file (no-op if none).
     void flush();

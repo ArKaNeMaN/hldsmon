@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "modnet.h"
 
@@ -70,9 +71,9 @@ struct ModnetEmitItem {
     double         dt;
 };
 
-// Fills up to `cap` items and advances the stored per-object baselines.
+// Fills up to out.size() items and advances the stored per-object baselines.
 // Returns the number of items written.
-size_t modnet_got_collect_emit(ModnetEmitItem* out, size_t cap, double now) noexcept;
+size_t modnet_got_collect_emit(std::span<ModnetEmitItem> out, double now) noexcept;
 
 } // namespace hldsmon
 

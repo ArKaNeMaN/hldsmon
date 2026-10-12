@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <utility>
 
 #include "metrics.h"
 
@@ -26,7 +28,10 @@ namespace hldsmon {
 constexpr size_t kHostReadCap = 16384;
 
 // ---- `present` mask bits — one per emitted `host` field (HM-3) ----
-enum HostPresent : uint16_t {
+// Scoped bitmask: combine the bits with the constexpr operators below and
+// convert to the uint16_t storage fields with std::to_underlying at the
+// integer boundary.
+enum class HostPresent : uint16_t {
     kHostUdpRcvbufErrors = 1u << 0,  // /proc/net/snmp  Udp RcvbufErrors
     kHostUdpInErrors     = 1u << 1,  // /proc/net/snmp  Udp InErrors
     kHostUdpInCsumErrors = 1u << 2,  // /proc/net/snmp  Udp InCsumErrors (HM-6)
@@ -39,8 +44,23 @@ enum HostPresent : uint16_t {
     kHostDiskBavailMb    = 1u << 9,  // statvfs         f_bavail, MiB
 };
 
+constexpr HostPresent operator|(HostPresent a, HostPresent b) noexcept {
+    return static_cast<HostPresent>(std::to_underlying(a) |
+                                    std::to_underlying(b));
+}
+
+constexpr HostPresent operator&(HostPresent a, HostPresent b) noexcept {
+    return static_cast<HostPresent>(std::to_underlying(a) &
+                                    std::to_underlying(b));
+}
+
+constexpr HostPresent& operator|=(HostPresent& a, HostPresent b) noexcept {
+    a = a | b;
+    return a;
+}
+
 // ---- `caveat` mask bits — per source / uncertainty (HM-3, M4) ----
-enum HostCaveat : uint16_t {
+enum class HostCaveat : uint16_t {
     kCaveatUdpNetns  = 1u << 0,  // /proc/net/*: netns may be shared (host/neighbour data)
     kCaveatNetDev    = 1u << 1,  // NIC counters are driver-dependent: 0 = "not reported" (M2)
     kCaveatSteal     = 1u << 2,  // steal zeroed by lxcfs/OpenVZ, not authoritative
@@ -48,6 +68,21 @@ enum HostCaveat : uint16_t {
     kCaveatDisk      = 1u << 4,  // statvfs: thin provisioning / quotas overestimate
     kCaveatTruncated = 1u << 5,  // a source read was truncated this tick (L3)
 };
+
+constexpr HostCaveat operator|(HostCaveat a, HostCaveat b) noexcept {
+    return static_cast<HostCaveat>(std::to_underlying(a) |
+                                   std::to_underlying(b));
+}
+
+constexpr HostCaveat operator&(HostCaveat a, HostCaveat b) noexcept {
+    return static_cast<HostCaveat>(std::to_underlying(a) &
+                                   std::to_underlying(b));
+}
+
+constexpr HostCaveat& operator|=(HostCaveat& a, HostCaveat b) noexcept {
+    a = a | b;
+    return a;
+}
 
 // One tick's cumulative snapshot: raw counters (zero when a field is absent —
 // the `present` bit says which were actually found) plus the internal
@@ -79,7 +114,7 @@ void parse_self_io(const char* buf, HostSnapshot& out) noexcept;
 // reset (netns recreation / process restart) or wrapped beyond a sane horizon:
 // false, *out untouched — the caller re-baselines and emits null instead of a
 // giant unsigned delta.
-bool delta_u64(uint64_t prev, uint64_t cur, uint64_t* out) noexcept;
+[[nodiscard]] bool delta_u64(uint64_t prev, uint64_t cur, uint64_t* out) noexcept;
 
 // ---- environment detection (design §23.3 п.2, H1) ----
 // Tri-state probe result. kUnknown means "could not determine" and must be
@@ -109,12 +144,12 @@ EnvVerdict detect_env(const EnvInputs& in) noexcept;
 EnvInputs probe_env() noexcept;
 
 // ---- bounded POSIX I/O ----
-// Reads up to cap-1 bytes of `path` into `buf` (NUL-terminated), retrying
-// EINTR and draining to EOF or a full buffer. True on success with *out_len
-// set (bytes stored, excluding NUL) and *out_truncated = more data remained
-// (partial read => caveated, L3). False on open/read error (metric
+// Reads up to buf.size()-1 bytes of `path` into `buf` (NUL-terminated),
+// retrying EINTR and draining to EOF or a full buffer. True on success with
+// *out_len set (bytes stored, excluding NUL) and *out_truncated = more data
+// remained (partial read => caveated, L3). False on open/read error (metric
 // unavailable, QAS-H3) with *out_len = 0.
-bool read_file(const char* path, char* buf, size_t cap, size_t* out_len,
+bool read_file(const char* path, std::span<char> buf, size_t* out_len,
                bool* out_truncated) noexcept;
 
 // statvfs(3): f_bavail * f_frsize in MiB for `dir` (M5 — the log directory,

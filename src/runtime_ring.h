@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <new>
+#include <span>
 
 namespace hldsmon {
 
@@ -66,9 +67,9 @@ public:
     const T& at(size_t i) const { return buf_[physical(i)]; }
     T& at(size_t i) { return buf_[physical(i)]; }
 
-    // Copy up to n newest elements into out[], oldest-first (newest last).
+    // Copy up to n newest elements into out, oldest-first (newest last).
     // Returns the number written (min(n, size())). No allocation.
-    size_t last(size_t n, T* out) const {
+    size_t last(size_t n, std::span<T> out) const {
         if (n > count_) {
             n = count_;
         }

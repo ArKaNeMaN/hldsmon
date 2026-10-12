@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 static int g_fail = 0;
 
@@ -45,9 +46,9 @@ static void test_parse_snmp_udp_old_kernel() {
     parse_snmp_udp(kFile, s);
     CHECK(s.udp_in_errors == 5);
     CHECK(s.udp_rcvbuf_errors == 3);
-    CHECK((s.present & kHostUdpInErrors) != 0);
-    CHECK((s.present & kHostUdpRcvbufErrors) != 0);
-    CHECK((s.present & kHostUdpInCsumErrors) == 0);  // absent => flag, not 0
+    CHECK((s.present & std::to_underlying(HostPresent::kHostUdpInErrors)) != 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostUdpRcvbufErrors)) != 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostUdpInCsumErrors)) == 0);  // absent => flag, not 0
 }
 
 static void test_parse_snmp_udp_modern_and_reordered() {
@@ -59,9 +60,9 @@ static void test_parse_snmp_udp_modern_and_reordered() {
     CHECK(s.udp_in_errors == 42);
     CHECK(s.udp_rcvbuf_errors == 9);
     CHECK(s.udp_in_csum_errors == 4);
-    CHECK((s.present & (kHostUdpInErrors | kHostUdpRcvbufErrors |
-                        kHostUdpInCsumErrors)) ==
-          (kHostUdpInErrors | kHostUdpRcvbufErrors | kHostUdpInCsumErrors));
+    CHECK((s.present & (std::to_underlying(HostPresent::kHostUdpInErrors | HostPresent::kHostUdpRcvbufErrors) |
+                        std::to_underlying(HostPresent::kHostUdpInCsumErrors))) ==
+          (std::to_underlying(HostPresent::kHostUdpInErrors | HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInCsumErrors)));
 }
 
 static void test_parse_snmp_udp_no_section() {
@@ -87,9 +88,9 @@ static void test_parse_net_dev_real_header() {
     HostSnapshot s = empty_snapshot();
     parse_net_dev(kFile, s);
     CHECK(s.net_rx_dropped == 4);  // summed over interfaces
-    CHECK((s.present & kHostNetRxDropped) != 0);
-    CHECK((s.present & kHostNetRxMissed) == 0);
-    CHECK((s.present & kHostNetRxOverruns) == 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostNetRxDropped)) != 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostNetRxMissed)) == 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostNetRxOverruns)) == 0);
 }
 
 static void test_parse_net_dev_extended_header() {
@@ -104,9 +105,9 @@ static void test_parse_net_dev_extended_header() {
     CHECK(s.net_rx_dropped == 7);
     CHECK(s.net_rx_missed == 9);
     CHECK(s.net_rx_overruns == 11);
-    CHECK((s.present & (kHostNetRxDropped | kHostNetRxMissed |
-                        kHostNetRxOverruns)) ==
-          (kHostNetRxDropped | kHostNetRxMissed | kHostNetRxOverruns));
+    CHECK((s.present & (std::to_underlying(HostPresent::kHostNetRxDropped | HostPresent::kHostNetRxMissed) |
+                        std::to_underlying(HostPresent::kHostNetRxOverruns))) ==
+          (std::to_underlying(HostPresent::kHostNetRxDropped | HostPresent::kHostNetRxMissed | HostPresent::kHostNetRxOverruns)));
 }
 
 static void test_parse_net_dev_without_header() {
@@ -124,7 +125,7 @@ static void test_parse_stat() {
         "intr 123 0\n";
     HostSnapshot s = empty_snapshot();
     parse_stat(kFile, s);
-    CHECK((s.present & kHostStealPct) != 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostStealPct)) != 0);
     CHECK(s.stat_steal_jiffies == 7);
     CHECK(s.stat_total_jiffies == 100 + 2 + 50 + 1000 + 10 + 0 + 5 + 7);
 }
@@ -132,7 +133,7 @@ static void test_parse_stat() {
 static void test_parse_stat_without_steal() {
     HostSnapshot s = empty_snapshot();
     parse_stat("cpu 100 2 50 1000 10 0 5\n", s);
-    CHECK((s.present & kHostStealPct) == 0);
+    CHECK((s.present & std::to_underlying(HostPresent::kHostStealPct)) == 0);
 }
 
 static void test_parse_self_io() {
@@ -146,12 +147,12 @@ static void test_parse_self_io() {
     parse_self_io(kFile, s);
     CHECK(s.io_read_bytes == 4096);
     CHECK(s.io_write_bytes == 8192);
-    CHECK((s.present & (kHostIoReadBytes | kHostIoWriteBytes)) ==
-          (kHostIoReadBytes | kHostIoWriteBytes));
+    CHECK((s.present & (std::to_underlying(HostPresent::kHostIoReadBytes | HostPresent::kHostIoWriteBytes))) ==
+          (std::to_underlying(HostPresent::kHostIoReadBytes | HostPresent::kHostIoWriteBytes)));
 
     HostSnapshot s2 = empty_snapshot();
     parse_self_io("rchar: 1\nwchar: 2\n", s2);
-    CHECK((s2.present & (kHostIoReadBytes | kHostIoWriteBytes)) == 0);
+    CHECK((s2.present & (std::to_underlying(HostPresent::kHostIoReadBytes | HostPresent::kHostIoWriteBytes))) == 0);
 }
 
 // ---- HM-1: reset/wrap-safe delta ----------------------------------------
@@ -183,11 +184,11 @@ static void test_detect_env_matrix() {
     host.netns_private = Tri::kUnknown;
     EnvVerdict v = detect_env(host);
     CHECK(v.netns_authoritative);
-    CHECK((v.caveat & kCaveatUdpNetns) == 0);
-    CHECK((v.caveat & kCaveatSteal) == 0);
-    CHECK((v.caveat & kCaveatNetDev) != 0);  // M2: always
-    CHECK((v.caveat & kCaveatIo) != 0);
-    CHECK((v.caveat & kCaveatDisk) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatUdpNetns)) == 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatSteal)) == 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatNetDev)) != 0);  // M2: always
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatIo)) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatDisk)) != 0);
 
     // Container with a positively confirmed private netns: authoritative netns,
     // but steal stays caveated (lxcfs/OpenVZ zero it).
@@ -196,8 +197,8 @@ static void test_detect_env_matrix() {
     container_private.netns_private = Tri::kYes;
     v = detect_env(container_private);
     CHECK(v.netns_authoritative);
-    CHECK((v.caveat & kCaveatUdpNetns) == 0);
-    CHECK((v.caveat & kCaveatSteal) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatUdpNetns)) == 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatSteal)) != 0);
 
     // Container confirmed shared netns => caveated (QAS-H2).
     EnvInputs container_shared;
@@ -205,8 +206,8 @@ static void test_detect_env_matrix() {
     container_shared.netns_private = Tri::kNo;
     v = detect_env(container_shared);
     CHECK(!v.netns_authoritative);
-    CHECK((v.caveat & kCaveatUdpNetns) != 0);
-    CHECK((v.caveat & kCaveatSteal) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatUdpNetns)) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatSteal)) != 0);
 
     // Unreadable /proc/1/ns/net (EACCES) => unknown => caveated (QAS-H8).
     EnvInputs container_unknown;
@@ -214,7 +215,7 @@ static void test_detect_env_matrix() {
     container_unknown.netns_private = Tri::kUnknown;
     v = detect_env(container_unknown);
     CHECK(!v.netns_authoritative);
-    CHECK((v.caveat & kCaveatUdpNetns) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatUdpNetns)) != 0);
 
     // Unknown containerization is never treated as health.
     EnvInputs all_unknown;
@@ -222,8 +223,8 @@ static void test_detect_env_matrix() {
     all_unknown.netns_private = Tri::kUnknown;
     v = detect_env(all_unknown);
     CHECK(!v.netns_authoritative);
-    CHECK((v.caveat & kCaveatUdpNetns) != 0);
-    CHECK((v.caveat & kCaveatSteal) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatUdpNetns)) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatSteal)) != 0);
 }
 
 static void test_probe_env_smoke() {
@@ -232,9 +233,9 @@ static void test_probe_env_smoke() {
     CHECK(in.container == Tri::kNo || in.container == Tri::kYes ||
           in.container == Tri::kUnknown);
     const EnvVerdict v = detect_env(in);
-    CHECK((v.caveat & kCaveatNetDev) != 0);
-    CHECK((v.caveat & kCaveatIo) != 0);
-    CHECK((v.caveat & kCaveatDisk) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatNetDev)) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatIo)) != 0);
+    CHECK((v.caveat & std::to_underlying(HostCaveat::kCaveatDisk)) != 0);
 }
 
 // ---- QAS-H3: bounded reader and statvfs --------------------------------
@@ -243,14 +244,14 @@ static void test_read_file() {
     char buf[512];
     size_t len = 123;
     bool truncated = true;
-    CHECK(!read_file("/nonexistent/hldsmon/file", buf, sizeof buf, &len,
+    CHECK(!read_file("/nonexistent/hldsmon/file", buf, &len,
                      &truncated));
     CHECK(len == 0);
     CHECK(!truncated);
 
     len = 0;
     truncated = true;
-    CHECK(read_file("/proc/self/io", buf, sizeof buf, &len, &truncated));
+    CHECK(read_file("/proc/self/io", buf, &len, &truncated));
     CHECK(len > 0);
     CHECK(!truncated);
     CHECK(buf[len] == '\0');
@@ -259,14 +260,14 @@ static void test_read_file() {
     char tiny[8];
     len = 0;
     truncated = false;
-    CHECK(read_file("/proc/self/io", tiny, sizeof tiny, &len, &truncated));
+    CHECK(read_file("/proc/self/io", tiny, &len, &truncated));
     CHECK(len == sizeof tiny - 1);
     CHECK(truncated);
     CHECK(tiny[len] == '\0');
 
     // A directory opens but read() fails => unavailable, not a crash.
     len = 99;
-    CHECK(!read_file(".", buf, sizeof buf, &len, &truncated));
+    CHECK(!read_file(".", buf, &len, &truncated));
     CHECK(len == 0);
 }
 
@@ -281,8 +282,8 @@ static void test_statvfs_bavail() {
 
 static void test_build_record_first_sample_is_null() {
     HostSnapshot cur = empty_snapshot();
-    cur.present = kHostUdpRcvbufErrors | kHostUdpInErrors | kHostStealPct |
-                  kHostDiskBavailMb;
+    cur.present = std::to_underlying(HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInErrors | HostPresent::kHostStealPct) |
+                  std::to_underlying(HostPresent::kHostDiskBavailMb);
     cur.udp_rcvbuf_errors = 10;
     cur.udp_in_errors = 100;
     cur.stat_steal_jiffies = 1;
@@ -291,25 +292,25 @@ static void test_build_record_first_sample_is_null() {
 
     const HostSnapshot prev = empty_snapshot();
     HostRecord r;
-    build_host_record(prev, /*has_prev=*/false, cur, kCaveatUdpNetns, false,
+    build_host_record(prev, /*has_prev=*/false, cur, std::to_underlying(HostCaveat::kCaveatUdpNetns), false,
                       1755000000.0, r);
     CHECK(r.t == 1755000000.0);
     // First sample: every Δ is unknown => absent (null), not zero.
-    CHECK(r.present_mask == kHostDiskBavailMb);
+    CHECK(r.present_mask == std::to_underlying(HostPresent::kHostDiskBavailMb));
     CHECK(r.udp_rcvbuf_errors == 0);
     CHECK(r.udp_in_errors == 0);
-    CHECK((r.present_mask & kHostUdpRcvbufErrors) == 0);
-    CHECK((r.present_mask & kHostStealPct) == 0);
-    CHECK((r.present_mask & kHostDiskBavailMb) != 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostUdpRcvbufErrors)) == 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostStealPct)) == 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostDiskBavailMb)) != 0);
     CHECK(r.disk_bavail_mb == 12345);
-    CHECK(r.caveat_mask == kCaveatUdpNetns);
+    CHECK(r.caveat_mask == std::to_underlying(HostCaveat::kCaveatUdpNetns));
 }
 
 static void test_build_record_deltas_and_steal_pct() {
     HostSnapshot prev = empty_snapshot();
-    prev.present = kHostUdpRcvbufErrors | kHostUdpInErrors | kHostNetRxDropped |
-                   kHostIoReadBytes | kHostIoWriteBytes | kHostStealPct |
-                   kHostDiskBavailMb;
+    prev.present = std::to_underlying(HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInErrors | HostPresent::kHostNetRxDropped) |
+                   std::to_underlying(HostPresent::kHostIoReadBytes | HostPresent::kHostIoWriteBytes | HostPresent::kHostStealPct) |
+                   std::to_underlying(HostPresent::kHostDiskBavailMb);
     prev.udp_rcvbuf_errors = 10;
     prev.udp_in_errors = 100;
     prev.net_rx_dropped = 0;
@@ -330,11 +331,11 @@ static void test_build_record_deltas_and_steal_pct() {
     cur.disk_bavail_mb = 499;
 
     HostRecord r;
-    build_host_record(prev, true, cur, kCaveatNetDev, false, 2.0, r);
-    CHECK(r.present_mask == (kHostUdpRcvbufErrors | kHostUdpInErrors |
-                             kHostNetRxDropped | kHostIoReadBytes |
-                             kHostIoWriteBytes | kHostStealPct |
-                             kHostDiskBavailMb));
+    build_host_record(prev, true, cur, std::to_underlying(HostCaveat::kCaveatNetDev), false, 2.0, r);
+    CHECK(r.present_mask == (std::to_underlying(HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInErrors) |
+                             std::to_underlying(HostPresent::kHostNetRxDropped | HostPresent::kHostIoReadBytes) |
+                             std::to_underlying(HostPresent::kHostIoWriteBytes | HostPresent::kHostStealPct) |
+                             std::to_underlying(HostPresent::kHostDiskBavailMb)));
     CHECK(r.udp_rcvbuf_errors == 15);
     CHECK(r.udp_in_errors == 40);
     CHECK(r.net_rx_dropped == 7);
@@ -343,12 +344,12 @@ static void test_build_record_deltas_and_steal_pct() {
     CHECK(r.disk_bavail_mb == 499);
     // steal: 5/500 => exactly 1%.
     CHECK(r.steal_pct > 0.999f && r.steal_pct < 1.001f);
-    CHECK(r.caveat_mask == kCaveatNetDev);
+    CHECK(r.caveat_mask == std::to_underlying(HostCaveat::kCaveatNetDev));
 }
 
 static void test_build_record_reset_rebaselines() {
     HostSnapshot prev = empty_snapshot();
-    prev.present = kHostUdpRcvbufErrors | kHostUdpInErrors | kHostStealPct;
+    prev.present = std::to_underlying(HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInErrors | HostPresent::kHostStealPct);
     prev.udp_rcvbuf_errors = 50;  // will be "reset" (netns recreation)
     prev.udp_in_errors = 200;
     prev.stat_steal_jiffies = 30;
@@ -363,18 +364,18 @@ static void test_build_record_reset_rebaselines() {
 
     HostRecord r;
     build_host_record(prev, true, cur, 0, false, 3.0, r);
-    CHECK((r.present_mask & kHostUdpRcvbufErrors) == 0);
-    CHECK((r.present_mask & kHostUdpInErrors) != 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostUdpRcvbufErrors)) == 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostUdpInErrors)) != 0);
     CHECK(r.udp_in_errors == 60);
-    CHECK((r.present_mask & kHostStealPct) == 0);
+    CHECK((r.present_mask & std::to_underlying(HostPresent::kHostStealPct)) == 0);
 }
 
 static void test_build_record_truncation_caveat() {
     HostSnapshot s = empty_snapshot();
     HostRecord r;
-    build_host_record(s, true, s, kCaveatIo, /*truncated=*/true, 1.0, r);
-    CHECK((r.caveat_mask & kCaveatTruncated) != 0);
-    CHECK((r.caveat_mask & kCaveatIo) != 0);
+    build_host_record(s, true, s, std::to_underlying(HostCaveat::kCaveatIo), /*truncated=*/true, 1.0, r);
+    CHECK((r.caveat_mask & std::to_underlying(HostCaveat::kCaveatTruncated)) != 0);
+    CHECK((r.caveat_mask & std::to_underlying(HostCaveat::kCaveatIo)) != 0);
     CHECK(r.present_mask == 0);
 }
 
@@ -394,7 +395,7 @@ static void test_full_snapshot_from_fixtures() {
     parse_stat("cpu 10 1 2 100 1 0 0 3 0 0\n", s);
     parse_self_io("read_bytes: 8\nwrite_bytes: 9\n", s);
     s.disk_bavail_mb = 42;
-    s.present |= kHostDiskBavailMb;
+    s.present |= std::to_underlying(HostPresent::kHostDiskBavailMb);
 
     // A second tick with +1 on every counter yields Δ = 1 for each field.
     HostSnapshot next = s;
@@ -418,10 +419,10 @@ static void test_full_snapshot_from_fixtures() {
     CHECK(r.io_write_bytes == 1);
     CHECK(r.disk_bavail_mb == 41);
     CHECK(r.steal_pct > 0.9f && r.steal_pct < 1.1f);  // 1/100 = 1%
-    CHECK(r.present_mask == (kHostUdpRcvbufErrors | kHostUdpInErrors |
-                             kHostUdpInCsumErrors | kHostNetRxDropped |
-                             kHostStealPct | kHostIoReadBytes |
-                             kHostIoWriteBytes | kHostDiskBavailMb));
+    CHECK(r.present_mask == (std::to_underlying(HostPresent::kHostUdpRcvbufErrors | HostPresent::kHostUdpInErrors) |
+                             std::to_underlying(HostPresent::kHostUdpInCsumErrors | HostPresent::kHostNetRxDropped) |
+                             std::to_underlying(HostPresent::kHostStealPct | HostPresent::kHostIoReadBytes) |
+                             std::to_underlying(HostPresent::kHostIoWriteBytes | HostPresent::kHostDiskBavailMb)));
 }
 
 int main() {

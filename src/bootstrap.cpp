@@ -454,7 +454,7 @@ void hldsmon_game_shutdown() {
         ShutdownRecord r;
         std::memset(&r, 0, sizeof(r));
         r.t = platform_wall_seconds();
-        copy_str(r.reason, sizeof(r.reason), "graceful");
+        copy_str(r.reason, "graceful");
         events::write_shutdown(r);
     }
     if (c.log != nullptr) {

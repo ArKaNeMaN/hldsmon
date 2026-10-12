@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 static int g_fail = 0;
 
@@ -68,9 +69,9 @@ static void test_reject_timing_json() {
     std::strcpy(r.stage, "SV_CheckProtocol");
     r.stage_ms = 12;
     r.total_ms = 34;
-    r.timing_present = kTimingStageMs | kTimingTotalMs;
+    r.timing_present = std::to_underlying(TimingPresent::kTimingStageMs | TimingPresent::kTimingTotalMs);
 
-    size_t n = write_reject_json(buf, sizeof buf, r);
+    size_t n = write_reject_json(buf, r);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(has(buf, "\"type\":\"reject\""));
@@ -78,15 +79,15 @@ static void test_reject_timing_json() {
     CHECK(!has(buf, "null"));
 
     std::memset(&r, 0, sizeof r);
-    n = write_reject_json(buf, sizeof buf, r);
+    n = write_reject_json(buf, r);
     CHECK(n > 0);
     CHECK(has(buf, "\"stage_ms\":null"));
     CHECK(has(buf, "\"total_ms\":null"));
 
     // an independently cleared bit only nulls its own field
     r.stage_ms = 9;
-    r.timing_present = kTimingStageMs;
-    n = write_reject_json(buf, sizeof buf, r);
+    r.timing_present = std::to_underlying(TimingPresent::kTimingStageMs);
+    n = write_reject_json(buf, r);
     CHECK(n > 0);
     CHECK(has(buf, "\"stage_ms\":9"));
     CHECK(has(buf, "\"total_ms\":null"));
@@ -100,9 +101,9 @@ static void test_connect_timing_json() {
     c.id = 3;
     c.auth_ms = 1500;
     c.steam_ms = 45;
-    c.timing_present = kTimingAuthMs | kTimingSteamMs;
+    c.timing_present = std::to_underlying(TimingPresent::kTimingAuthMs | TimingPresent::kTimingSteamMs);
 
-    size_t n = write_connect_json(buf, sizeof buf, c);
+    size_t n = write_connect_json(buf, c);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(has(buf, "\"type\":\"connect\""));
@@ -110,14 +111,14 @@ static void test_connect_timing_json() {
     CHECK(!has(buf, "null"));
 
     std::memset(&c, 0, sizeof c);
-    n = write_connect_json(buf, sizeof buf, c);
+    n = write_connect_json(buf, c);
     CHECK(n > 0);
     CHECK(has(buf, "\"auth_ms\":null"));
     CHECK(has(buf, "\"steam_ms\":null"));
 
     c.auth_ms = 7;
-    c.timing_present = kTimingAuthMs;
-    n = write_connect_json(buf, sizeof buf, c);
+    c.timing_present = std::to_underlying(TimingPresent::kTimingAuthMs);
+    n = write_connect_json(buf, c);
     CHECK(n > 0);
     CHECK(has(buf, "\"auth_ms\":7"));
     CHECK(has(buf, "\"steam_ms\":null"));
@@ -132,7 +133,7 @@ static void test_mapchange_load_json() {
     m.load_ms = 250;
     m.load_present = 1;
 
-    const size_t n = write_mapchange_json(buf, sizeof buf, m);
+    const size_t n = write_mapchange_json(buf, m);
     CHECK(n > 0);
     CHECK(std::strlen(buf) == n);
     CHECK(std::strcmp(buf,
@@ -142,13 +143,13 @@ static void test_mapchange_load_json() {
 
     m.load_ms = 0;
     m.load_present = 0;
-    const size_t m2 = write_mapchange_json(buf, sizeof buf, m);
+    const size_t m2 = write_mapchange_json(buf, m);
     CHECK(m2 > 0);
     CHECK(has(buf, "\"load_ms\":null"));
 
     char tiny[8];
     std::memset(tiny, 0x7f, sizeof tiny);
-    CHECK(write_mapchange_json(tiny, sizeof tiny, m) == 0);
+    CHECK(write_mapchange_json(tiny, m) == 0);
     CHECK(static_cast<unsigned char>(tiny[0]) == 0x7f);
 }
 

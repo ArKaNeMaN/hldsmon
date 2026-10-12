@@ -55,7 +55,7 @@ ModnetCounters* modnet_counters(uint16_t obj) noexcept;
 // rc<0 with errno EINPROGRESS/EALREADY => Pending (only `connect_attempts`);
 // otherwise => Failed (`conn_fail`). Never fails on a positive rc.
 enum class ConnectClass { Blocking, Pending, Failed };
-ConnectClass modnet_classify_connect(int rc, int err) noexcept;
+[[nodiscard]] ConnectClass modnet_classify_connect(int rc, int err) noexcept;
 
 // Fixed-capacity address->object range cache (INV-M5). `add` returns false on
 // capacity overflow; `lookup` then fails closed (-1) for every address.

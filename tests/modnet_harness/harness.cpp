@@ -72,7 +72,7 @@ static void total_net(ModnetSnapshot& s) {
 // Asserts that a per-object emit item carries the expected `.so` label.
 static void check_label(const char* want_so) {
     ModnetEmitItem items[8];
-    const size_t n = modnet_got_collect_emit(items, 8, 1234.0);
+    const size_t n = modnet_got_collect_emit(items, 1234.0);
     bool found = false;
     for (size_t i = 0; i < n; ++i) {
         if (std::strcmp(items[i].so, want_so) == 0) {

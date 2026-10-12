@@ -223,6 +223,23 @@
 - **Риски/нити.** CI зависит от внешнего Docker Hub-образа → пин по digest (желательно зеркало в ghcr.io); образ 3.41 ГБ (дороже pull); glibc ≤ 2.17 держится лишь пока не используются фичи с новыми glibc-зависимостями — CI-проверку сохранять; `_GLIBCXX_USE_CXX11_ABI=0` не менять.
 - **Коммит.** Не выполнен: по профилю требуется явная просьба владельца.
 
+## Стадия 11b (modernize): C++23-идиомы (`std::span`, `enum class`/`std::to_underlying`, гигиена)
+
+- **Контекст.** После перехода на C++23 (Стадия 11) — модернизация кода под новые фичи там, где это правильнее, при замороженном поведении. Процесс — `refactor-delivery`, **Mode A** (behavior-preserving).
+- **Гейт-трейл.** Baseline `6bd742f` (дерево чистое, набор зелёный, контракт зафиксирован). План — `.omo/plans/cxx23-modernization.md`; независимое ревью `momus` = **OKAY** (правлена лишь неточность примера размеров: `DropRecord=16872`, не `16835`).
+- **Сделано (S1/S2/S4/S5):**
+  - **S1** — `std::span<char>` в serialization-API (`json_escape` + 17 `write_*_json`) и все вызовы (src + 73 вызова в тестах). Логика эмиттеров не тронута; `out.size()`/`out.data()`.
+  - **S2** — `std::span` для остальных буферных API: `plugin.h` (`copy_str`/`copy_str_utf8`/`append_u32_dec`/`format_ip`/`format_u64_dec`), `metrics.h` (`classify_detector`/`format_ip4_packed`), `host_metrics` (`read_file`), `log_writer::write`, `ring_buffer`/`runtime_ring::last`, `modnet_got_collect_emit`; все вызовы обновлены.
+  - **S3 — пропущен (нет работы):** переинтерпретации значения нет — `pack_ip4` уже на сдвигах; весь `memcpy` — строки/структуры (`enginefuncs_t`, `META_FUNCTIONS`, пути); весь `reinterpret_cast` — адресный interop (движок, GOT). `std::bit_cast` применять не к чему.
+  - **S4** — битмаски → `enum class : <underlying>` + `constexpr` операторы + `std::to_underlying` на границах: `HostPresent`/`HostCaveat` (`host_metrics.h`), `ConfigPresent`/`TimingPresent` (`metrics.h`), `HookBit` (`hook_manager.cpp`). Числовые значения и типы хранения не менялись.
+  - **S5** — `[[nodiscard]]` на чистых конвертерах/предикатах (call-sites проверены — иначе `-Werror`); `constexpr` там, где реально вычислимо на месте определения.
+  - **S6/S7 — сознательно не делались:** `std::string_view` (риск лайфтайма — ротирующийся userinfo-буфер; низкая ценность) и `std::array` для сырых массивов (косметика, большой churn).
+- **Замороженный контракт сохранён:** экспорты — 9, `verify-exports` OK (не изменялись); JSONL-байты — ассерты тестов неизменны (правки в тестах только синтаксические: передача буфера и `std::to_underlying(...)`); размеры структур — `static_assert` в `metrics.h` не тронуты; INV-2 — `test_no_alloc` PASS; `_GLIBCXX_USE_CXX11_ABI=0`; glibc ≤ 2.17.
+- **Артефакты.** Изменено 32 файла: `src/{serialization.{h,cpp},plugin.h,metrics.h,host_metrics.{h,cpp},log_writer.{h,cpp},ring_buffer.h,runtime_ring.h,modnet_got.{h,cpp},hook_manager.cpp,hooks.cpp,sampler.cpp,events.cpp,control.cpp,bootstrap.cpp}` + тесты (`test_*`), `tests/modnet_harness/harness.cpp`, `.omo/plans/cxx23-modernization.md`. `include/`, `Makefile`, `version_script.lds`, `exports.whitelist`, CI, схема P1 — не тронуты.
+- **Верификация (oracle-образ, GCC 16.2.0).** На каждом шаге — независимый прогон на свежей копии: `make` 0 warnings; max GLIBC `2.17`; без динамического `libstdc++`/`libgcc`; `verify-exports: OK`; `test-modnet-harness: PASS`; `make test` = все host-тесты PASS + **209 Python OK**. Запретных `std::string/vector/format/optional`, `#pragma`-подавлений, ослаблений тестов — нет.
+- **Отклонения.** Тест-файлы изменены синтаксически (call-sites/квалификация), не по существу утверждений; чекпойнт-коммиты не делались (политика репозитория).
+- **Коммит.** Не выполнен: по профилю требуется явная просьба владельца.
+
 ## Итог по всем стадиям (Ур.0–4)
 Все 7 фич прошли полный пайплайн (design → design-review → owner-форки → plan → plan-review → реализация → верификация → журнал): **Стадии 4–10**. Стадии закоммичены в `main` (3 коммита), версия поднята **0.3.0 → 0.4.0**, выпущен релиз **`v0.4.0`** (по явной просьбе владельца).
 

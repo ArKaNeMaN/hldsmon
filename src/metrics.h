@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
+#include <utility>
 
 namespace hldsmon {
 
@@ -169,7 +171,9 @@ struct NeighborsInfo {
 // marks which cvar pointers resolved at bootstrap (CFG-2): an absent cvar is
 // emitted as the JSON literal `null` and its value slot is left zero, so the
 // whole POD can be memset before filling (CFG-5) and compared bitwise.
-enum ConfigPresent : uint16_t {
+// Scoped bitmask: combine with the constexpr operators below; convert to the
+// uint16_t storage fields with std::to_underlying at the integer boundary.
+enum class ConfigPresent : uint16_t {
     kCfgSysTicrate      = 1u << 0,
     kCfgHostFramerate   = 1u << 1,
     kCfgSvTimeout       = 1u << 2,
@@ -180,6 +184,25 @@ enum ConfigPresent : uint16_t {
     kCfgSvMaxcmdrate    = 1u << 7,
     kCfgSvMincmdrate    = 1u << 8,
 };
+
+constexpr ConfigPresent operator|(ConfigPresent a, ConfigPresent b) noexcept {
+    return static_cast<ConfigPresent>(std::to_underlying(a) |
+                                      std::to_underlying(b));
+}
+
+constexpr ConfigPresent operator&(ConfigPresent a, ConfigPresent b) noexcept {
+    return static_cast<ConfigPresent>(std::to_underlying(a) &
+                                      std::to_underlying(b));
+}
+
+constexpr ConfigPresent& operator|=(ConfigPresent& a, ConfigPresent b) noexcept {
+    a = a | b;
+    return a;
+}
+
+constexpr ConfigPresent operator~(ConfigPresent a) noexcept {
+    return static_cast<ConfigPresent>(~std::to_underlying(a));
+}
 
 struct ConfigSnapshot {
     uint16_t present;          // bitmask of kCfg* presence bits
@@ -237,13 +260,30 @@ struct DropRecord {
 // Presence bits for the connect/load timing fields (stage connect-timings,
 // design §25.3; CTP-1/CT-4). uint32 ms cannot express "not measured", so each
 // record carries a presence mask and a clear bit serializes as JSON `null`.
-enum TimingPresent : uint8_t {
+// Scoped bitmask: combine with the constexpr operators below; convert to the
+// uint8_t storage fields with std::to_underlying at the integer boundary.
+enum class TimingPresent : uint8_t {
     kTimingStageMs = 1u << 0,  // reject.stage_ms — validator duration
     kTimingTotalMs = 1u << 1,  // reject.total_ms — SV_ConnectClient -> reject
     kTimingAuthMs  = 1u << 2,  // connect.auth_ms — SV_ConnectClient -> success
     kTimingSteamMs = 1u << 3,  // connect.steam_ms — Steam stage duration
     kTimingLoadMs  = 1u << 4,  // mapchange.load_ms — SV_Spawn_f -> ready
 };
+
+constexpr TimingPresent operator|(TimingPresent a, TimingPresent b) noexcept {
+    return static_cast<TimingPresent>(std::to_underlying(a) |
+                                      std::to_underlying(b));
+}
+
+constexpr TimingPresent operator&(TimingPresent a, TimingPresent b) noexcept {
+    return static_cast<TimingPresent>(std::to_underlying(a) &
+                                      std::to_underlying(b));
+}
+
+constexpr TimingPresent& operator|=(TimingPresent& a, TimingPresent b) noexcept {
+    a = a | b;
+    return a;
+}
 
 // Rejected connection — P1 `reject` (+ connect-timings extension).
 struct RejectRecord {
@@ -398,7 +438,7 @@ struct HostRecord {
 // timeout would otherwise keep emitting a flat, stale non-zero rate. Header-only
 // and engine-free so this decision stays host-testable; call it after `idle_ms`
 // has been filled.
-inline void gate_idle_flow(ClientSample& s, uint32_t threshold_ms) noexcept {
+inline constexpr void gate_idle_flow(ClientSample& s, uint32_t threshold_ms) noexcept {
     if (s.idle_ms >= threshold_ms) {
         s.flow_in_kbps = 0.0f;
         s.flow_out_kbps = 0.0f;
@@ -412,7 +452,7 @@ inline void gate_idle_flow(ClientSample& s, uint32_t threshold_ms) noexcept {
 // Non-positive / non-finite latency (<=0, NaN, -inf) yields 0 ("not measured");
 // values at or above the uint16 ceiling saturate at 0xFFFF. Header-only and
 // engine-free so the conversion stays host-testable.
-inline uint16_t ping_ms_from_latency(float latency_s) noexcept {
+[[nodiscard]] inline constexpr uint16_t ping_ms_from_latency(float latency_s) noexcept {
     const double ms = static_cast<double>(latency_s) * 1000.0;
     if (!(ms > 0.0)) {         // catches <=0, -inf and NaN without <cmath>
         return 0;
@@ -431,7 +471,7 @@ inline uint16_t ping_ms_from_latency(float latency_s) noexcept {
 // the caller clears the presence bit (JSON `null`, CT-6/CT-8) instead of
 // emitting garbage; otherwise stores the rounded, uint32-clamped value and
 // returns true. Header-only and engine-free so the guard stays host-testable.
-inline bool timing_delta_ms(double delta_s, uint32_t& out_ms) noexcept {
+[[nodiscard]] inline constexpr bool timing_delta_ms(double delta_s, uint32_t& out_ms) noexcept {
     if (!(delta_s > 0.0)) {    // catches <=0, -inf and NaN without <cmath>
         return false;
     }
@@ -451,8 +491,8 @@ inline bool timing_delta_ms(double delta_s, uint32_t& out_ms) noexcept {
 // in ms; count==0 (no delta observed, e.g. the client's first packet since
 // connect) finalizes to all zeros meaning "no data" (L1).
 
-inline void jitter_reset(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_max,
-                         uint32_t& jit_count) noexcept {
+inline constexpr void jitter_reset(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_max,
+                                   uint32_t& jit_count) noexcept {
     jit_min = 0;
     jit_sum = 0;
     jit_max = 0;
@@ -463,7 +503,7 @@ inline void jitter_reset(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_max
 // milliseconds. Returns false for a non-positive or non-finite delta, which
 // guards clock jumps and the client's first tracked packet (M4); otherwise
 // stores the rounded, uint16-clamped value and returns true.
-inline bool jitter_delta_ms(double now_real, double prev_real, uint32_t& out_ms) noexcept {
+[[nodiscard]] inline constexpr bool jitter_delta_ms(double now_real, double prev_real, uint32_t& out_ms) noexcept {
     if (!(now_real > prev_real)) {   // catches <=0 and NaN without <cmath>
         return false;
     }
@@ -472,8 +512,8 @@ inline bool jitter_delta_ms(double now_real, double prev_real, uint32_t& out_ms)
     return true;
 }
 
-inline void jitter_add_ms(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_max,
-                          uint32_t& jit_count, uint32_t delta_ms) noexcept {
+inline constexpr void jitter_add_ms(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_max,
+                                    uint32_t& jit_count, uint32_t delta_ms) noexcept {
     if (jit_count == 0 || delta_ms < jit_min) {
         jit_min = delta_ms;
     }
@@ -487,9 +527,9 @@ inline void jitter_add_ms(uint32_t& jit_min, uint32_t& jit_sum, uint32_t& jit_ma
 
 // min / avg (= sum/count) / max in ms, each clamped to uint16. count==0
 // finalizes to all zeros ("no data").
-inline void jitter_finalize(uint32_t jit_min, uint32_t jit_sum, uint32_t jit_max,
-                            uint32_t jit_count, uint16_t& out_min, uint16_t& out_avg,
-                            uint16_t& out_max) noexcept {
+inline constexpr void jitter_finalize(uint32_t jit_min, uint32_t jit_sum, uint32_t jit_max,
+                                      uint32_t jit_count, uint16_t& out_min, uint16_t& out_avg,
+                                      uint16_t& out_max) noexcept {
     if (jit_count == 0) {
         out_min = 0;
         out_avg = 0;
@@ -506,7 +546,7 @@ inline void jitter_finalize(uint32_t jit_min, uint32_t jit_sum, uint32_t jit_max
 // over the packed struct, no allocation. Callers memset a snapshot before
 // filling it, so absent fields hold stable zeroes and cannot cause a false
 // "changed". Header-only and engine-free for host tests.
-inline bool config_changed(const ConfigSnapshot& a, const ConfigSnapshot& b) noexcept {
+[[nodiscard]] inline bool config_changed(const ConfigSnapshot& a, const ConfigSnapshot& b) noexcept {
     return std::memcmp(&a, &b, sizeof(ConfigSnapshot)) != 0;
 }
 
@@ -519,7 +559,7 @@ inline bool config_changed(const ConfigSnapshot& a, const ConfigSnapshot& b) noe
 // flooding", "Kicked/Banned for speedhack"). A miss yields "" and never affects
 // the drop. Not covered by design: slowmo (time-deceleration abuse) and
 // detectors that throttle/ignore without dropping. Engine-free for host tests.
-inline const char* detector_name(const char* reason) noexcept {
+[[nodiscard]] inline const char* detector_name(const char* reason) noexcept {
     if (reason == nullptr) {
         return "";
     }
@@ -539,13 +579,13 @@ inline const char* detector_name(const char* reason) noexcept {
 }
 
 // Fills `out` with `detector_name(reason)`, bounded and NUL-terminated.
-inline void classify_detector(const char* reason, char* out, size_t cap) noexcept {
-    if (cap == 0) {
+inline void classify_detector(const char* reason, std::span<char> out) noexcept {
+    if (out.empty()) {
         return;
     }
     const char* det = detector_name(reason);
     size_t i = 0;
-    for (; det[i] != '\0' && i + 1 < cap; ++i) {
+    for (; det[i] != '\0' && i + 1 < out.size(); ++i) {
         out[i] = det[i];
     }
     out[i] = '\0';
@@ -553,8 +593,8 @@ inline void classify_detector(const char* reason, char* out, size_t cap) noexcep
 
 // Dotted-quad rendering of a packed host-order IPv4 (the engine-path format_ip
 // in plugin.h needs netadr_t; this mirror keeps metrics.h engine-free).
-inline void format_ip4_packed(uint32_t ip, char* out, size_t cap) noexcept {
-    if (cap == 0) {
+inline constexpr void format_ip4_packed(uint32_t ip, std::span<char> out) noexcept {
+    if (out.empty()) {
         return;
     }
     size_t pos = 0;
@@ -570,14 +610,14 @@ inline void format_ip4_packed(uint32_t ip, char* out, size_t cap) noexcept {
                 v /= 10u;
             }
         }
-        while (n > 0 && pos + 1 < cap) {
+        while (n > 0 && pos + 1 < out.size()) {
             out[pos++] = tmp[--n];
         }
-        if (shift != 0 && pos + 1 < cap) {
+        if (shift != 0 && pos + 1 < out.size()) {
             out[pos++] = '.';
         }
     }
-    out[pos < cap ? pos : cap - 1] = '\0';
+    out[pos < out.size() ? pos : out.size() - 1] = '\0';
 }
 
 // One linear pass over the bounded per-IP table (`entries[0..n)`, `ip == 0` or
@@ -585,8 +625,8 @@ inline void format_ip4_packed(uint32_t ip, char* out, size_t cap) noexcept {
 // count into `out`, descending, ties keeping the earlier table position.
 // O(n * HLDSMON_TOP_IPS) worst case, no allocation; runs off the hot path in the
 // 1 Hz packet aggregation (design §26.3 п.3). Returns the number valid (0..3).
-inline size_t select_top_ips(const IpEntry* entries, uint32_t n,
-                             IpCount out[HLDSMON_TOP_IPS]) noexcept {
+[[nodiscard]] inline constexpr size_t select_top_ips(const IpEntry* entries, uint32_t n,
+                                                     IpCount out[HLDSMON_TOP_IPS]) noexcept {
     size_t used = 0;
     if (entries == nullptr) {
         return 0;
@@ -605,7 +645,7 @@ inline size_t select_top_ips(const IpEntry* entries, uint32_t n,
             out[pos] = out[pos - 1];
             --pos;
         }
-        format_ip4_packed(packed, out[pos].ip, sizeof(out[pos].ip));
+        format_ip4_packed(packed, out[pos].ip);
         out[pos].count = count;
         if (used < HLDSMON_TOP_IPS) {
             ++used;

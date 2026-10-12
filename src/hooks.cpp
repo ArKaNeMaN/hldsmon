@@ -10,6 +10,8 @@
 
 #include "events.h"
 
+#include <utility>
+
 namespace hldsmon {
 namespace {
 
@@ -71,11 +73,11 @@ void emit_reject(const netadr_t* adr, const char* stage, const char* detail,
     std::memset(&r, 0, sizeof(r));
     r.t = platform_wall_seconds();
     if (adr != nullptr) {
-        format_ip(*adr, r.ip, sizeof(r.ip));
+        format_ip(*adr, r.ip);
     }
-    copy_str(r.steamid, sizeof(r.steamid), steamid != nullptr ? steamid : "");
-    copy_str(r.stage, sizeof(r.stage), stage != nullptr ? stage : "");
-    copy_str(r.detail, sizeof(r.detail), detail != nullptr ? detail : "");
+    copy_str(r.steamid, steamid != nullptr ? steamid : "");
+    copy_str(r.stage, stage != nullptr ? stage : "");
+    copy_str(r.detail, detail != nullptr ? detail : "");
     r.stage_ms = stage_ms;
     r.total_ms = total_ms;
     r.timing_present = timing_present;
@@ -102,11 +104,11 @@ void reject_with_timing(const netadr_t* adr, const char* stage, const char* deta
     uint32_t total_ms = 0;
     uint8_t present = 0;
     if (timing_delta_ms(end_real - begin_real, stage_ms)) {
-        present |= kTimingStageMs;
+        present |= std::to_underlying(TimingPresent::kTimingStageMs);
     }
     if (c.connect.active != 0 && c.connect.t0 > 0.0 &&
         timing_delta_ms(end_real - c.connect.t0, total_ms)) {
-        present |= kTimingTotalMs;
+        present |= std::to_underlying(TimingPresent::kTimingTotalMs);
     }
     emit_reject(adr, stage, detail, steamid, stage_ms, total_ms, present);
     reset_connect_ctx(c);
@@ -119,7 +121,7 @@ void update_massdrop(const char* category, double now_real) noexcept {
                       (std::strcmp(m.category, category) == 0) &&
                       (now_real - m.last_t <= kMassDropWindowS);
     if (!same) {
-        copy_str(m.category, sizeof(m.category), category);
+        copy_str(m.category, category);
         m.count = 1;
         m.emitted = false;
     } else if (m.count != 0xFFFFFFFFu) {
@@ -135,8 +137,8 @@ void update_massdrop(const char* category, double now_real) noexcept {
             r.t = platform_wall_seconds();
             r.window_s = static_cast<uint32_t>(kMassDropWindowS);
             r.count = static_cast<uint16_t>(m.count);
-            copy_str(r.reason, sizeof(r.reason), category);
-            copy_str(r.category, sizeof(r.category), category);
+            copy_str(r.reason, category);
+            copy_str(r.category, category);
             events::write_massdrop(r);
             ++c.massdrop_count;
         }
@@ -158,26 +160,26 @@ void stamp_identity(IGameClient* cl, int id) noexcept {
         return;
     }
 
-    copy_str_utf8(ci.name, sizeof(ci.name), cl->GetName());
+    copy_str_utf8(ci.name, cl->GetName());
 
     edict_t* ed = cl->GetEdict();
     if (ed != nullptr && g_engfuncs.pfnGetPlayerAuthId != nullptr) {
         const char* aid = g_engfuncs.pfnGetPlayerAuthId(ed);
         if (aid != nullptr) {
-            copy_str_utf8(ci.authid, sizeof(ci.authid), aid);
+            copy_str_utf8(ci.authid, aid);
         }
     }
 
     USERID_t* uid = cl->GetNetworkUserID();
     if (uid != nullptr && uid->m_SteamID != 0) {
-        format_u64_dec(uid->m_SteamID, ci.steamid64, sizeof(ci.steamid64));
+        format_u64_dec(uid->m_SteamID, ci.steamid64);
     }
 
     INetChan* nc = cl->GetNetChan();
     if (nc != nullptr) {
         const netadr_t* a = nc->GetRemoteAdr();
         if (a != nullptr) {
-            format_ip(*a, ci.ip, sizeof(ci.ip));
+            format_ip(*a, ci.ip);
             if (a->type == NA_IP) {
                 const uint16_t p = a->port;
                 ci.port = static_cast<int32_t>(static_cast<uint16_t>((p >> 8) | (p << 8)));
@@ -203,11 +205,11 @@ void build_drop_record(int id, IGameClient* live, bool crash, const char* reason
     rec.t = platform_wall_seconds();
     rec.id = static_cast<uint8_t>(id);
     rec.gen = (id >= 0 && id < c.maxclients) ? c.clients[id].gen : 0;
-    copy_str(rec.reason, sizeof(rec.reason), reason != nullptr ? reason : "");
+    copy_str(rec.reason, reason != nullptr ? reason : "");
     classify_reason(reason, rec.category, sizeof(rec.category));
-    classify_detector(reason, rec.detector, sizeof(rec.detector));
+    classify_detector(reason, rec.detector);
     rec.crash = crash ? 1 : 0;
-    copy_str(rec.observed_via, sizeof(rec.observed_via),
+    copy_str(rec.observed_via,
              observed_via != nullptr ? observed_via : "unknown");
     fill_identity(rec, live, id, rec.t);
 
@@ -410,10 +412,10 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
             if (c.connect.active != 0) {
                 if (c.connect.t0 > 0.0 &&
                     timing_delta_ms(now_real - c.connect.t0, auth_ms)) {
-                    timing_present |= kTimingAuthMs;
+                    timing_present |= std::to_underlying(TimingPresent::kTimingAuthMs);
                 }
                 if (timing_delta_ms(c.connect.steam_enter, steam_ms)) {
-                    timing_present |= kTimingSteamMs;
+                    timing_present |= std::to_underlying(TimingPresent::kTimingSteamMs);
                 }
                 reset_connect_ctx(c);
             }
@@ -422,7 +424,7 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
             if (nc != nullptr) {
                 const netadr_t* a = nc->GetRemoteAdr();
                 if (a != nullptr) {
-                    format_ip(*a, cr.ip, sizeof(cr.ip));
+                    format_ip(*a, cr.ip);
                     if (a->type == NA_IP) {
                         cr.ip_packed = pack_ip4(a->ip);
                         cr.port_packed = a->port;
@@ -430,7 +432,7 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
                 }
             }
             format_steamid(sid, cr.steamid, sizeof(cr.steamid));
-            copy_str(cr.name, sizeof(cr.name), cl->GetName());
+            copy_str(cr.name, cl->GetName());
             stamp_identity(cl, id);
 
             if (plugin_enabled()) {
@@ -438,9 +440,9 @@ void h_ClientConnected(IRehldsHook_ClientConnected* chain, IGameClient* cl) {
                 std::memset(&rec, 0, sizeof(rec));
                 rec.t = platform_wall_seconds();
                 rec.id = static_cast<uint8_t>(id);
-                copy_str(rec.ip, sizeof(rec.ip), cr.ip);
-                copy_str(rec.steamid, sizeof(rec.steamid), cr.steamid);
-                copy_str(rec.name, sizeof(rec.name), cr.name);
+                copy_str(rec.ip, cr.ip);
+                copy_str(rec.steamid, cr.steamid);
+                copy_str(rec.name, cr.name);
                 rec.auth_ms = auth_ms;
                 rec.steam_ms = steam_ms;
                 rec.timing_present = timing_present;
@@ -604,7 +606,7 @@ void h_SV_Spawn_f(IRehldsHook_SV_Spawn_f* chain) {
     if (c.attached) {
         const char* m = current_map();
         if (m != nullptr && std::strcmp(m, c.last_map) != 0) {
-            copy_str(c.last_map, sizeof(c.last_map), m);
+            copy_str(c.last_map, m);
             c.massdrop.category[0] = '\0';
             c.massdrop.count = 0;
             c.massdrop.emitted = false;
@@ -618,7 +620,7 @@ void h_SV_Spawn_f(IRehldsHook_SV_Spawn_f* chain) {
             if (plugin_enabled()) {
                 MapCtx& mc = c.map_ctx;
                 mc.t_spawn = engine_now_real();
-                copy_str(mc.pending_map, sizeof(mc.pending_map), m);
+                copy_str(mc.pending_map, m);
                 mc.pending = 1;
                 mc.ticks = 0;
             }

@@ -3,12 +3,14 @@
 #include "plugin.h"
 #include "events.h"
 
+#include <span>
+
 namespace hldsmon {
 namespace events {
 namespace {
 
 template <class T>
-using Writer = size_t (*)(char*, size_t, const T&);
+using Writer = size_t (*)(std::span<char>, const T&);
 
 template <class T>
 void emit(const T& r, Writer<T> fn) {
@@ -19,12 +21,12 @@ void emit(const T& r, Writer<T> fn) {
     if (c.log == nullptr) {
         return;
     }
-    const size_t n = fn(c.line_buf, kLineBufSize, r);
+    const size_t n = fn(std::span<char>(c.line_buf, kLineBufSize), r);
     if (n == 0) {
         ++c.serialize_failures;
         return;
     }
-    c.log->write(c.line_buf, n);
+    c.log->write(std::span<const char>(c.line_buf, n));
 }
 
 } // namespace
