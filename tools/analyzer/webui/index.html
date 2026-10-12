@@ -644,7 +644,7 @@
         </div>
         <div class="field wide">
           <label for="ftpPath">Путь к файлу телеметрии</label>
-          <input type="text" id="ftpPath" placeholder="/cstrike/addons/metamod/hldsmon/logs/hldsmon-{date}.jsonl" spellcheck="false">
+          <input type="text" id="ftpPath" placeholder="/cstrike/addons/hldsmon/logs/hldsmon-{date}.jsonl" spellcheck="false">
         </div>
         <div class="field">
           <label>Соединение</label>
@@ -1567,17 +1567,26 @@ function ftpDisconnect() {
   if (sid) ftpSendClose(sid);
 }
 
-function ftpStopAuto() {
+// Cancel the timer + auto flag WITHOUT touching the checkbox. Used both when
+// stopping (user unticks / disconnect) and when (re)starting, so that starting
+// auto no longer clobbers the freshly-ticked box back to unchecked.
+function ftpCancelTimer() {
   if (ftp.timer) { clearInterval(ftp.timer); ftp.timer = null; }
   ftp.auto = false;
+}
+
+function ftpStopAuto() {
+  ftpCancelTimer();
   const cb = $("#ftpAuto");
   if (cb) cb.checked = false;
 }
 
 function ftpStartAuto() {
-  ftpStopAuto();
+  ftpCancelTimer();
   ftp.auto = true;
   ftp.timer = setInterval(() => { ftpRefresh(false); }, ftp.intervalMs);
+  const cb = $("#ftpAuto");
+  if (cb) cb.checked = true;
 }
 
 function ftpIntervalChanged() {
