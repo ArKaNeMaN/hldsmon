@@ -69,7 +69,7 @@
 │   │                     Control (RCON: hldsmon_status / hldsmon_flush_log)      │    │
 │   └─────────────────────────────────────────────────────────────────────────────┘    │
 └───────────────────────────────────────────┬─────────────────────────────────────────┘
-                                             ▼  addons/metamod/hldsmon/logs/hldsmon-YYYY-MM-DD.jsonl
+                                             ▼  addons/hldsmon/logs/hldsmon-YYYY-MM-DD.jsonl
                                     (владелец забирает по FTP)
                                              ▼
                               tools/analyzer/*.py (парсинг, агрегация, отчёты)
@@ -159,7 +159,7 @@
 ## 7. Хранилище: JSONL с суточной ротацией
 
 - **Формат:** JSON Lines, одна запись — строка. Типы: `server`, `client`, `drop`, `reject`, `netcmd`, `massdrop`, `packet`, `hitch`, `mapchange`, `voice`, `shutdown`, `crash` (см. Приложение A).
-- **Файл:** `logs/hldsmon-YYYY-MM-DD.jsonl` (UTC), директория `hldsmon_dir` (default `addons/metamod/hldsmon/logs/`; fallback `/tmp/hldsmon` с предупреждением).
+- **Файл:** `logs/hldsmon-YYYY-MM-DD.jsonl` (UTC), директория `hldsmon_dir` (default `addons/hldsmon/logs/`; fallback `/tmp/hldsmon` с предупреждением).
 - **Ротация:** при смене UTC-даты на 1 Гц-тике LogWriter закрывает старый и открывает новый файл.
 - **Буферизация:** `FILE*` append + `fflush` раз в `hldsmon_flush_sec` (default 1 с). Потеря при краше — ≤ ~1 с. Данные в page cache ОС переживают краш процесса.
 - **Права:** файл `0600`, директория `0700`. Лимит размера/сутки — предупреждение при превышении `hldsmon_max_mb`.
@@ -234,7 +234,7 @@
 | `hldsmon_client_ring` | cvar | размер кольца клиента | 300 |
 | `hldsmon_server_ring` | cvar | размер серверного кольца | 3600 |
 | `hldsmon_drop_window` | cvar | сэмплов окна в drop-record | 60 |
-| `hldsmon_dir` | cvar | директория логов | `addons/metamod/hldsmon/logs` |
+| `hldsmon_dir` | cvar | директория логов | `addons/hldsmon/logs` |
 | `hldsmon_max_mb` | cvar | лимит размера/сутки (предупреждение) | 512 |
 | `hldsmon_ip_table` | cvar | размер per-IP таблицы | 4096 |
 | `hldsmon_retention_days` | cvar | максимум дневных файлов логов (вкл. текущий); `<=0` — выкл | 3 |

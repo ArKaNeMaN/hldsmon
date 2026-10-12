@@ -51,7 +51,7 @@ char s_val_flush_sec[]   = "1";
 char s_val_client_ring[] = "300";
 char s_val_server_ring[] = "3600";
 char s_val_drop_window[] = "60";
-char s_val_dir[]         = "addons/metamod/hldsmon/logs";
+char s_val_dir[]         = "addons/hldsmon/logs";
 char s_val_max_mb[]      = "512";
 char s_val_ip_table[]    = "4096";
 char s_val_retention_days[] = "3";
@@ -278,7 +278,7 @@ bool open_log() noexcept {
     c.log->set_max_mb(static_cast<uint64_t>(cvar_f(c.cvars.max_mb, 512.0f)));
     c.log->set_retention_days(static_cast<int>(cvar_f(c.cvars.retention_days, 3.0f)));
 
-    const char* dir = "addons/metamod/hldsmon/logs";
+    const char* dir = "addons/hldsmon/logs";
     if (c.cvars.dir != nullptr && c.cvars.dir->string != nullptr &&
         c.cvars.dir->string[0] != '\0') {
         dir = c.cvars.dir->string;

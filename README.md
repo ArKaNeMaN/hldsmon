@@ -40,7 +40,7 @@ readelf -d HldsMonitoring_mm_i386.so | grep NEEDED                              
    linux addons/metamod/dlls/HldsMonitoring_mm_i386.so HldsMonitoring
    ```
 3. Проверить: `meta list` (плагин загружен), затем в консоли `hldsmon_status`.
-4. Логи: `<mod>/addons/metamod/hldsmon/logs/hldsmon-YYYY-MM-DD.jsonl` (UTC), суточная ротация.
+4. Логи: `<mod>/addons/hldsmon/logs/hldsmon-YYYY-MM-DD.jsonl` (UTC), суточная ротация.
 
 ## Что собирается
 
@@ -58,11 +58,26 @@ readelf -d HldsMonitoring_mm_i386.so | grep NEEDED                              
 | `hldsmon_status` | статус: путь лога, объём, счётчики, размеры колец, проба layout |
 | `hldsmon_flush_log` | принудительный сброс буфера |
 
-Cvar'ы: `hldsmon_enable`, `hldsmon_client_hz`, `hldsmon_disk_hz`, `hldsmon_flush_sec`, `hldsmon_client_ring`, `hldsmon_server_ring`, `hldsmon_drop_window`, `hldsmon_dir`, `hldsmon_max_mb`, `hldsmon_ip_table`, `hldsmon_retention_days`.
+### Cvar'ы
 
-**Retention (автоудаление):** `hldsmon_retention_days` (default `3`) задаёт максимум одновременно существующих дневных файлов, включая текущий. При открытии лога и на суточной ротации старые `hldsmon-YYYY-MM-DD.jsonl` (дата старше `сегодня − (N−1)`) удаляются; `N=1` оставляет только текущий файл, `N<=0` отключает удаление (keep-all). Значение перечитывается каждый server-tick, поэтому изменение вступает в силу на ближайшей ротации. Удаляются только файлы точного шаблона в `hldsmon_dir`; маркер краша и прочие файлы не трогаются.
+Все cvar'ы регистрируются с флагом `FCVAR_ARCHIVE` (сохраняются движком). Значения читаются «на лету» там, где это отмечено.
 
-Cvar'ы атрибуции `modnet`: `hldsmon_modnet` (default 0 — мастер-выключатель), `hldsmon_modnet_targets` (default `""` — пусто ⇒ встроенная пара `easy_http_amxx_i386.so`/`sockets_amxx_i386.so`), `hldsmon_modnet_rescan_sec` (default 5 — период rescan; плюс rescan по `SV_Spawn_f`).
+| Cvar | Default | Диапазон / примечание | Назначение |
+|---|---|---|---|
+| `hldsmon_enable` | `1` | `0`/`1` (вкл при `>0.5`) | Мастер-выключатель сбора. При `0` серверные и клиентские замеры и запись в лог прекращаются; переключатель `modnet` синхронизируется независимо. |
+| `hldsmon_client_hz` | `1` | `>0` Гц; `<=0` — выкл | Частота per-client замеров (staggered: интервал делится на число батчей `ceil(maxclients/8)`). |
+| `hldsmon_disk_hz` | `1` | `>0` Гц; `<=0` — выкл | Частота записи per-client записей на диск (тоже staggered). |
+| `hldsmon_flush_sec` | `1` | сек; `<=0` — без периодического flush | Период `fflush` лог-файла. |
+| `hldsmon_client_ring` | `300` | clamp `1..65536` | Размер кольца последних замеров на клиента (в памяти). Задаёт глубину окна для Δloss/Δchoke/delta_seq и drop-среза. |
+| `hldsmon_server_ring` | `3600` | clamp `1..262144` | Размер кольца серверных замеров (`3600` ≈ 1 ч при 1 Гц). |
+| `hldsmon_drop_window` | `60` | clamp `0..64` (большее обрезается) | Сколько последних per-client замеров вкладывается в каждую drop-запись (поле `window`). `0` — без среза. |
+| `hldsmon_dir` | `addons/hldsmon/logs` | путь | Каталог логов. Относительный путь разрешается от игровой директории (`pfnGetGameDir`), т.е. `<mod>/addons/hldsmon/logs`; путь с ведущим `/` — абсолютный. Недоступен ⇒ fallback `/tmp/hldsmon`. Создаётся рекурсивно, права `0700` (каталог) / `0600` (файл). |
+| `hldsmon_max_mb` | `512` | МБ; `0` — без лимита | Суточный лимит объёма текущего файла. При превышении запись останавливается до следующей суточной ротации. |
+| `hldsmon_ip_table` | `4096` | clamp `16..1048576`, округляется вверх до степени двойки | Размер хеш-таблицы уникальных IP (пакетная статистика). |
+| `hldsmon_retention_days` | `3` | `N>=1`; `<=0` — keep-all | Максимум одновременно хранимых дневных файлов, включая текущий (`3` ⇒ сегодня + 2 предыдущих). Перечитывается каждый server-tick, применяется при ближайшем open/ротации. Удаляются только файлы точного шаблона `hldsmon-YYYY-MM-DD.jsonl` в `hldsmon_dir`; маркер краша и прочие файлы не трогаются. |
+| `hldsmon_modnet` | `0` | `0`/`1` (вкл при `>0.5`) | Мастер-выключатель атрибуции трафика (`modnet`). |
+| `hldsmon_modnet_targets` | `""` | пробел-разделённые basename `.so` | Целевые in-process модули. Пусто ⇒ встроенный список `easy_http_amxx_i386.so sockets_amxx_i386.so`. |
+| `hldsmon_modnet_rescan_sec` | `5` | сек, минимум `1` | Период повторного сканирования GOT/PLT; дополнительно rescan инициируется по `SV_Spawn_f`. |
 
 ## Анализ (офлайн)
 
