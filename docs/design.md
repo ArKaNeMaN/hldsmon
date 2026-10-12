@@ -50,7 +50,7 @@
 - **`client_t`** (движковый `server.h`, доступ через `IRehldsServerStatic::GetClient_t(id)`): `active/spawned/fully_connected/connected` (booleans, **нет `cs_*` enum**), `netchan`, `chokecount`, `delta_sequence`, `latency`, `packet_loss`, `connecttime`, `cmdtime`, `connection_started`, `frames`, `edict`, `userinfo`, `userid`, `network_userid`, `proxy`, `fakeclient`.
 - **Семантика метрик:** `packet_loss`, `chokecount`, `GetPacketLoss()`, `GetChokeCount()` — вероятно кумулятивные/усреднённые. Хранить сырые + считать Δ/тренд; loss дополнительно выводить из прироста `incoming_sequence`/ack с учётом переполнения.
 - **Уже в движке:** команда `stats` (CPU%, суммарные in/out KB/s, uptime, users, FPS, players); `sv_remoteaccess` player-list; детекторы флуда `rehlds_security` (movecmd/stringcmd/dlfile/speedhack) с готовыми строками причин.
-- **Сборка:** HLDS 32-бит. Есть `gcc/g++ 11.4`, `clang`, `make`, `git`, `gh`; `cmake`/`ninja` нет (сборка Makefile). Требуется multilib (`gcc-multilib`).
+- **Сборка:** HLDS 32-бит, стандарт **C++23**. Канонический тулчейн — образ `hun1er/oracle-7-cxx-build-env-gnu` (**GCC 16.2.0** на glibc **2.17**, пинован по digest `sha256:4e3334c1…`), используется и в CI, и для деплой-бинарника; статический линк libgcc/libstdc++ + `_GLIBCXX_USE_CXX11_ABI=0` ⇒ максимум `GLIBC_2.17`. Локально — `make` с GCC ≥ 11 + multilib (`gcc-multilib`), только для разработки/тестов. `cmake`/`ninja` нет (сборка Makefile).
 
 ---
 
@@ -279,7 +279,7 @@ HldsMonitoring/
     └── tests/
 ```
 
-- **Сборка:** Makefile, `-m32 -fPIC -shared`, `-Wall -Wextra`, `-ldl`, `version_script.lds` (экспорт `GiveFnptrsToDll/Meta_*/GetEntityAPI2/GetNewDLLFunctions/GetEngineFunctions`).
+- **Сборка:** Makefile, `-std=c++23 -m32 -fPIC -shared`, `-Wall -Wextra -Werror`, `-ldl`, `version_script.lds` (экспорт `GiveFnptrsToDll/Meta_*/GetEntityAPI2/GetNewDLLFunctions/GetEngineFunctions`). Канонический тулчейн — oracle-образ (GCC 16.2.0, glibc 2.17, пинован по digest).
 - **Заголовки:** вендорить из `metamod-r/extra/example/include` (HLSDK+metamod+`rehlds_api.h`) + движковые `server.h`/`net.h`; при вендоринге **сверить сигнатуры хуков** и зафиксировать версию/коммит.
 - **Хостовые тесты:** компилируются без движка (`make test`) — только `metrics.h/ring_buffer.h/delta.h/serialization.*`.
 

@@ -2,7 +2,11 @@
 # Build: 32-bit Metamod plugin (Linux). Tests: host-native core + python analyzer.
 
 CXX      ?= g++
-CC       ?= gcc
+# make predefines CC=cc; the oracle build image ships gcc but no `cc` symlink,
+# so only override the built-in default (keeps env/command-line overrides).
+ifeq ($(origin CC),default)
+CC       := gcc
+endif
 PYTHON   ?= python3
 
 # ---- vendored include dirs (system-style: suppress third-party warnings) ----
@@ -24,13 +28,13 @@ PLUGIN_DEFS := \
 	-DHAVE_STRONG_TYPEDEF
 
 WARN       := -Wall -Wextra -Werror
-BASE_FLAGS := -std=c++17 $(WARN) -O2
+BASE_FLAGS := -std=c++23 $(WARN) -O2
 PLUGIN_FLAGS := $(BASE_FLAGS) -m32 -fPIC -shared $(PLUGIN_DEFS) $(VENDOR_INC)
 HOST_FLAGS := $(BASE_FLAGS) -Isrc -pthread
 # 32-bit synthetic GOT/PLT harness (M-P5): driver + target objects, no engine headers.
 HARNESS_DIR    := build/modnet_harness
 HARNESS_SRCS   := src/modnet_got.cpp src/modnet.cpp
-HARNESS_FLAGS  := -std=c++17 $(WARN) -O2 -m32 -Isrc
+HARNESS_FLAGS  := -std=c++23 $(WARN) -O2 -m32 -Isrc
 HARNESS_TFLAGS := $(WARN) -O2 -m32 -fPIC -shared -fno-optimize-sibling-calls
 
 TARGET := HldsMonitoring_mm_i386.so

@@ -16,9 +16,10 @@ Native Metamod-плагин для ReHLDS (Half-Life Dedicated Server), соби
 - **Скиллы ролей:** design → `software-architect`; code → `developer`; tests/DoD → `qa-engineer`; сборка/деплой → `devops-engineer`; безопасность → `security-engineer`.
 
 ## Команды верификации
-- `make` — сборка плагина (32-бит, `-m32`).
+- `make` — сборка плагина (32-бит, `-m32`, C++23).
 - `make test` — хостовые unit-тесты (C++) + тесты инструментов анализа (Python).
 - `make clean` — очистка.
+- Канонический тулчейн (CI + деплой-бинарник) — образ `hun1er/oracle-7-cxx-build-env-gnu` (GCC 16.2.0, glibc 2.17), пинован по digest; см. `README.md` → «Сборка».
 - Линтер: компилятор с `-Wall -Wextra` (отдельного линтера нет).
 
 ## Политика коммитов

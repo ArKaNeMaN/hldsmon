@@ -7,22 +7,22 @@ Native Metamod-плагин для ReHLDS (Half-Life Dedicated Server, GoldSrc),
 
 ## Сборка
 
-```bash
-make            # -> HldsMonitoring_mm_i386.so (32-bit, -Wall -Wextra -Werror)
-make verify-exports   # определённые символы ровно = exports.whitelist
-make test       # C++ host-тесты ядра + Python-тесты анализатора
-make test-modnet-harness   # 32-битный синтетический .so-стенд атрибуции modnet
-make clean
-```
+Стандарт — **C++23**. Канонический тулчейн (и для CI, и для деплой-артефакта) — образ
+`hun1er/oracle-7-cxx-build-env-gnu` (**GCC 16.2.0**, glibc **2.17**), пинованный по digest:
 
-Требуется `gcc/g++` с multilib (`gcc-multilib g++-multilib libc6-dev-i386`) и `python3`.
+```bash
+IMG='hun1er/oracle-7-cxx-build-env-gnu@sha256:4e3334c189a05c51a40050b14e7db05dadd42af283c9d6e4bf9bc0b6c6ca2191'
+
+# сборка плагина + проверки (ровно то, что делает CI):
+docker run --rm -v "$PWD":/src -w /src "$IMG" \
+  bash -lc 'make clean && make && make verify-exports && make test-modnet-harness'
+
+# host-тесты ядра + Python-тесты анализатора:
+docker run --rm -v "$PWD":/src -w /src "$IMG" bash -lc 'make test'
+```
 
 ### Совместимость со старым хостингом (важно)
-Целевой хостинг имеет старую glibc (≤ 2.17). Плагин **статически** линкует `libgcc`/`libstdc++` и не должен требовать glibc выше **2.17**. Собирайте совместимый бинарник образом `hun1er/oracle-7-cxx-build-env-gnu`:
-
-```bash
-docker run --rm -v "$PWD":/src -w /src hun1er/oracle-7-cxx-build-env-gnu make
-```
+Целевой хостинг имеет старую glibc (≤ 2.17). Плагин **статически** линкует `libgcc`/`libstdc++` и не должен требовать glibc выше **2.17**. Собирайте деплой-бинарник указанным выше oracle-образом (GCC 16 держит glibc 2.17 — проверено).
 
 Проверка (обе команды обязательны):
 ```bash
@@ -30,7 +30,9 @@ objdump -T HldsMonitoring_mm_i386.so | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail
 readelf -d HldsMonitoring_mm_i386.so | grep NEEDED                                  # без libstdc++/libgcc
 ```
 
-Готовый разворачиваемый бинарник (GLIBC_2.17): `dist/HldsMonitoring_mm_i386.so`. Локальный `make` в новом дистрибутиве даёт `.so`, требующий более свежую glibc (годится только для разработки/тестов) — для деплоя используйте oracle-образ выше.
+Готовый разворачиваемый бинарник (GLIBC_2.17): `dist/HldsMonitoring_mm_i386.so`.
+Локальная разработка: в дистрибутиве с GCC ≥ 11 и multilib (`gcc-multilib g++-multilib libc6-dev-i386`) обычный `make`/`make test` работает, но локальный `.so` требует более свежую glibc и годится только для разработки/тестов — для деплоя используйте oracle-образ выше.
+
 
 ## Установка
 
@@ -143,9 +145,9 @@ INV-1 пассивность (`callNext`+propagate, `PreprocessPacket` нико�
 
 ## CI и релизы
 
-GitHub Actions (`.github/workflows/ci.yml`):
-- **tests** — `make test` (host C++ ядро + Python-тесты анализатора);
-- **plugin** — сборка 32-бит `.so` в образе `manylinux2014_i686` (CentOS 7, glibc 2.17) + проверки `verify-exports`, `GLIBC ≤ 2.17` и отсутствия динамических `libstdc++`/`libgcc`; артефакт `HldsMonitoring_mm_i386.so`;
+GitHub Actions (`.github/workflows/ci.yml`) — оба C++-job'а идут в пинованном oracle-образе (**GCC 16, C++23**, glibc 2.17):
+- **tests** — `make test` (host C++ ядро + Python-тесты анализатора) в oracle-образе;
+- **plugin** — сборка 32-бит `.so` в oracle-образе + проверки `verify-exports`, `GLIBC ≤ 2.17` и отсутствия динамических `libstdc++`/`libgcc`; артефакт `HldsMonitoring_mm_i386.so`;
 - **analyzer-binaries** — одиночный бинарник веб-UI (PyInstaller) для Linux и Windows (`hldsmon-webui` / `hldsmon-webui.exe`);
 - **release** — на тег `v*` прикрепляет плагин и бинарники к GitHub Release.
 

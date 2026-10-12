@@ -10,24 +10,31 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Sole build/test toolchain (CI and release): GCC 16.2.0 on glibc 2.17.
+# Pinned by digest for reproducibility. See README "Сборка" / docs/design.md §3.
+env:
+  BUILD_IMAGE: hun1er/oracle-7-cxx-build-env-gnu@sha256:4e3334c189a05c51a40050b14e7db05dadd42af283c9d6e4bf9bc0b6c6ca2191
+
 jobs:
   tests:
-    name: Host core + analyzer tests
+    name: Host core + analyzer tests (oracle image, C++23)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: make test (host C++ core + Python analyzer)
-        run: make test
+      - name: make test in oracle image
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src "$BUILD_IMAGE" \
+            bash -lc 'make test'
 
   plugin:
     name: Plugin .so (32-bit, glibc <= 2.17)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build in manylinux2014_i686 (CentOS 7 toolchain)
+      - name: Build + host checks in oracle image (GCC 16, C++23, glibc 2.17)
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_i686 \
-            bash -lc 'for d in /opt/rh/devtoolset-*/enable; do source "$d" && break; done; make clean && make && make verify-exports && make test-modnet-harness'
+          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src "$BUILD_IMAGE" \
+            bash -lc 'make clean && make && make verify-exports && make test-modnet-harness'
       - name: Assert GLIBC <= 2.17 and no dynamic libstdc++/libgcc
         run: |
           set -e
