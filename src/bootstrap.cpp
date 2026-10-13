@@ -23,7 +23,7 @@ IRehldsServerStatic* g_RehldsSvs   = nullptr;
 plugin_info_t Plugin_info = {
     META_INTERFACE_VERSION,   // ifvers
     "HldsMonitoring",         // name
-    "0.4.0",                  // version
+    "0.4.1",                  // version
     __DATE__,                 // date
     "Sisyphus",               // author
     "",                       // url

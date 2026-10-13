@@ -621,6 +621,25 @@
   }
   .ftp-reached { font-size: 12px; color: var(--ok); }
   .ftp-cap { font-size: 12px; color: var(--warn); }
+
+  /* ------------------------------------------------------------------ */
+  /*  Stage 13 «instant-period» — min/max band (per-metric charts),       */
+  /*  two-level timeline (detail brush), selective-section toggles.       */
+  /* ------------------------------------------------------------------ */
+  .chart-svg .band { stroke: none; }
+  .period-detail-row { margin-top: 3px; }
+  .period-detail-row .period-timeline { margin-bottom: 0; }
+  .period-detail-row .period-brush { width: 100%; height: 22px; }
+  .period-detail-row .period-timeline-label { margin-top: 1px; font-size: 10.5px; line-height: 1.15; white-space: nowrap; }
+  .period-detail-row .period-timeline-empty { padding: 0; font-size: 11px; }
+  .mode-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-mut); }
+  .mode-toggle select {
+    font: inherit; font-size: 11.5px; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 3px 7px;
+  }
+  .mode-toggle select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .sections-list { display: flex; flex-wrap: wrap; gap: 6px var(--sp-3); align-items: center; }
 </style>
 </head>
 <body>
@@ -909,6 +928,8 @@ const state = {
   dropSearch: "",                    // persisted search text (drops table)
   allSeries: ["fps", "frame_ms_avg", "cpu_pct", "players"], // combined chart selection
   allNormalize: true,                // combined chart normalized to 0–100%
+  allMode: "max",                    // O12: combined chart shows min OR max (never both)
+  sections: null,                    // REQ-I10/O15: per-block enable flags (null -> all on)
   playerMetrics: [],                 // overlay: chosen client metric keys (single global set, persisted)
   datasetsHelpOpen: false,           // combined panel «Справка» list shown/hidden
   page: { clients: 1, drops: 1 },    // current page per table
@@ -1029,6 +1050,93 @@ function mergeSessions(listOfSeries) {
   return out;
 }
 
+/* ---- Stage 13 triplet contract: {t:[...], metric:{min,max,avg,n}} ----
+   computeView is the SINGLE normalization point. `projectTriplet` accepts either
+   the new bucketed triple form or a legacy flat array (defensive FTP/demo), and
+   returns {t, flat:{metric:avg[]}, proj:{metric:{min,max,avg,n}}}. Every consumer
+   downstream keeps working on the flat `avg` projection; band rendering reads
+   `proj`. */
+function projectTriplet(raw) {
+  raw = raw || {};
+  const t = Array.isArray(raw.t) ? raw.t.slice() : [];
+  const flat = {};
+  const proj = {};
+  for (const k in raw) {
+    if (k === "t") continue;
+    const v = raw[k];
+    if (v && !Array.isArray(v) && typeof v === "object" &&
+        (Array.isArray(v.avg) || Array.isArray(v.min) || Array.isArray(v.max))) {
+      const avg = Array.isArray(v.avg) ? v.avg.slice() : [];
+      const mn = Array.isArray(v.min) ? v.min.slice() : avg.slice();
+      const mx = Array.isArray(v.max) ? v.max.slice() : avg.slice();
+      const n = Array.isArray(v.n) ? v.n.slice() : avg.map(x => isNum(x) ? 1 : 0);
+      flat[k] = avg;
+      proj[k] = { min: mn, max: mx, avg: avg, n: n };
+    } else if (Array.isArray(v)) {
+      const arr = v.slice();
+      flat[k] = arr;
+      proj[k] = { min: arr.slice(), max: arr.slice(), avg: arr.slice(), n: arr.map(x => isNum(x) ? 1 : 0) };
+    }
+  }
+  return { t: t, flat: flat, proj: proj };
+}
+function sliceFlat(flat, idx) {
+  const o = {};
+  for (const k in flat) o[k] = sliceByIdx(flat[k], idx);
+  return o;
+}
+function sliceProj(proj, idx) {
+  const o = {};
+  for (const k in proj) {
+    const p = proj[k];
+    o[k] = { min: sliceByIdx(p.min, idx), max: sliceByIdx(p.max, idx),
+             avg: sliceByIdx(p.avg, idx), n: sliceByIdx(p.n, idx) };
+  }
+  return o;
+}
+/* flat projection of a sliced proj at one projection mode (`min`/`max`/`avg`). */
+function projAt(proj, key, mode) {
+  const p = proj && proj[key];
+  if (!p) return null;
+  const arr = p[mode];
+  return Array.isArray(arr) ? arr : p.avg;
+}
+/* per-sample caveat mask (OR-approx from the bucketed mask min/max). */
+function caveatMaskAt(proj, k) {
+  const p = proj && proj.caveat_mask;
+  if (!p) return null;
+  const a = p.min ? p.min[k] : null, b = p.max ? p.max[k] : null;
+  if (!isNum(a) && !isNum(b)) return null;
+  return (isNum(a) ? a : 0) | (isNum(b) ? b : 0);
+}
+/* min–max band for one metric (optionally scaled), or null when unavailable. */
+function metricBand(proj, key, scale) {
+  const p = proj && proj[key];
+  if (!p || !Array.isArray(p.min) || !Array.isArray(p.max)) return null;
+  const s = (typeof scale === "number") ? scale : 1;
+  return {
+    lo: p.min.map(v => isNum(v) ? v * s : null),
+    hi: p.max.map(v => isNum(v) ? v * s : null),
+  };
+}
+/* merge per-session projections in session order (aligns with mergeSessions t). */
+function mergeProjSessions(list) {
+  const out = {};
+  for (const pj of (list || [])) {
+    if (!pj) continue;
+    for (const k in pj) {
+      if (k === "t") continue;
+      const p = pj[k];
+      const o = out[k] || (out[k] = { min: [], max: [], avg: [], n: [] });
+      o.min = o.min.concat(Array.isArray(p.min) ? p.min : []);
+      o.max = o.max.concat(Array.isArray(p.max) ? p.max : []);
+      o.avg = o.avg.concat(Array.isArray(p.avg) ? p.avg : []);
+      o.n = o.n.concat(Array.isArray(p.n) ? p.n : []);
+    }
+  }
+  return out;
+}
+
 /* computeView: derive the period-filtered render model from a raw result. */
 function computeView(result) {
   result = result || {};
@@ -1038,24 +1146,36 @@ function computeView(result) {
   const active = isNum(from) || isNum(to);
 
   const rawSeries = result.series || {};
-  const sIdx = seriesIndices(rawSeries.t, lo, hi);
-  const series = {};
-  for (const k in rawSeries) series[k] = sliceByIdx(rawSeries[k], sIdx);
+  const projS = projectTriplet(rawSeries);
+  const sIdx = seriesIndices(projS.t, lo, hi);
+  const series = sliceFlat(projS.flat, sIdx);
+  series.t = sliceByIdx(projS.t, sIdx);
+  const seriesProj = sliceProj(projS.proj, sIdx);
+  seriesProj.t = series.t;
 
   const rawCS = result.client_series || {};
   const clientSeries = {};
+  const clientProj = {};
   for (const id in rawCS) {
-    const c = rawCS[id] || {};
-    const idx = seriesIndices(c.t, lo, hi);
-    const o = {};
-    for (const k in c) o[k] = sliceByIdx(c[k], idx);
+    const projC = projectTriplet(rawCS[id] || {});
+    const idx = seriesIndices(projC.t, lo, hi);
+    const o = sliceFlat(projC.flat, idx);
+    o.t = sliceByIdx(projC.t, idx);
     clientSeries[id] = o;
+    const pj = sliceProj(projC.proj, idx);
+    pj.t = o.t;
+    clientProj[id] = pj;
   }
 
   const rawHost = result.host_series || {};
-  const hIdx = seriesIndices(rawHost.t, lo, hi);
-  const hostSeries = {};
-  for (const k in rawHost) hostSeries[k] = sliceByIdx(rawHost[k], hIdx);
+  const projH = projectTriplet(rawHost);
+  const hIdx = seriesIndices(projH.t, lo, hi);
+  const hostSeries = sliceFlat(projH.flat, hIdx);
+  hostSeries.t = sliceByIdx(projH.t, hIdx);
+  const hostProj = sliceProj(projH.proj, hIdx);
+  hostProj.t = hostSeries.t;
+  /* per-bucket caveat mask (OR-approx) aligned to the sliced host axis. */
+  const hostMasks = hostSeries.t.map((_, k) => caveatMaskAt(hostProj, k));
 
   const config = (Array.isArray(result.config) ? result.config : [])
     .filter(c => !active || inRangeF(c.t, lo, hi));
@@ -1148,6 +1268,7 @@ function computeView(result) {
       return fa - fb || String(a.session).localeCompare(String(b.session));
     });
     const merged = mergeSessions(sessions.map(s => clientSeries[s.session]));
+    const mergedProj = mergeProjSessions(sessions.map(s => clientProj[s.session]));
     let firstT = isNum(g.first_t) ? g.first_t : null;
     let lastT = isNum(g.last_t) ? g.last_t : null;
     let samples = 0;
@@ -1166,6 +1287,7 @@ function computeView(result) {
       name: g.name || "",
       sessions,
       series: merged,
+      proj: mergedProj,
       first_t: firstT,
       last_t: lastT,
       samples,
@@ -1179,6 +1301,7 @@ function computeView(result) {
 
   return {
     result, series, clientSeries, hostSeries, config,
+    seriesProj, clientProj, hostProj, hostMasks,
     drops, events, clients, identities, players,
     active, lo, hi, tRange, fullRange,
     serverSamples: sIdx.length, clientSamples,
@@ -1277,6 +1400,7 @@ function httpErrorText(status, data) {
   const limit = data && isNum(data.limit_bytes) ? data.limit_bytes : null;
   if (code === "log_too_large") return "Файл превышает лимит клапана чтения" + (limit != null ? " (" + humanBytes(limit) + ")" : "") + ".";
   if (code === "session_expired") return "Сессия истекла — загрузите файл заново.";
+  if (code === "handle_body_conflict") return "Конфликт handle и тела запроса (400).";
   if (code === "unlimited_nonloopback_disabled") return "Безлимитный приём запрещён на не-loopback — запустите сервер с --allow-nonloopback-unlimited.";
   if (code === "request_timeout") return "Таймаут чтения запроса (408).";
   if (code === "busy") return "Сервер занят (лимит одновременных загрузок) — повторите позже (429).";
@@ -1386,56 +1510,168 @@ function analyzeViaXhr(url, blob, job) {
   });
 }
 
-/* fetchAnalyze: direct Blob upload + SERVER-SIDE period (stage 12).
-   - no from/to -> coarse whole-day overview + handle (downsampled series)
-   - from/to   -> materialized full-resolution window (coarse=false)
-   The period is chosen BEFORE the request; local results are never filtered
-   from a full-resolution payload client-side. `reset` starts a fresh upload.
-   Uses XMLHttpRequest (not fetch) so the upload-progress phase is observable;
-   a per-request `job` id drives the server-side parse-progress poll. */
+/* merge fields for the handle-form windowed response (coarse:false):
+   ONLY the windowed series/summary are replaced; the heavy whole-day lists
+   (`drops`/`clients`/`sessions`/`client_identities`/`anomalies`/`events`/`config`)
+   are KEPT from the coarse response (design §29.3 п.10 / N-M1). */
+const WINDOW_REPLACE_FIELDS = ["series", "client_series", "host_series",
+  "host_caveats", "focus_points"];
+/* heavy whole-day tables: present only in a coarse response; a coarse-recompute
+   replaces them while keeping the current windowed series (R3-m2). */
+const HEAVY_MERGE_FIELDS = ["drops", "clients", "sessions", "client_identities",
+  "anomalies", "anomalies_excluded", "events", "config"];
+
+/* requestAnalyzeWindow: handle-form `/api/analyze?handle=&from&to&sections=` with
+   NO body — served from the server-side session in O(window) (REQ-I1/I3). */
+async function requestAnalyzeWindow(from, to) {
+  const q = new URLSearchParams();
+  q.set("handle", state.handle);
+  if (isNum(from)) q.set("from", String(from));
+  if (isNum(to)) q.set("to", String(to));
+  const sp = sectionsParam();
+  if (sp) q.set("sections", sp);
+  const res = await fetch("/api/analyze?" + q.toString(), { method: "POST" });
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok || !data || data.ok !== true) {
+    const err = new Error(httpErrorText(res.status, data));
+    err.status = res.status;
+    err.code = data && data.code;
+    throw err;
+  }
+  return data;
+}
+
+/* uploadAnalyze: the FIRST (body) request — streams the composite Blob (never a
+   JS string) and receives `handle`. Used on the first analysis, a `reset`, and
+   the one-shot recovery after `session_expired`. */
+async function uploadAnalyze(from, to) {
+  const blob = state.fileBlob || buildUploadBlob(state.files);
+  state.fileBlob = blob;
+  const names = state.files.map(f => f.name);
+  const q = new URLSearchParams();
+  q.set("files", names.join(","));
+  if (isNum(from)) q.set("from", String(from));
+  if (isNum(to)) q.set("to", String(to));
+  const sp = sectionsParam();
+  if (sp) q.set("sections", sp);
+  const job = ftpNewJob();
+  q.set("job", job);
+  return analyzeViaXhr("/api/analyze?" + q.toString(), blob, job);
+}
+
+/* mergeAnalyzeResponse: fold a server payload into state.result.
+   - coarse:true (whole-day): adopt on first paint / reset; on a heavy-section
+     re-enable keep the current windowed series and replace ONLY the heavy tables.
+   - coarse:false (windowed): replace series/summary; KEEP heavy tables.
+   Never resets `state.fullRange` on a windowed response (N-M2). */
+function mergeAnalyzeResponse(data, meta) {
+  meta = meta || {};
+  const coarse = data.coarse === true;
+  const prev = state.result;
+  const windowActive = isNum(state.period.from) || isNum(state.period.to);
+  if (coarse) {
+    if (!prev || meta.reset || !windowActive) {
+      state.result = data;                 // initial/whole-day overview
+    } else {
+      const merged = Object.assign({}, prev);  // coarse-recompute: heavy tables only
+      for (const k of HEAVY_MERGE_FIELDS) if (k in data) merged[k] = data[k];
+      if (data.digest) merged.digest = data.digest;
+      merged.records_count = (data.records_count != null) ? data.records_count : prev.records_count;
+      merged.log_end = (data.log_end != null) ? data.log_end : prev.log_end;
+      merged.window = prev.window || data.window;
+      merged.window_count = data.window_count;
+      merged.handle = data.handle || prev.handle;
+      state.result = merged;
+    }
+    state.coarse = true;
+    state.window = state.result.window || data.window || null;
+    const p = data.digest && data.digest.period;
+    if (p && isNum(p.start)) state.fullRange = { start: p.start, end: isNum(p.end) ? p.end : null };
+  } else {
+    const base = prev || {};
+    const merged = Object.assign({}, base);
+    for (const k of WINDOW_REPLACE_FIELDS) if (k in data) merged[k] = data[k];
+    if (data.digest) merged.digest = data.digest;
+    merged.handle = data.handle || base.handle;
+    merged.window = data.window || base.window;
+    merged.window_count = data.window_count;
+    merged.records_count = (data.records_count != null) ? data.records_count : base.records_count;
+    merged.log_end = (data.log_end != null) ? data.log_end : base.log_end;
+    state.result = merged;
+    state.coarse = false;
+    state.window = merged.window || null;
+    // N-M2: keep the WHOLE-log main-brush domain across windowed responses.
+    if (!state.fullRange) {
+      const p = data.digest && data.digest.period;
+      if (p && isNum(p.start)) state.fullRange = { start: p.start, end: isNum(p.end) ? p.end : null };
+    }
+  }
+}
+
+/* fetchAnalyze: FIRST request uploads the Blob (returns `handle`); every later
+   period change / window navigation reuses the handle with a NO-BODY request
+   (never re-sends the file). `session_expired` clears the handle and re-uploads
+   exactly once. `sections=` comes from the persisted per-block toggles. */
 async function fetchAnalyze(opts) {
   opts = opts || {};
   if (!state.files.length) { setStatus("Сначала выберите файлы.", "error"); return; }
   if (state.analyzing) return;
-  if (opts.reset) { state.period = { from: null, to: null }; }
-  const from = (opts.from !== undefined) ? opts.from : state.period.from;
-  const to = (opts.to !== undefined) ? opts.to : state.period.to;
+  if (opts.reset) {
+    state.period = { from: null, to: null };
+    state.handle = null;
+    state.coarse = false;
+    state.window = null;
+    state.fullRange = null;
+  }
+  const useHandle = state.source === "local" && !!state.handle && !opts.reset;
+  const from = opts.coarse ? null : ((opts.from !== undefined) ? opts.from : state.period.from);
+  const to = opts.coarse ? null : ((opts.to !== undefined) ? opts.to : state.period.to);
+  const windowed = isNum(from) || isNum(to);
   state.analyzing = true;
   setLoading(true);
-  setStatus((isNum(from) || isNum(to)) ? "Запрос окна…" : "Загрузка и анализ (обзор дня)…", "info");
-  localProgressStart();
+  setStatus(windowed ? "Запрос окна…" : "Анализ (обзор дня)…", "info");
+  let usedProgress = false;
+  if (!useHandle) { localProgressStart(); usedProgress = true; }
   try {
-    const blob = state.fileBlob || buildUploadBlob(state.files);
-    state.fileBlob = blob;
-    const names = state.files.map(f => f.name);
-    const q = new URLSearchParams();
-    q.set("files", names.join(","));
-    if (isNum(from)) q.set("from", String(from));
-    if (isNum(to)) q.set("to", String(to));
-    const job = ftpNewJob();
-    q.set("job", job);
-    const data = await analyzeViaXhr("/api/analyze?" + q.toString(), blob, job);
+    let data;
+    if (useHandle) {
+      try {
+        data = await requestAnalyzeWindow(from, to);
+      } catch (err) {
+        if (err && err.code === "session_expired") {
+          // handle evicted/expired -> clear + re-upload exactly once
+          state.handle = null;
+          setExportEnabled(false);
+          if (!usedProgress) { localProgressStart(); usedProgress = true; }
+          data = await uploadAnalyze(from, to);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      data = await uploadAnalyze(from, to);
+    }
     revokeUrls();
     state.source = "local";
     state.demo = false;
-    state.handle = data.handle || null;
-    state.coarse = data.coarse === true;
-    state.window = data.window || null;
-    state.period = { from: isNum(from) ? from : null, to: isNum(to) ? to : null };
-    const p = data.digest && data.digest.period;
-    if (p && isNum(p.start)) state.fullRange = { start: p.start, end: isNum(p.end) ? p.end : null };
+    state.handle = data.handle || state.handle || null;
+    if (opts.from !== undefined || opts.to !== undefined) {
+      state.period = { from: isNum(from) ? from : null, to: isNum(to) ? to : null };
+    }
+    mergeAnalyzeResponse(data, { reset: !!opts.reset });
     if (opts.reset) state.selectedClient = null;
-    render(data);
+    render(state.result);
     const mode = state.coarse
       ? "обзор дня"
       : ("окно " + fmtInt(data.window_count) + " записей");
-    setStatus("Готово: " + fmtInt(data.records_count) + " записей из " + names.length + " файл(ов) · " + mode + ".", "ok");
+    setStatus("Готово: " + fmtInt(state.result.records_count) + " записей · " + mode + ".", "ok");
   } catch (err) {
     const msg = (err && err.message ? err.message : String(err));
     setStatus("Ошибка анализа: " + msg, "error");
     toast("Ошибка анализа: " + msg, "error");
   } finally {
-    localProgressHide();
+    if (usedProgress) localProgressHide();
     state.analyzing = false;
     setLoading(false);
   }
@@ -1793,6 +2029,67 @@ function datasetsSave() {
 const STICKY_KEY = "hldsmon.ui.sticky.v1";
 /* compact «Период» target height in px (QAS-L17; asserted by the page selfTest) */
 const PERIOD_MAX_HEIGHT_PX = 96;
+
+/* ---------- Stage 13 «instant-period»: combined-chart mode + section toggles ---------- */
+/* O12: the general «Все датасеты» chart shows ONE of min/max (never both, no band).
+   Per-metric charts always draw the min–max band + avg line. Persisted globally. */
+const ALLMODE_KEY = "hldsmon.ui.allmode.v1";
+/* REQ-I10/O15: canonical section keys (design §29.3 п.11 / R3-m1; key == payload
+   field). Toggling a block persists globally; disabled sections are neither
+   requested (`sections=`) nor rendered. Default = all on. */
+const SECTION_KEYS = ["digest", "series", "host_series", "client_series",
+  "client_identities", "clients", "sessions", "drops", "anomalies", "events",
+  "config", "focus_points"];
+/* heavy sections live only in a coarse (whole-day) response: re-enabling one
+   under an active window needs a coarse-recompute (handle, no from/to). */
+const HEAVY_SECTIONS = { client_identities: 1, clients: 1, sessions: 1, drops: 1, anomalies: 1, events: 1, config: 1 };
+const SECTIONS_KEY = "hldsmon.ui.sections.v1";
+/* two-level timeline: the detail brush auto-appears when the selected window is
+   narrower than this fraction of the whole-log span (O14/REQ-I11). */
+const DETAIL_TIMELINE_RATIO = 0.05;
+
+function isHeavySection(key) { return HEAVY_SECTIONS[key] === 1; }
+/* enabled section keys (default: every canonical key). */
+function enabledSections() {
+  return SECTION_KEYS.filter(k => !state.sections || state.sections[k] !== false);
+}
+/* true when a payload field should be requested/rendered. */
+function sec(key) { return !state.sections || state.sections[key] !== false; }
+/* `sections=` query value; null when everything is on (server default = all). */
+function sectionsParam() {
+  const en = enabledSections();
+  if (en.length === SECTION_KEYS.length) return null;
+  return en.length ? en.join(",") : "";
+}
+
+function allModeLoad() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  let v = null;
+  try { v = store.getItem(ALLMODE_KEY); } catch (e) { v = null; }
+  if (v === "min" || v === "max") state.allMode = v;
+}
+function allModeSave() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  try { store.setItem(ALLMODE_KEY, state.allMode); } catch (e) { /* unavailable */ }
+}
+function sectionsLoad() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  let d = null;
+  try { d = JSON.parse(store.getItem(SECTIONS_KEY) || "null"); } catch (e) { d = null; }
+  if (!d || typeof d !== "object") return;
+  const out = {};
+  for (const k of SECTION_KEYS) out[k] = (d[k] === false) ? false : true;
+  state.sections = out;
+}
+function sectionsSave() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  try { store.setItem(SECTIONS_KEY, JSON.stringify(state.sections || {})); }
+  catch (e) { /* unavailable */ }
+}
 /* follow hit area: dragging the right handle within this many SCREEN px of the
    track end turns following ON (no upper bound). Converted to viewBox/time units
    against the rendered SVG width inside buildPeriodTimeline.commit(). */
@@ -2207,7 +2504,7 @@ function buildPeriodPanel(result) {
   stickyLabel.appendChild(el("span", null, "закрепить"));
   headRow.appendChild(stickyLabel);
 
-  // second row: the timeline on its OWN full-width line
+  // second row: the main timeline on its OWN full-width line
   const tlRow = el("div", "period-timeline-row");
   const tl = el("div", "period-tl");
   tl.appendChild(buildPeriodTimeline(view, {
@@ -2215,6 +2512,22 @@ function buildPeriodPanel(result) {
     onCommit: (from, to) => applyPeriodValues(from, to),
   }));
   tlRow.appendChild(tl);
+
+  // third row: the DETAIL brush — domain = the selected window; auto-shown only
+  // when the window is narrower than DETAIL_TIMELINE_RATIO of the whole log.
+  const fullSpan = (isNum(fr.start) && isNum(fr.end)) ? (fr.end - fr.start) : null;
+  const winFrom = isNum(state.period.from) ? state.period.from : (isNum(fr.start) ? fr.start : null);
+  const winTo = isNum(state.period.to) ? state.period.to : (isNum(fr.end) ? fr.end : null);
+  const winSpan = (isNum(winFrom) && isNum(winTo)) ? (winTo - winFrom) : null;
+  if (fullSpan && fullSpan > 0 && winSpan != null && winSpan > 0 &&
+      winSpan < DETAIL_TIMELINE_RATIO * fullSpan) {
+    const dRow = el("div", "period-timeline-row period-detail-row");
+    dRow.id = "detailTimeline";
+    const dtl = el("div", "period-tl");
+    dtl.appendChild(buildDetailTimeline(view, winFrom, winTo));
+    dRow.appendChild(dtl);
+    tlRow.appendChild(dRow);
+  }
 
   const pill = (state.period.from != null || state.period.to != null) ? "фильтр активен" : "полный диапазон";
   const panelEl = panel("Период", pill, tlRow, headRow);
@@ -2224,32 +2537,29 @@ function buildPeriodPanel(result) {
   return panelEl;
 }
 
-/* buildPeriodTimeline: draggable brush spanning the FULL log range. */
-function buildPeriodTimeline(view, cb) {
-  cb = cb || {};
-  const wrap = el("div", "period-timeline");
-  const fr = (view && view.fullRange) || {};
-  const fullStart = isNum(fr.start) ? fr.start : null;
-  const fullEnd = isNum(fr.end) ? fr.end : null;
-  if (fullStart == null || fullEnd == null || fullEnd <= fullStart) {
-    wrap.appendChild(el("div", "period-timeline-empty", "Недостаточно данных для таймлайна периода"));
-    return wrap;
-  }
-
-  const ts = (view.result && view.result.series && view.result.series.t) || [];
-  let sample = 1;
-  if (ts.length > 1 && isNum(ts[0]) && isNum(ts[1]) && ts[1] > ts[0]) sample = ts[1] - ts[0];
-
+/* makeBrush: a generic draggable range brush over a fixed domain. Used by the
+   main period timeline (domain = whole log) and the detail timeline (domain =
+   the selected window). opts: {domFrom, domTo, selFrom, selTo, sample, follow,
+   snapFollow, ariaLabel, detail, onLive(from,to), onCommit(from,to)}. Returns
+   {wrap}. */
+function makeBrush(opts) {
+  opts = opts || {};
   const VW = 720, VH = 44, tx0 = 12, tx1 = VW - 12;
-  const span = fullEnd - fullStart;
-  const t2x = t => tx0 + ((t - fullStart) / span) * (tx1 - tx0);
-  const x2t = x => fullStart + ((x - tx0) / (tx1 - tx0)) * span;
-  const clampT = t => Math.max(fullStart, Math.min(fullEnd, t));
-  const follow = !isNum(state.period.to);   // no upper bound == tracking the newest sample
+  const domFrom = opts.domFrom, domTo = opts.domTo;
+  const span = domTo - domFrom;
+  const sample = (isNum(opts.sample) && opts.sample > 0) ? opts.sample : 1;
+  const follow = !!opts.follow;
+  const wrap = el("div", "period-timeline");
+
+  const t2x = t => tx0 + ((t - domFrom) / span) * (tx1 - tx0);
+  const x2t = x => domFrom + ((x - tx0) / (tx1 - tx0)) * span;
+  const clampT = t => Math.max(domFrom, Math.min(domTo, t));
 
   const svg = svgEl("svg", {
-    class: "period-brush", viewBox: "0 0 " + VW + " " + VH,
-    preserveAspectRatio: "none", "aria-label": "Выбор периода",
+    class: "period-brush" + (opts.detail ? " detail" : ""),
+    viewBox: "0 0 " + VW + " " + VH,
+    preserveAspectRatio: "none",
+    "aria-label": opts.ariaLabel || "Выбор периода",
   });
   if (follow) svg.classList.add("follow");
 
@@ -2282,8 +2592,8 @@ function buildPeriodTimeline(view, cb) {
   wrap.appendChild(svg);
   wrap.appendChild(labelEl);
 
-  let curFrom = isNum(state.period.from) ? clampT(state.period.from) : fullStart;
-  let curTo = isNum(state.period.to) ? clampT(state.period.to) : fullEnd;
+  let curFrom = isNum(opts.selFrom) ? clampT(opts.selFrom) : domFrom;
+  let curTo = isNum(opts.selTo) ? clampT(opts.selTo) : domTo;
   if (curTo < curFrom) { const tmp = curFrom; curFrom = curTo; curTo = tmp; }
 
   function redraw() {
@@ -2302,12 +2612,12 @@ function buildPeriodTimeline(view, cb) {
     curFrom = clampT(from); curTo = clampT(to);
     if (curFrom > curTo) { const tmp = curFrom; curFrom = curTo; curTo = tmp; }
     redraw();
-    if (live && cb.onLive) cb.onLive(curFrom, curTo);
+    if (live && opts.onLive) opts.onLive(curFrom, curTo);
   }
   // atEnd: commit came from the right handle (drag/keyboard) -> snap the end back to follow.
   function commit(atEnd) {
     let from = curFrom, to = curTo;
-    if (atEnd && fullEnd != null) {
+    if (atEnd && opts.snapFollow && domTo != null) {
       // Follow turns ON only when the right handle lands within FOLLOW_SNAP_PX SCREEN px
       // of the track end. Convert screen px -> viewBox units via the rendered SVG width
       // (svg.getBoundingClientRect().width / VW), then viewBox units -> seconds.
@@ -2315,14 +2625,14 @@ function buildPeriodTimeline(view, cb) {
       const pxPerVb = rect.width ? (rect.width / VW) : 0;
       let snap = sample;   // safe fallback when the SVG is not laid out (width 0)
       if (pxPerVb > 0) snap = (FOLLOW_SNAP_PX / pxPerVb) / (tx1 - tx0) * span;
-      if (to >= fullEnd - snap) to = null;   // near the end -> no upper bound (follow ON)
+      if (to >= domTo - snap) to = null;   // near the end -> no upper bound (follow ON)
     }
-    if (cb.onCommit) cb.onCommit(from, to);
+    if (opts.onCommit) opts.onCommit(from, to);
   }
 
   function pointerTime(ev) {
     const rect = svg.getBoundingClientRect();
-    if (!rect.width) return fullStart;
+    if (!rect.width) return domFrom;
     const vx = ((ev.clientX - rect.left) / rect.width) * VW;
     return clampT(x2t(vx));
   }
@@ -2347,7 +2657,7 @@ function buildPeriodTimeline(view, cb) {
     else {
       const s = curTo - curFrom;
       let f = t - dragging.offset;
-      f = Math.max(fullStart, Math.min(fullEnd - s, f));
+      f = Math.max(domFrom, Math.min(domTo - s, f));
       setSel(f, f + s, true);
     }
   });
@@ -2381,13 +2691,60 @@ function buildPeriodTimeline(view, cb) {
   hRight.addEventListener("keyup", onKeyUp("to"));
 
   redraw();
-  return wrap;
+  return { wrap: wrap };
 }
 
-/* applyPeriodValues: the single funnel used by the timeline brush (the only period
-   editor). For local uploads the period is SERVER-side: re-request the window (the
-   file is streamed again as a Blob, never re-read into a JS string). FTP/demo keep
-   client-side filtering of the already-loaded data. */
+/* buildPeriodTimeline: the MAIN brush spanning the WHOLE log range. */
+function buildPeriodTimeline(view, cb) {
+  cb = cb || {};
+  const wrap = el("div", "period-timeline");
+  const fr = (view && view.fullRange) || {};
+  const fullStart = isNum(fr.start) ? fr.start : null;
+  const fullEnd = isNum(fr.end) ? fr.end : null;
+  if (fullStart == null || fullEnd == null || fullEnd <= fullStart) {
+    wrap.appendChild(el("div", "period-timeline-empty", "Недостаточно данных для таймлайна периода"));
+    return wrap;
+  }
+  const ts = (view.result && view.result.series && view.result.series.t) || [];
+  let sample = 1;
+  if (ts.length > 1 && isNum(ts[0]) && isNum(ts[1]) && ts[1] > ts[0]) sample = ts[1] - ts[0];
+  const brush = makeBrush({
+    domFrom: fullStart, domTo: fullEnd,
+    selFrom: isNum(state.period.from) ? state.period.from : fullStart,
+    selTo: isNum(state.period.to) ? state.period.to : fullEnd,
+    sample: sample,
+    follow: !isNum(state.period.to),
+    snapFollow: true,
+    ariaLabel: "Выбор периода",
+    onLive: cb.onLive,
+    onCommit: cb.onCommit,
+  });
+  return brush.wrap;
+}
+
+/* buildDetailTimeline: the SECOND brush, spanning ONLY the selected window.
+   Auto-shown when the window is narrower than DETAIL_TIMELINE_RATIO of the log;
+   its handles set a sub-range inside the window (repeated drag = nested zoom). */
+function buildDetailTimeline(view, winFrom, winTo) {
+  const wrap = el("div", "period-timeline");
+  if (!(isNum(winFrom) && isNum(winTo)) || winTo <= winFrom) return wrap;
+  const sample = Math.max(1, (winTo - winFrom) / 1000);
+  const brush = makeBrush({
+    domFrom: winFrom, domTo: winTo,
+    selFrom: winFrom, selTo: winTo,
+    sample: sample,
+    follow: false,
+    snapFollow: false,
+    detail: true,
+    ariaLabel: "Детальный период (внутри окна)",
+    onCommit: (from, to) => applyPeriodValues(from, to),
+  });
+  return brush.wrap;
+}
+
+/* applyPeriodValues: the single funnel used by BOTH timeline brushes. For local
+   uploads the period is SERVER-side and instant: a NO-BODY handle request (the
+   file is never re-sent). FTP/demo keep client-side filtering of loaded data. */
 function applyPeriodValues(from, to) {
   state.period = { from: from, to: to };
   if (state.source === "local") { fetchAnalyze({ from: from, to: to, reset: false }); return; }
@@ -2961,7 +3318,7 @@ function buildClientsPanel(view) {
 function buildChartsPanel(view) {
   const wrap = el("div", "charts");
   wrap.id = "serverCharts";
-  fillCharts(wrap, view.series, view.events);
+  fillCharts(wrap, view.series, view.events, view.seriesProj);
   return panel("Динамика по времени", null, wrap, buildEventTools());
 }
 
@@ -3188,36 +3545,41 @@ function buildCharts(series, opts) {
   opts = opts || {};
   const events = opts.events || (state.view && state.view.events) || [];
   const showEvents = opts.showEvents != null ? opts.showEvents : state.showEvents;
+  const proj = opts.proj || (state.view && state.view.seriesProj) || null;
   const wrap = el("div", "charts");
   if (!series || !Array.isArray(series.t) || !series.t.length) {
     wrap.appendChild(el("div", "empty", "нет серверных сэмплов"));
     return wrap;
   }
+  // per-metric server charts ALWAYS draw the min–max band + the avg line (O12).
   const specs = [
     { title: "FPS", unit: "", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "FPS", color: COLORS.fps, values: series.fps }] },
+      lines: [{ key: "fps", name: "FPS", color: COLORS.fps, values: series.fps }] },
     { title: "Кадр, мс", unit: "frame_ms", fmt: v => fmtFloat(v, 1),
       lines: [
-        { name: "min", color: COLORS.min, values: series.frame_ms_min },
-        { name: "avg", color: COLORS.avg, values: series.frame_ms_avg },
-        { name: "max", color: COLORS.max, values: series.frame_ms_max },
+        { key: "frame_ms_min", name: "min", color: COLORS.min, values: series.frame_ms_min },
+        { key: "frame_ms_avg", name: "avg", color: COLORS.avg, values: series.frame_ms_avg },
+        { key: "frame_ms_max", name: "max", color: COLORS.max, values: series.frame_ms_max },
       ] },
     { title: "CPU", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "CPU %", color: COLORS.cpu, values: series.cpu_pct }] },
+      lines: [{ key: "cpu_pct", name: "CPU %", color: COLORS.cpu, values: series.cpu_pct }] },
     { title: "RSS", unit: "МБ", fmt: v => fmtFloat(v, 0), zeroBase: true,
-      lines: [{ name: "RSS, МБ", color: COLORS.rss, values: (series.rss_kb || []).map(v => isNum(v) ? v / 1024 : null) }] },
+      lines: [{ key: "rss_kb", bandScale: 1 / 1024, name: "RSS, МБ", color: COLORS.rss, values: (series.rss_kb || []).map(v => isNum(v) ? v / 1024 : null) }] },
     { title: "Игроки", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
       lines: [
-        { name: "players", color: COLORS.players, values: series.players },
-        { name: "real", color: COLORS.real, values: series.real_players },
+        { key: "players", name: "players", color: COLORS.players, values: series.players },
+        { key: "real_players", name: "real", color: COLORS.real, values: series.real_players },
       ] },
     { title: "Трафик", unit: "KB/s", fmt: v => fmtFloat(v, 0), zeroBase: true,
       lines: [
-        { name: "in", color: COLORS.inK, values: series.in_kbps },
-        { name: "out", color: COLORS.outK, values: series.out_kbps },
+        { key: "in_kbps", name: "in", color: COLORS.inK, values: series.in_kbps },
+        { key: "out_kbps", name: "out", color: COLORS.outK, values: series.out_kbps },
       ] },
   ];
   for (const spec of specs) {
+    for (const l of spec.lines) {
+      if (proj && l.key && !l.band) l.band = metricBand(proj, l.key, l.bandScale);
+    }
     if (!spec.lines.some(l => Array.isArray(l.values) && l.values.some(isNum))) continue;
     wrap.appendChild(buildChart(series.t, spec, { events: events, showEvents: showEvents }));
   }
@@ -3226,14 +3588,19 @@ function buildCharts(series, opts) {
 }
 
 /* fillCharts: (re)build the server charts into an existing .charts host. */
-function fillCharts(host, series, events) {
+function fillCharts(host, series, events, proj) {
   host.textContent = "";
-  const built = buildCharts(series, { events: events, showEvents: state.showEvents });
+  const built = buildCharts(series, {
+    events: events, showEvents: state.showEvents,
+    proj: proj || (state.view && state.view.seriesProj) || null,
+  });
   while (built.firstChild) host.appendChild(built.firstChild);
 }
 
-/* client-chart specs from one client's parallel series */
+/* client-chart specs from one client's parallel series (per-metric band + avg) */
 function buildClientCharts(cs, opts) {
+  opts = opts || {};
+  const proj = opts.proj || null;
   const wrap = el("div", "charts");
   if (!cs || !Array.isArray(cs.t) || !cs.t.length) {
     wrap.appendChild(el("div", "empty", "нет данных клиента за выбранный период"));
@@ -3241,31 +3608,34 @@ function buildClientCharts(cs, opts) {
   }
   const specs = [
     { title: "Ping", unit: "мс", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "ping", color: COLORS.ping, values: cs.ping }] },
+      lines: [{ key: "ping", name: "ping", color: COLORS.ping, values: cs.ping }] },
     { title: "Loss", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "loss", color: COLORS.loss, values: cs.loss }] },
+      lines: [{ key: "loss", name: "loss", color: COLORS.loss, values: cs.loss }] },
     { title: "Choke", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "choke", color: COLORS.choke, values: cs.choke }] },
+      lines: [{ key: "choke", name: "choke", color: COLORS.choke, values: cs.choke }] },
     { title: "Reliable fill", unit: "%", fmt: v => fmtFloat(v, 1), zeroBase: true,
-      lines: [{ name: "rel_fill", color: COLORS.fill, values: cs.rel_fill }] },
+      lines: [{ key: "rel_fill", name: "rel_fill", color: COLORS.fill, values: cs.rel_fill }] },
   ];
   if (anyNum(cs.idle_ms)) specs.push(
     { title: "Простой, мс", unit: "мс", fmt: v => fmtFloat(v, 0), zeroBase: true,
-      lines: [{ name: "idle_ms", color: COLORS.idle, values: cs.idle_ms }] });
+      lines: [{ key: "idle_ms", name: "idle_ms", color: COLORS.idle, values: cs.idle_ms }] });
   if (anyNum(cs.delta_seq)) specs.push(
     { title: "Δ sequence", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
-      lines: [{ name: "delta_seq", color: COLORS.dseq, values: cs.delta_seq }] });
+      lines: [{ key: "delta_seq", name: "delta_seq", color: COLORS.dseq, values: cs.delta_seq }] });
   if (anyNum(cs.dloss)) specs.push(
     { title: "Δ loss", unit: "", fmt: v => fmtFloat(v, 0), zeroBase: true,
-      lines: [{ name: "dloss", color: COLORS.dloss, values: cs.dloss }] });
+      lines: [{ key: "dloss", name: "dloss", color: COLORS.dloss, values: cs.dloss }] });
   if (anyNum(cs.flow_in_kbps) || anyNum(cs.flow_out_kbps)) specs.push(
     { title: "Трафик, KB/s", unit: "KB/s", fmt: v => fmtFloat(v, 0), zeroBase: true,
       lines: [
-        { name: "in", color: COLORS.inK, values: cs.flow_in_kbps },
-        { name: "out", color: COLORS.outK, values: cs.flow_out_kbps },
+        { key: "flow_in_kbps", name: "in", color: COLORS.inK, values: cs.flow_in_kbps },
+        { key: "flow_out_kbps", name: "out", color: COLORS.outK, values: cs.flow_out_kbps },
       ] });
 
   for (const spec of specs) {
+    for (const l of spec.lines) {
+      if (proj && l.key && !l.band) l.band = metricBand(proj, l.key);
+    }
     if (!spec.lines.some(l => Array.isArray(l.values) && l.values.some(isNum))) continue;
     wrap.appendChild(buildChart(cs.t, spec, opts));
   }
@@ -3278,14 +3648,19 @@ function renderClientCharts(host, view, id) {
   if (id == null) { host.appendChild(el("div", "empty", "клиент не выбран")); return; }
   const sid = String(id);
   let cs = null;
+  let proj = null;
   if (sid.indexOf("player:") === 0) {
     const key = sid.slice(7);
     const p = (view && Array.isArray(view.players)) ? view.players.find(pp => String(pp.player) === key) : null;
     cs = p ? p.series : null;
+    proj = p ? p.proj : null;
   } else {
     cs = (view && view.clientSeries) ? view.clientSeries[sid] : null;
+    proj = (view && view.clientProj) ? view.clientProj[sid] : null;
   }
-  const built = buildClientCharts(cs, { events: (view && view.events) || [], showEvents: state.showEvents });
+  const built = buildClientCharts(cs, {
+    events: (view && view.events) || [], showEvents: state.showEvents, proj: proj,
+  });
   while (built.firstChild) host.appendChild(built.firstChild);
 }
 
@@ -3320,14 +3695,15 @@ function alignToServerTime(clientT, values, t) {
 /* step-resample a host series onto the server time axis (last sample <= t).
    A null sample stays null (gap: a missing value is never a zero), past the
    last host sample the line stops, and markers[i] flags the samples whose
-   caveat bit is set (value present but not attributable). */
-function alignHostToServerTime(hostSeries, key, t, caveatBit) {
+   caveat bit is set (value present but not attributable). Accepts the already
+   projected host arrays + per-bucket caveat masks (Stage 13 triplets). */
+function alignHostToServerTime(hostT, hostValues, hostMasks, t, caveatBit) {
   const n = Array.isArray(t) ? t.length : 0;
   const values = new Array(n).fill(null);
   const markers = new Array(n).fill(false);
-  const ht = (hostSeries && Array.isArray(hostSeries.t)) ? hostSeries.t : [];
-  const vals = (hostSeries && Array.isArray(hostSeries[key])) ? hostSeries[key] : [];
-  const masks = (hostSeries && Array.isArray(hostSeries.caveat_mask)) ? hostSeries.caveat_mask : [];
+  const ht = Array.isArray(hostT) ? hostT : [];
+  const vals = Array.isArray(hostValues) ? hostValues : [];
+  const masks = Array.isArray(hostMasks) ? hostMasks : [];
   const at = [];
   for (let k = 0; k < ht.length; k++) if (isNum(ht[k])) at.push(k);
   if (!at.length) return { values: values, markers: markers };
@@ -3367,26 +3743,42 @@ function syncClientPickers() {
   if (cp) cp.value = state.selectedClient != null ? String(state.selectedClient) : "";
 }
 
+/* general-chart dataset values: EXACTLY one projection (min OR max, never both,
+   never a band — O12). Falls back to the flat avg projection if a band is absent. */
+function datasetValues(view, key, mode, scale) {
+  const proj = view && view.seriesProj;
+  let arr = projAt(proj, key, mode);
+  if (!arr) arr = (view && view.series) ? view.series[key] : null;
+  if (!Array.isArray(arr)) return null;
+  if (typeof scale === "number") return arr.map(v => isNum(v) ? v * scale : null);
+  return arr;
+}
+
 function buildAllChart(view) {
   view = view || state.view;
   const series = (view && view.series) || {};
   const t = Array.isArray(series.t) ? series.t : [];
+  const mode = (state.allMode === "min") ? "min" : "max";   // O12: never both
   const chosen = ALL_DATASETS.filter(d => state.allSeries.indexOf(d.key) !== -1);
   const chosenHost = HOST_DATASETS.filter(d => state.allSeries.indexOf(d.key) !== -1);
   if (!chosen.length && !chosenHost.length) return el("div", "empty", "выберите хотя бы один датасет");
   const lines = [];
   for (const d of chosen) {
-    const values = d.values(series);
+    const values = datasetValues(view, d.key, mode, d.key === "rss_kb" ? 1 / 1024 : undefined);
     if (!Array.isArray(values) || !values.some(isNum)) continue;
     lines.push({ name: d.label, color: d.color, values: values, fmt: v => fmtFloat(v, d.dec), unit: d.unit });
   }
-  /* host rows: aligned to server time, null = gap, caveat bit = ring marker */
-  const hostSeries = (view && view.hostSeries) || null;
+  /* host rows: aligned to server time, null = gap, caveat bit = ring marker.
+     Uses the SAME single projection as the server datasets (no band). */
+  const hostProj = (view && view.hostProj) || null;
+  const hostT = (view && view.hostSeries && Array.isArray(view.hostSeries.t)) ? view.hostSeries.t : [];
+  const hostMasks = (view && view.hostMasks) || [];
   const hc = (view && view.result && view.result.host_caveats) || {};
-  if (chosenHost.length && hostSeries && Array.isArray(hostSeries.t) && hostSeries.t.length) {
+  if (chosenHost.length && hostT.length) {
     for (const d of chosenHost) {
       const info = hc[d.key] || null;
-      const aligned = alignHostToServerTime(hostSeries, d.key, t, info ? info.bit : 0);
+      const hv = projAt(hostProj, d.key, mode);
+      const aligned = alignHostToServerTime(hostT, hv, hostMasks, t, info ? info.bit : 0);
       if (!aligned.values.some(isNum)) continue;
       lines.push({
         name: d.label, color: d.color, values: aligned.values,
@@ -3600,6 +3992,24 @@ function buildAllPanel(view) {
     syncClientPickers();
   };
 
+  /* O12: the general chart shows ONE of min/max (never both, no band). The toggle
+     is instant — same payload, no request — and persisted globally. */
+  const modeLabel = el("label", "mode-toggle");
+  modeLabel.title = "Общий график: показывать min или max (никогда оба; без полосы)";
+  modeLabel.appendChild(document.createTextNode("режим "));
+  const modeSel = el("select");
+  modeSel.id = "allChartMode";
+  modeSel.setAttribute("aria-label", "Проекция общего графика");
+  [["max", "max"], ["min", "min"]].forEach(([v, t]) => modeSel.appendChild(new Option(t, v)));
+  modeSel.value = state.allMode === "min" ? "min" : "max";
+  modeSel.addEventListener("change", () => {
+    state.allMode = modeSel.value === "min" ? "min" : "max";
+    allModeSave();
+    fillAllChart(host, state.view);   // no request: same payload
+  });
+  modeLabel.appendChild(modeSel);
+  tools.appendChild(modeLabel);
+
   const nLabel = el("label", "evt-toggle");
   nLabel.title = "Нормировать каждый ряд к 0–100%, чтобы сравнить форму кривых";
   const nCb = el("input");
@@ -3709,6 +4119,14 @@ function buildChart(t, spec, opts) {
   for (const vals of plotVals) {
     for (const v of vals) { if (isNum(v)) { if (v < ymin) ymin = v; if (v > ymax) ymax = v; } }
   }
+  /* min–max bands must fit the plot: widen the y-range to include band extremes */
+  if (!normalize && !bars) {
+    for (const l of spec.lines) {
+      if (!l.band) continue;
+      for (const v of (l.band.lo || [])) if (isNum(v)) { if (v < ymin) ymin = v; if (v > ymax) ymax = v; }
+      for (const v of (l.band.hi || [])) if (isNum(v)) { if (v < ymin) ymin = v; if (v > ymax) ymax = v; }
+    }
+  }
   if (!isFinite(ymin)) { ymin = 0; ymax = 1; }
   if (normalize) { ymin = 0; ymax = 1; }
   else if (bars) {
@@ -3795,6 +4213,30 @@ function buildChart(t, spec, opts) {
     }
     svg.appendChild(barsG);
   } else {
+    /* min–max band (fill) behind each per-metric line: contiguous numeric runs,
+       upper edge along `hi`, lower edge back along `lo` (O12, per-metric charts). */
+    const bandG = svgEl("g", { class: "bands" });
+    for (let li = 0; li < spec.lines.length; li++) {
+      const b = spec.lines[li].band;
+      if (!b || !Array.isArray(b.lo) || !Array.isArray(b.hi)) continue;
+      let d = "", i = 0, drew = false;
+      while (i < n) {
+        if (!isNum(b.lo[i]) || !isNum(b.hi[i])) { i++; continue; }
+        let j = i;
+        while (j < n && isNum(b.lo[j]) && isNum(b.hi[j])) j++;
+        d += "M" + xs[i].toFixed(1) + " " + sy(b.hi[i]).toFixed(1) + " ";
+        for (let k = i + 1; k < j; k++) d += "L" + xs[k].toFixed(1) + " " + sy(b.hi[k]).toFixed(1) + " ";
+        for (let k = j - 1; k >= i; k--) d += "L" + xs[k].toFixed(1) + " " + sy(b.lo[k]).toFixed(1) + " ";
+        d += "Z ";
+        drew = true;
+        i = j;
+      }
+      if (drew) bandG.appendChild(svgEl("path", {
+        class: "band", d: d, fill: spec.lines[li].color, "fill-opacity": "0.15",
+      }));
+    }
+    svg.appendChild(bandG);
+
     /* line paths (null breaks the line) + caveat ring markers */
     const linesG = svgEl("g");
     for (let li = 0; li < spec.lines.length; li++) {
@@ -3919,6 +4361,59 @@ function syncTopbarHeight() {
   if (tb) document.documentElement.style.setProperty("--topbar-h", tb.offsetHeight + "px");
 }
 
+/* buildSectionsPanel: per-block enable/disable (REQ-I10/O15). Disabled sections
+   are neither requested (`sections=`) nor rendered; the choice persists globally.
+   Re-enabling under an active window: a LIGHT section => windowed handle request;
+   a HEAVY section => coarse-recompute (handle, no from/to) + heavy-table re-merge. */
+const SECTION_LABELS = {
+  digest: "Сводка", series: "Серверные ряды", host_series: "Host-метрики",
+  client_series: "Ряды клиентов", client_identities: "Идентичности",
+  clients: "Агрегаты клиентов", sessions: "Сессии/игроки", drops: "Отключения",
+  anomalies: "Аномалии", events: "События", config: "Конфигурация",
+  focus_points: "Фокус-события",
+};
+function buildSectionsPanel() {
+  const list = el("div", "sections-list");
+  for (const key of SECTION_KEYS) {
+    const lab = el("label", "evt-toggle");
+    lab.title = "Запрашивать и показывать секцию «" + (SECTION_LABELS[key] || key) + "» (состояние сохраняется)";
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.setAttribute("data-section-key", key);
+    cb.checked = sec(key);
+    cb.addEventListener("change", () => {
+      const nextOn = cb.checked;
+      state.sections = state.sections || {};
+      const probe = Object.assign({}, state.sections);
+      probe[key] = nextOn;
+      if (SECTION_KEYS.filter(k => probe[k] !== false).length === 0) {
+        cb.checked = true; return;   // keep at least one section enabled
+      }
+      state.sections[key] = nextOn;
+      sectionsSave();
+      if (nextOn && state.source === "local" && state.handle) {
+        if (isHeavySection(key)) {
+          fetchAnalyze({ coarse: true, reset: false });   // heavy => coarse-recompute
+        } else if (isNum(state.period.from) || isNum(state.period.to)) {
+          fetchAnalyze({ from: state.period.from, to: state.period.to, reset: false });  // light => window
+        } else {
+          fetchAnalyze({ coarse: true, reset: false });
+        }
+        return;
+      }
+      render(state.result);   // off (and non-local) => just re-render the gated blocks
+    });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(" " + (SECTION_LABELS[key] || key)));
+    list.appendChild(lab);
+  }
+  list.appendChild(el("span", "hint", "выключенные секции сервер не считает; тяжёлые возвращаются пересчётом"));
+  const enabled = enabledSections().length;
+  const p = panel("Секции данных", enabled + " из " + SECTION_KEYS.length, list);
+  p.id = "sectionsPanel";
+  return p;
+}
+
 function render(result) {
   if (!result) return;
   // Capture keyboard focus before tearing the DOM down, restore it afterwards.
@@ -3934,66 +4429,71 @@ function render(result) {
 
   setLogEndBadge(result.log_end);
 
+  // 0. selective sections (REQ-I10/O15) — first, so toggles stay reachable
+  results.appendChild(buildSectionsPanel());
+
   // 1. summary (period-aware)
-  results.appendChild(buildSummary(result, view));
+  if (sec("digest")) results.appendChild(buildSummary(result, view));
 
   // 2. period selector
   results.appendChild(buildPeriodPanel(result));
 
   // 3. anomalies counter + log-end line
-  results.appendChild(buildInfoLine(result));
+  if (sec("anomalies") || sec("events")) results.appendChild(buildInfoLine(result));
 
   // 4. combined "all datasets" overlay chart — FIRST data panel
-  results.appendChild(buildAllPanel(view));
+  if (sec("series")) results.appendChild(buildAllPanel(view));
 
   // 5. focus events (result.focus_points) — right after the combined panel
-  results.appendChild(buildFocusPanel(view, result));
+  if (sec("focus_points")) results.appendChild(buildFocusPanel(view, result));
 
   // 6. counts by type
-  results.appendChild(panel("Записи по типам", String(digest.records != null ? digest.records : (result.records_count || 0)) + " всего", buildTypes(digest.counts_by_type)));
+  if (sec("digest")) results.appendChild(panel("Записи по типам", String(digest.records != null ? digest.records : (result.records_count || 0)) + " всего", buildTypes(digest.counts_by_type)));
 
   // 6b. config snapshots + diffs (stage 10)
-  results.appendChild(buildConfigPanel(view, result));
+  if (sec("config")) results.appendChild(buildConfigPanel(view, result));
 
   // 7. server charts (with event bands)
-  results.appendChild(buildChartsPanel(view));
+  if (sec("series")) results.appendChild(buildChartsPanel(view));
 
   // 8. per-client charts + picker
-  results.appendChild(buildPerClientPanel(view));
+  if (sec("client_series")) results.appendChild(buildPerClientPanel(view));
 
   // 9. clients table (identity + period aggregates)
-  results.appendChild(buildClientsPanel(view));
+  if (sec("clients") || sec("sessions") || sec("client_identities")) results.appendChild(buildClientsPanel(view));
 
   // 10. drops over time (count bars) + drops table + incident bundle
-  results.appendChild(buildDropsChartPanel(view));
-  const bundleMins = el("input");
-  bundleMins.type = "number";
-  bundleMins.id = "bundleMins";
-  bundleMins.className = "bundle-mins";
-  bundleMins.min = "0";
-  bundleMins.max = "1440";
-  bundleMins.step = "1";
-  bundleMins.value = "2";
-  bundleMins.title = "Полуокно bundle вокруг drop, минут";
-  const minsLabel = el("label", "evt-toggle", "± мин ");
-  minsLabel.appendChild(bundleMins);
-  const bundleBtn = el("button", "btn sm ghost", "bundle");
-  bundleBtn.type = "button";
-  bundleBtn.title = "Скачать JSON-конверт инцидента (окно ±N мин) для последнего drop в периоде";
-  bundleBtn.disabled = state.demo || !state.handle;
-  bundleBtn.addEventListener("click", () => {
-    const drops = (view && Array.isArray(view.drops)) ? view.drops : [];
-    if (!drops.length) { toast("Нет drop в выбранном периоде.", "error"); return; }
-    const mins = parseFloat(bundleMins.value);
-    downloadBundle(drops[drops.length - 1], isNaN(mins) ? 2 : mins);
-  });
-  const dropTools = el("div", "head-tools");
-  dropTools.appendChild(minsLabel);
-  dropTools.appendChild(bundleBtn);
-  results.appendChild(panel("Отключения (drops)", fmtInt(view.drops.length) + " шт.", buildDropsPanel(view.drops), dropTools));
+  if (sec("drops")) {
+    results.appendChild(buildDropsChartPanel(view));
+    const bundleMins = el("input");
+    bundleMins.type = "number";
+    bundleMins.id = "bundleMins";
+    bundleMins.className = "bundle-mins";
+    bundleMins.min = "0";
+    bundleMins.max = "1440";
+    bundleMins.step = "1";
+    bundleMins.value = "2";
+    bundleMins.title = "Полуокно bundle вокруг drop, минут";
+    const minsLabel = el("label", "evt-toggle", "± мин ");
+    minsLabel.appendChild(bundleMins);
+    const bundleBtn = el("button", "btn sm ghost", "bundle");
+    bundleBtn.type = "button";
+    bundleBtn.title = "Скачать JSON-конверт инцидента (окно ±N мин) для последнего drop в периоде";
+    bundleBtn.disabled = state.demo || !state.handle;
+    bundleBtn.addEventListener("click", () => {
+      const drops = (view && Array.isArray(view.drops)) ? view.drops : [];
+      if (!drops.length) { toast("Нет drop в выбранном периоде.", "error"); return; }
+      const mins = parseFloat(bundleMins.value);
+      downloadBundle(drops[drops.length - 1], isNaN(mins) ? 2 : mins);
+    });
+    const dropTools = el("div", "head-tools");
+    dropTools.appendChild(minsLabel);
+    dropTools.appendChild(bundleBtn);
+    results.appendChild(panel("Отключения (drops)", fmtInt(view.drops.length) + " шт.", buildDropsPanel(view.drops), dropTools));
+  }
 
   // 11. anomalies
-  results.appendChild(panel("Аномалии", null, buildAnomalies(result.anomalies)));
+  if (sec("anomalies")) results.appendChild(panel("Аномалии", null, buildAnomalies(result.anomalies)));
 
   setModeBadge(!!state.demo);
   setExportEnabled(!state.demo && !!state.handle);
@@ -4053,6 +4553,27 @@ function panel(titleText, pillText, bodyEl, headExtra) {
 /* =====================================================================
    Demo dataset — rendered through the exact same path.
    ===================================================================== */
+/* wrap a legacy flat demo series into the Stage 13 triplet contract so the demo
+   travels the SAME normalization path (computeView) as a real server payload
+   (a demo point is exact -> min=max=avg, n=1/0). */
+function toTriplets(flat) {
+  flat = flat || {};
+  const out = { t: Array.isArray(flat.t) ? flat.t.slice() : [] };
+  for (const k in flat) {
+    if (k === "t") continue;
+    const arr = Array.isArray(flat[k]) ? flat[k] : [];
+    out[k] = {
+      min: arr.slice(), max: arr.slice(), avg: arr.slice(),
+      n: arr.map(v => isNum(v) ? 1 : 0),
+    };
+  }
+  return out;
+}
+function toTripletsMap(flatMap) {
+  const out = {};
+  for (const id in flatMap) out[id] = toTriplets(flatMap[id]);
+  return out;
+}
 function makeDemo() {
   const N = 60, t0 = 1712345678, dt = 1.0;
   const N1 = 30, t1 = t0 + (N - 1) * dt + 5;
@@ -4267,18 +4788,19 @@ function makeDemo() {
   };
 
   return {
-    ok: true, version: 1,
+    ok: true, version: 2,
     files: digest.files,
     digest: digest,
-    series: {
+    // Stage 13: demo series travel the SAME triplet contract as the server.
+    series: toTriplets({
       t: t,
       frame_ms_min: frameMin, frame_ms_avg: frameAvg, frame_ms_max: frameMax,
       cpu_pct: cpu, rss_kb: rss,
       players: players, real_players: real, edicts: edicts, fps: fps,
       in_kbps: inK, out_kbps: outK,
-    },
+    }),
     clients: clients,
-    client_series: client_series,
+    client_series: toTripletsMap(client_series),
     client_identities: client_identities,
     sessions: buildPlayerGroups(client_identities),
     session_count: sessionCount,
@@ -4292,7 +4814,7 @@ function makeDemo() {
     ],
     anomalies_excluded: anomalies_excluded,
     focus_points: focus_points,
-    host_series: hostSeries,
+    host_series: toTriplets(hostSeries),
     host_caveats: host_caveats,
     config: config,
     records_count: records_count,
@@ -4307,6 +4829,9 @@ function init() {
   state.collapsed = Object.assign({}, DEFAULT_COLLAPSED, collapsedLoad() || {});
   // Restore persisted combined-panel dataset settings (selection / normalize / events / per-player metrics).
   datasetsLoad();
+  // Restore the general-chart projection (O12) and the selective-section toggles (O15).
+  allModeLoad();
+  sectionsLoad();
   // Restore the sticky «Период» choice (REQ-L8) before the first render.
   stickyLoad();
 
@@ -4443,15 +4968,21 @@ async function checkHealth() {
 /* ----- self-test: render each builder on the demo set, catch throws ----- */
 function selfTest() {
   const demo = makeDemo();
+  // run the demo through computeView with a clean period so triplet consumption,
+  // band rendering and the timeline checks are deterministic (restored below).
+  const savedPeriod = state.period;
+  const savedView = state.view;
+  state.period = { from: null, to: null };
   const view = computeView(demo);
+  state.view = view;
   const checks = [
     ["summary", () => buildSummary(demo, view)],
     ["period", () => buildPeriodPanel(demo)],
     ["info-line", () => buildInfoLine(demo)],
     ["types", () => buildTypes(demo.digest.counts_by_type)],
-    ["charts+bands", () => buildCharts(demo.series, { events: demo.events, showEvents: true })],
+    ["charts+bands", () => buildCharts(view.series, { proj: view.seriesProj, events: view.events, showEvents: true })],
     ["charts-panel", () => buildChartsPanel(view)],
-    ["client-charts", () => buildClientCharts(demo.client_series["0:u7"], { events: demo.events, showEvents: true })],
+    ["client-charts", () => buildClientCharts(view.clientSeries["0:u7"], { proj: view.clientProj["0:u7"], events: view.events, showEvents: true })],
     ["per-client", () => buildPerClientPanel(view)],
     ["player-groups", () => buildPlayerGroups(demo.client_identities)],
     ["events-toggle", () => buildEventTools()],
@@ -4544,6 +5075,70 @@ function selfTest() {
       if (!ok) throw new Error("блок «Период» не отражает sticky-выключение");
       return node;
     }],
+    /* ---- Stage 13 UI QAS (I7/I14/I20/I21) — browser-only, outside `make test` ---- */
+    ["I7-per-chart-type", () => {
+      // general «Все датасеты»: ONE projection (min OR max), NEVER a min–max band
+      const all = buildAllChart(view);
+      if (all.querySelector && all.querySelector(".band")) throw new Error("общий график не должен рисовать band (min+max вместе)");
+      if (state.allMode !== "max" && state.allMode !== "min") throw new Error("неверный режим общего графика: " + state.allMode);
+      // per-metric charts ALWAYS draw the min–max band + the avg line
+      const per = buildCharts(view.series, { proj: view.seriesProj, events: view.events, showEvents: false });
+      if (per.querySelector && !per.querySelector(".band")) throw new Error("per-metric без min–max band");
+      const cl = buildClientCharts(view.clientSeries["0:u7"], { proj: view.clientProj["0:u7"], events: view.events, showEvents: false });
+      if (cl.querySelector && !cl.querySelector(".band")) throw new Error("клиентский per-metric без band");
+      return all;
+    }],
+    ["I14-mode-sections-persist", () => {
+      const store = ftpPrefsStore();
+      if (!store) throw new Error("localStorage недоступен");
+      if (ALLMODE_KEY.indexOf("hldsmon.ui.") !== 0 || SECTIONS_KEY.indexOf("hldsmon.ui.") !== 0) throw new Error("неверные ключи персиста");
+      const panelNode = buildSectionsPanel();
+      const boxes = panelNode.querySelectorAll("input[data-section-key]");
+      if (boxes.length !== SECTION_KEYS.length) throw new Error("не все секции в панели: " + boxes.length);
+      const rawMode = store.getItem(ALLMODE_KEY), rawSec = store.getItem(SECTIONS_KEY);
+      const prevMode = state.allMode, prevSec = state.sections;
+      try {
+        store.setItem(ALLMODE_KEY, "min"); state.allMode = "max"; allModeLoad();
+        if (state.allMode !== "min") throw new Error("режим общего графика не восстановлен");
+        const saved = {}; for (const k of SECTION_KEYS) saved[k] = false; saved.digest = true;
+        store.setItem(SECTIONS_KEY, JSON.stringify(saved)); sectionsLoad();
+        if (state.sections.digest !== true || state.sections.drops !== false) throw new Error("секции не восстановлены");
+        const p2 = buildSectionsPanel();
+        const cbDrop = p2.querySelector('input[data-section-key="drops"]');
+        if (!cbDrop || cbDrop.checked !== false) throw new Error("панель не отражает выключенную секцию");
+      } finally {
+        state.allMode = prevMode;
+        state.sections = prevSec;
+        if (rawMode == null) store.removeItem(ALLMODE_KEY); else store.setItem(ALLMODE_KEY, rawMode);
+        if (rawSec == null) store.removeItem(SECTIONS_KEY); else store.setItem(SECTIONS_KEY, rawSec);
+      }
+      return panelNode;
+    }],
+    ["I20-detail-timeline", () => {
+      const prev = state.period;
+      try {
+        state.period = { from: null, to: null };
+        const noWin = buildPeriodPanel(demo);
+        if (noWin.querySelector && noWin.querySelector("#detailTimeline")) throw new Error("детальный таймлайн показан без окна");
+        const fr = view.fullRange;
+        const span = fr.end - fr.start;
+        state.period = { from: fr.start, to: fr.start + span * 0.01 };   // 1% < DETAIL_TIMELINE_RATIO
+        const win = buildPeriodPanel(demo);
+        if (!win.querySelector || !win.querySelector("#detailTimeline")) throw new Error("нет детального таймлайна при узком окне");
+        return win;
+      } finally { state.period = prev; }
+    }],
+    ["I21-triplet-consumption", () => {
+      const n = view.series.t.length;
+      if (!(n > 0)) throw new Error("пустой t общего ряда");
+      if (!Array.isArray(view.series.fps) || view.series.fps.length !== n) throw new Error("flat-проекция avg общего ряда не совпала с t");
+      if (!view.seriesProj.fps || !Array.isArray(view.seriesProj.fps.min) || view.seriesProj.fps.min.length !== n) throw new Error("нет min/max-проекции серверного ряда");
+      const agg = aggregateSeries(view.clientSeries["0:u7"]);
+      if (!isNum(agg.ping_avg)) throw new Error("aggregateSeries на плоской проекции клиента сломан");
+      const p = (view.players && view.players.length) ? view.players[0] : null;
+      if (!p || !Array.isArray(p.series.t) || !p.proj || !p.proj.ping) throw new Error("player-group merge/proj сломан");
+      return view.result;
+    }],
   ];
   const resultsList = [];
   let failed = 0;
@@ -4558,6 +5153,8 @@ function selfTest() {
       resultsList.push("✗ " + name + ": " + (err && err.message ? err.message : String(err)));
     }
   }
+  state.period = savedPeriod;
+  state.view = savedView;
   const summary = "Самопроверка: " + (checks.length - failed) + "/" + checks.length + " ok";
   if (window.console && console.log) console.log("[self-test]", summary, resultsList);
   toast(summary + (failed ? (" · " + failed + " ошибок") : ""), failed ? "error" : "ok");
@@ -4566,7 +5163,7 @@ function selfTest() {
 
 document.addEventListener("DOMContentLoaded", init);
 // expose for manual console verification
-window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime, fetchAnalyze, buildUploadBlob, buildPeriodPanel, fmtRange, applySticky, ftpUpdateRange, STICKY_KEY, PERIOD_MAX_HEIGHT_PX };
+window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime, fetchAnalyze, buildUploadBlob, buildPeriodPanel, fmtRange, applySticky, ftpUpdateRange, STICKY_KEY, PERIOD_MAX_HEIGHT_PX, buildSectionsPanel, makeBrush, projectTriplet, datasetValues, requestAnalyzeWindow, mergeAnalyzeResponse, allModeLoad, sectionsLoad, allModeSave, sectionsSave, ALLMODE_KEY, SECTIONS_KEY, SECTION_KEYS, HEAVY_SECTIONS, DETAIL_TIMELINE_RATIO };
 </script>
 </body>
 </html>

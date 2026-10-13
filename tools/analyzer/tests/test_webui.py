@@ -88,19 +88,26 @@ class TestAnalyzeBytes(unittest.TestCase):
 
     def test_top_level_keys_and_files_echo(self):
         self.assertTrue(self.payload["ok"])
-        self.assertEqual(self.payload["version"], 1)
+        self.assertEqual(self.payload["version"], 2)
         self.assertEqual(self.payload["files"], ["day1.jsonl", "day2.jsonl"])
 
     def test_series_lengths_and_values(self):
         series = self.payload["series"]
-        for key, values in series.items():
-            self.assertEqual(len(values), 3, "series %s length" % key)
         self.assertEqual(series["t"], [1000.0, 1001.0, 1002.0])
-        self.assertEqual(series["frame_ms_min"], [1.0, 1.5, None])
-        self.assertEqual(series["frame_ms_max"], [3.0, 3.5, None])
-        self.assertEqual(series["real_players"], [4, 5, 6])
-        self.assertEqual(series["players"], [5, 6, 7])
-        self.assertEqual(series["out_kbps"], [2.5, 2.6, 2.7])
+        for key, value in series.items():
+            if key == "t":
+                continue
+            self.assertEqual(len(value["min"]), 3, "series %s length" % key)
+            self.assertEqual(len(value["max"]), 3, key)
+            self.assertEqual(len(value["avg"]), 3, key)
+            self.assertEqual(len(value["n"]), 3, key)
+        self.assertEqual(series["frame_ms_min"]["max"], [1.0, 1.5, None])
+        self.assertEqual(series["frame_ms_min"]["n"], [1, 1, 0])
+        self.assertEqual(series["frame_ms_max"]["max"], [3.0, 3.5, None])
+        self.assertEqual(series["real_players"]["min"], [4, 5, 6])
+        self.assertEqual(series["real_players"]["max"], [4, 5, 6])
+        self.assertEqual(series["players"]["max"], [5, 6, 7])
+        self.assertEqual(series["out_kbps"]["max"], [2.5, 2.6, 2.7])
 
     def test_clients_sorted_with_aggregates(self):
         clients = self.payload["clients"]
@@ -147,11 +154,13 @@ class TestAnalyzeBytes(unittest.TestCase):
         series = self.payload["client_series"]
         self.assertIn("0:i7:gNone", series)
         self.assertIn("0:i8:gNone", series)
-        self.assertEqual(len(series["0:i7:gNone"]["t"]), 2)
-        self.assertEqual(series["0:i7:gNone"]["ping"], [40, 50])
-        self.assertEqual(series["0:i7:gNone"]["loss"], [2, 4])
-        for name in ("t", "ping", "loss", "choke", "rel_fill"):
-            self.assertEqual(len(series["0:i7:gNone"][name]), 2, name)
+        i7 = series["0:i7:gNone"]
+        self.assertEqual(i7["t"], [1000.0, 1001.0])
+        self.assertEqual(i7["ping"]["max"], [40, 50])
+        self.assertEqual(i7["loss"]["max"], [2, 4])
+        for name in ("ping", "loss", "choke", "rel_fill"):
+            self.assertEqual(len(i7[name]["min"]), 2, name)
+            self.assertEqual(len(i7[name]["n"]), 2, name)
 
     def test_client_identities_shape(self):
         identities = self.payload["client_identities"]
@@ -307,9 +316,10 @@ class TestAnalyzeTelemetryPayload(unittest.TestCase):
                     "present_mask", "caveat_mask"):
             self.assertIn(key, host, key)
         self.assertEqual(host["t"], [1001.0, 1002.0])
-        self.assertEqual(host["udp_rcvbuf_errors"], [5, None])
-        self.assertEqual(host["udp_in_errors"], [None, 1])
-        self.assertEqual(host["caveat_mask"], [1, 1])
+        self.assertEqual(host["udp_rcvbuf_errors"]["max"], [5, None])
+        self.assertEqual(host["udp_rcvbuf_errors"]["n"], [1, 0])
+        self.assertEqual(host["udp_in_errors"]["max"], [None, 1])
+        self.assertEqual(host["caveat_mask"]["max"], [1, 1])
 
     def test_host_caveats_map_covers_fields(self):
         caveats = self.payload["host_caveats"]
@@ -419,7 +429,7 @@ class TestHTTP(unittest.TestCase):
         data = json.loads(body.decode("utf-8"))
         self.assertTrue(data["ok"])
         self.assertEqual(data["service"], "hldsmon-webui")
-        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["version"], 2)
 
     def test_post_analyze(self):
         status, headers, body = self._request(
@@ -1723,8 +1733,10 @@ class TestAnalyzeWindowContract(_LLSpoolEnv):
         ref_server = [hldsmon.server_series_value(r, "t")
                       for r, _ in ref if r.get("type") == "server"]
         self.assertEqual(payload["series"]["t"], ref_server)
-        for key, values in payload["series"].items():
-            self.assertEqual(len(values), len(ref_server), key)
+        for key, value in payload["series"].items():
+            if key == "t":
+                continue
+            self.assertEqual(len(value["min"]), len(ref_server), key)
 
     def test_windowed_full_resolution_and_default_downsampled(self):
         payload = self._analyze("?from=10000&to=10500")
@@ -1755,26 +1767,39 @@ class TestAnalyzeWindowContract(_LLSpoolEnv):
         self.assertEqual(webui.ANALYZE_DEFAULT_WINDOW_S, 1800.0)
         self.assertEqual(webui.SERIES_MAX_POINTS, 2000)
         self.assertEqual(hldsmon.SERIES_MAX_POINTS, 2000)
+        self.assertEqual(webui.CHART_MAX_POINTS, 2000)
+        self.assertEqual(hldsmon.CHART_MAX_POINTS, 2000)
+        self.assertEqual(webui.MIN_RESOLUTION_S, 1)
+        self.assertEqual(hldsmon.MIN_RESOLUTION_S, 1)
 
 
 class TestCoarseDownsampling(_LLSpoolEnv):
-    def test_coarse_series_capped_at_series_max_points(self):
-        n = webui.SERIES_MAX_POINTS + 5000
-        lines = [json.dumps({"type": "server", "t": 5000.0 + i, "fps": 60.0})
-                 for i in range(n)]
+    def test_coarse_buckets_capped_and_peaks_preserved(self):
+        n = webui.CHART_MAX_POINTS + 5000
+        spike = n // 2
+        lines = [
+            json.dumps({"type": "server", "t": 5000.0 + i,
+                        "fps": 600.0 if i == spike else 60.0})
+            for i in range(n)
+        ]
         body = ("\n".join(lines) + "\n").encode("utf-8")
         status, _, raw = self._post("/api/analyze", body)
         self.assertEqual(status, 200)
         payload = json.loads(raw)
         self.assertTrue(payload["coarse"])
         self.assertLessEqual(len(payload["series"]["t"]),
-                             webui.SERIES_MAX_POINTS)
+                             webui.CHART_MAX_POINTS)
         self.assertEqual(payload["records_count"], n)
+        # adaptive merge preserves the peak (min/max == per-second truth).
+        self.assertEqual(max(payload["series"]["fps"]["max"]), 600.0)
+        self.assertEqual(min(payload["series"]["fps"]["min"]), 60.0)
 
         full = self._post("/api/analyze?from=0&to=1000000", body)
         windowed = json.loads(full[2])
         self.assertFalse(windowed["coarse"])
-        self.assertEqual(len(windowed["series"]["t"]), n)
+        self.assertLessEqual(len(windowed["series"]["t"]),
+                             webui.CHART_MAX_POINTS)
+        self.assertEqual(max(windowed["series"]["fps"]["max"]), 600.0)
 
 
 class TestExportBundleViaHandle(_LLSpoolEnv):
@@ -1940,6 +1965,754 @@ class TestAnalysisMemory(unittest.TestCase):
                              RSS_WINDOW_SENS_MIB * 1024)
         self.assertGreater(thirty_count, five_count)
         self.assertLess(five_count, self.N)
+
+
+# ---------------------------------------------------------------------------
+# Stage 13 (instant-period) IP-P1: sparse index, analysis session, monotonicity
+# validation, and the real periodic spool sweeper (QAS-I3/I10/I12/I15/I16/I18).
+# ---------------------------------------------------------------------------
+
+def _write_lines(path, lines, newline="\n"):
+    with open(path, "wb") as fh:
+        for line in lines:
+            fh.write(line.encode("utf-8") + newline.encode("ascii"))
+
+
+class TestIterRecordsOffsets(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ipoff-")
+        self.path = os.path.join(self.dir, "log.jsonl")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_offsets_and_runs_match_iter_records(self):
+        lines = [
+            json.dumps({"type": "client", "t": 1.0, "id": 7, "ping": 10}),
+            json.dumps({"type": "shutdown", "t": 2.0, "reason": "graceful"}),
+            json.dumps({"type": "client", "t": 3.0, "id": 7, "ping": 20}),
+            json.dumps({"type": "crash", "t": 4.0}),
+            json.dumps({"type": "client", "t": 5.0, "id": 7, "ping": 30}),
+        ]
+        _write_lines(self.path, lines)
+        got = list(hldsmon.iter_records_offsets(self.path))
+        self.assertEqual([r for r, _, _, _ in got],
+                         list(hldsmon.iter_records(self.path)))
+        # run counts shutdown/crash strictly before the line (belongs to run).
+        self.assertEqual([run for _, run, _, _ in got], [0, 0, 1, 1, 2])
+        expected_offsets = []
+        pos = 0
+        for line in lines:
+            expected_offsets.append(pos)
+            pos += len(line.encode("utf-8")) + 1
+        self.assertEqual([off for _, _, off, _ in got], expected_offsets)
+        with open(self.path, "rb") as fh:
+            data = fh.read()
+        for _, _, off, _ in got:
+            self.assertEqual(data[off:off + 1], b"{")
+
+    def test_multibyte_and_crlf_offsets(self):
+        line1 = json.dumps({"type": "client", "t": 1.0, "name": "Привет"})
+        line2 = json.dumps({"type": "client", "t": 2.0, "name": "мир"})
+        with open(self.path, "wb") as fh:
+            fh.write((line1 + "\r\n").encode("utf-8"))
+            fh.write((line2 + "\r\n").encode("utf-8"))
+        got = list(hldsmon.iter_records_offsets(self.path))
+        self.assertEqual([hldsmon._record_ts(r) for r, _, _, _ in got],
+                         [1.0, 2.0])
+        expected2 = len((line1 + "\r\n").encode("utf-8"))
+        self.assertEqual([off for _, _, off, _ in got], [0, expected2])
+        with open(self.path, "rb") as fh:
+            data = fh.read()
+        self.assertTrue(data[expected2:].startswith(b"{"))
+        self.assertEqual([r for r, _, _, _ in got],
+                         list(hldsmon.iter_records(self.path)))
+
+    def test_bom_stripped_at_offset_zero(self):
+        with open(self.path, "wb") as fh:
+            fh.write(webui._BOM)
+            fh.write((json.dumps({"type": "server", "t": 1.0}) + "\n")
+                     .encode("utf-8"))
+        got = list(hldsmon.iter_records_offsets(self.path))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][2], 0)
+        self.assertEqual(hldsmon._record_ts(got[0][0]), 1.0)
+
+
+class TestIndexBuilder(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ipidx-")
+        self.path = os.path.join(self.dir, "log.jsonl")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_samples_carry_offset_and_run(self):
+        lines = [
+            json.dumps({"type": "client", "t": 1.0, "id": 7}),
+            json.dumps({"type": "shutdown", "t": 2.0}),
+            json.dumps({"type": "client", "t": 3.0, "id": 7}),
+            json.dumps({"type": "crash", "t": 4.0}),
+            json.dumps({"type": "client", "t": 5.0, "id": 7}),
+        ]
+        _write_lines(self.path, lines)
+        builder = hldsmon.IndexBuilder(step_s=0, step_bytes=0)
+        for _ in webui._iter_spool_pairs([self.path], index_builder=builder):
+            pass
+        ref = list(hldsmon.iter_records_offsets(self.path))
+        expected = [(r["t"], seg, off, run) for r, run, off, seg in ref]
+        self.assertEqual(builder.samples, expected)
+        self.assertEqual([s[3] for s in builder.samples], [0, 0, 1, 1, 2])
+        self.assertEqual(builder.t_lo, 1.0)
+        self.assertEqual(builder.t_hi, 5.0)
+        self.assertEqual(builder.segments, 1)
+        self.assertTrue(builder.monotonic)
+
+    def test_time_step_sampling(self):
+        builder = hldsmon.IndexBuilder(step_s=5, step_bytes=10 ** 12)
+        for t in range(11):
+            builder.add(float(t), 0, t * 10, 0)
+        self.assertEqual([s[0] for s in builder.samples], [0, 5, 10])
+
+    def test_byte_step_sampling(self):
+        builder = hldsmon.IndexBuilder(step_s=10 ** 9, step_bytes=100)
+        for off in (0, 50, 100, 150):
+            builder.add(0.0, 0, off, 0)
+        self.assertEqual([s[2] for s in builder.samples], [0, 100])
+
+    def test_cap_doubling_bounded_and_sorted(self):
+        builder = hldsmon.IndexBuilder(step_s=1, step_bytes=10 ** 12,
+                                       max_entries=8)
+        for t in range(1000):
+            builder.add(float(t), 0, t, 0)
+        self.assertLessEqual(len(builder.samples), 8)
+        self.assertEqual(builder.samples, sorted(builder.samples))
+        self.assertGreater(builder.step_s, 1)
+
+    def test_default_cap_is_index_max_entries(self):
+        self.assertEqual(webui.INDEX_MAX_ENTRIES, 20000)
+        builder = hldsmon.IndexBuilder()
+        self.assertEqual(builder.max_entries, hldsmon.INDEX_MAX_ENTRIES)
+        for t in range(120000):
+            builder.add(float(t), 0, t, 0)
+        self.assertLessEqual(len(builder.samples),
+                             hldsmon.INDEX_MAX_ENTRIES)
+        self.assertEqual(builder.samples, sorted(builder.samples))
+
+    def test_non_monotonic_sets_flag(self):
+        builder = hldsmon.IndexBuilder(step_s=10 ** 9, step_bytes=10 ** 12)
+        for t in (1.0, 2.0, 0.5):
+            builder.add(t, 0, 0, 0)
+        self.assertFalse(builder.monotonic)
+
+    def test_monotonic_true_for_sorted(self):
+        builder = hldsmon.IndexBuilder()
+        for t in (1.0, 2.0, 3.0):
+            builder.add(t, 0, 0, 0)
+        self.assertTrue(builder.monotonic)
+
+
+class TestInstantPeriodSession(_LLSpoolEnv):
+    def setUp(self):
+        super().setUp()
+        self._saved_analysis_bytes = webui._CONFIG.analysis_session_bytes
+        webui._CONFIG.analysis_session_bytes = (
+            webui.ANALYSIS_SESSION_MB * webui._MIB)
+
+    def tearDown(self):
+        webui._CONFIG.analysis_session_bytes = self._saved_analysis_bytes
+        super().tearDown()
+
+    def _analyze(self):
+        status, _, raw = self._post("/api/analyze", fixture_bytes())
+        self.assertEqual(status, 200, raw)
+        return json.loads(raw)
+
+    def test_one_pass_builds_coarse_and_index(self):
+        payload = self._analyze()
+        entry = webui.spool_get(payload["handle"])
+        self.assertIsNotNone(entry)
+        analysis = entry.analysis
+        self.assertIsNotNone(analysis)
+        self.assertIsNotNone(analysis.index)
+        self.assertTrue(analysis.index.samples)
+        self.assertEqual(analysis.t_lo,
+                         payload["digest"]["period"]["start"])
+        self.assertEqual(analysis.t_hi, payload["digest"]["period"]["end"])
+        self.assertEqual(analysis.summary["records"],
+                         payload["digest"]["records"])
+        self.assertEqual(analysis.summary["counts_by_type"],
+                         payload["digest"]["counts_by_type"])
+        self.assertEqual(analysis.summary["drop_count"], 1)
+        # fixture interleaves client t (1000.5 after server 1002) -> flagged.
+        self.assertFalse(analysis.monotonic)
+
+    def test_session_has_no_heavy_lists(self):
+        payload = self._analyze()
+        analysis = webui.spool_get(payload["handle"]).analysis
+        for heavy in ("drops", "clients", "sessions", "client_identities",
+                      "config", "events", "anomalies"):
+            self.assertNotIn(heavy, analysis.summary)
+        self.assertIsNone(analysis.coarse_series)
+        self.assertEqual(len(analysis.memo), 0)
+
+    def test_budget_drops_coarse_keeps_index(self):
+        payload = self._analyze()
+        analysis = webui.spool_get(payload["handle"]).analysis
+        analysis.coarse_series = {"t": [0.0] * 200000}
+        analysis.memo["k"] = ["x"] * 200000
+        webui._CONFIG.analysis_session_bytes = 1024
+        changed = webui._enforce_analysis_budget(analysis)
+        self.assertTrue(changed)
+        self.assertIsNone(analysis.coarse_series)
+        self.assertEqual(len(analysis.memo), 0)
+        self.assertIsNotNone(analysis.index)
+        self.assertTrue(analysis.index.samples)
+
+    def test_default_session_within_budget(self):
+        payload = self._analyze()
+        analysis = webui.spool_get(payload["handle"]).analysis
+        self.assertLessEqual(
+            webui.analysis_session_bytes(analysis),
+            webui.ANALYSIS_SESSION_MB * webui._MIB)
+
+
+class TestSpoolSweeper(unittest.TestCase):
+    def setUp(self):
+        self._saved = (webui._CONFIG.spool_dir, webui._CONFIG.spool_ttl,
+                       webui._CONFIG.analysis_session_bytes)
+        self._saved_budget = webui._SPOOL_BUDGET
+        self.dir = tempfile.mkdtemp(prefix="ipsweep-")
+        webui._CONFIG.spool_dir = self.dir
+        webui._CONFIG.analysis_session_bytes = (
+            webui.ANALYSIS_SESSION_MB * webui._MIB)
+        with webui._SPOOL_LOCK:
+            webui._SPOOLS.clear()
+        webui._reset_spool_budget()
+
+    def tearDown(self):
+        webui.stop_sweeper()
+        with webui._SPOOL_LOCK:
+            webui._SPOOLS.clear()
+        (webui._CONFIG.spool_dir, webui._CONFIG.spool_ttl,
+         webui._CONFIG.analysis_session_bytes) = self._saved
+        webui._SPOOL_BUDGET = self._saved_budget
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _entry_with_analysis(self, age_s):
+        entry = webui._spool_create()
+        with open(entry.path, "wb") as fh:
+            fh.write(b"x")
+        webui._spool_commit(entry, 1)
+        entry.analysis = webui.AnalysisSession(
+            index=hldsmon.IndexBuilder(), summary={})
+        entry.created = time.time() - age_s
+        return entry
+
+    def test_sweep_frees_analysis_and_file(self):
+        webui._CONFIG.spool_ttl = 10.0
+        entry = self._entry_with_analysis(age_s=1000)
+        removed = webui.spool_sweep()
+        self.assertEqual(removed, 1)
+        self.assertIsNone(entry.analysis)
+        self.assertFalse(os.path.exists(entry.path))
+        self.assertIsNone(webui.spool_get(entry.handle))
+
+    def test_background_sweeper_reaps_expired(self):
+        webui._CONFIG.spool_ttl = 10.0
+        entry = self._entry_with_analysis(age_s=1000)
+        webui.start_sweeper(0.05)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and os.path.exists(entry.path):
+            time.sleep(0.02)
+        self.assertFalse(os.path.exists(entry.path))
+        self.assertIsNone(webui.spool_get(entry.handle))
+
+    def test_background_sweeper_keeps_fresh(self):
+        webui._CONFIG.spool_ttl = 3600.0
+        entry = self._entry_with_analysis(age_s=1000)
+        webui.start_sweeper(0.05)
+        time.sleep(0.2)
+        self.assertTrue(os.path.exists(entry.path))
+        self.assertIsNotNone(webui.spool_get(entry.handle))
+
+
+# ---------------------------------------------------------------------------
+# Stage 13 (instant-period) IP-P2: handle windowed serving, coarse-recompute,
+# selective sections, memo, session_expired / handle_body_conflict (QAS-I1/I4/
+# I9/I15/I16/I19/I22/I24).
+# ---------------------------------------------------------------------------
+
+class TestHandleWindowServing(_LLSpoolEnv):
+    def setUp(self):
+        super().setUp()
+        self.body = _windowed_log_bytes()
+        self.records = webui._records_from_bytes(self.body)
+        status, _, raw = self._post("/api/analyze", self.body)
+        self.assertEqual(status, 200, raw)
+        self.coarse = json.loads(raw)
+        self.handle = self.coarse["handle"]
+        self.end = self.coarse["digest"]["period"]["end"]
+
+    def _window(self, lo, hi, extra=""):
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=%s&to=%s%s"
+            % (self.handle, lo, hi, extra), b"")
+        self.assertEqual(status, 200, raw)
+        return json.loads(raw)
+
+    def test_no_body_window_is_lightweight(self):
+        payload = self._window(10000, 10500)
+        self.assertFalse(payload["coarse"])
+        self.assertEqual(payload["window"], {"from": 10000.0, "to": 10500.0})
+        self.assertEqual(payload["handle"], self.handle)
+        for heavy in ("drops", "clients", "sessions", "client_identities",
+                      "anomalies", "events", "config"):
+            self.assertNotIn(heavy, payload)
+        for light in ("series", "client_series", "host_series",
+                      "focus_points", "digest", "window_count"):
+            self.assertIn(light, payload)
+
+    def test_window_matches_full_scan_reference(self):
+        lo, hi = 10000.0, 10500.0
+        payload = self._window(lo, hi)
+        ref = _reference_window(self.records, lo, hi)
+        recs = [r for r, _ in ref]
+        runs = [rn for _, rn in ref]
+        self.assertEqual(payload["window_count"], len(ref))
+        self.assertEqual(
+            payload["series"]["t"],
+            [hldsmon.server_series_value(r, "t")
+             for r in recs if r.get("type") == "server"])
+        self.assertEqual(payload["client_series"],
+                         webui._bucket_client_series(
+                             hldsmon.client_series(recs, runs=runs)))
+        self.assertEqual(payload["focus_points"],
+                         hldsmon.focus_points(recs, runs=runs))
+
+    def test_window_summary_is_whole_log_period(self):
+        payload = self._window(15000, 15500)
+        self.assertEqual(payload["digest"]["period"], self.coarse["digest"]["period"])
+        self.assertNotEqual(payload["digest"]["period"]["end"],
+                            payload["window"]["to"])
+        self.assertEqual(payload["digest"]["records"],
+                         self.coarse["digest"]["records"])
+
+    def test_handle_without_window_is_coarse_recompute(self):
+        status, _, raw = self._post("/api/analyze?handle=%s" % self.handle, b"")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertTrue(payload["coarse"])
+        for heavy in ("drops", "clients", "sessions", "client_identities",
+                      "anomalies", "events", "config"):
+            self.assertIn(heavy, payload)
+        self.assertEqual(payload["digest"]["period"]["end"], self.end)
+
+    def test_handle_with_body_is_400(self):
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=10000&to=10500" % self.handle,
+            self.body)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["code"], "handle_body_conflict")
+
+    def test_unknown_handle_is_410(self):
+        status, _, raw = self._post(
+            "/api/analyze?handle=nope&from=10000&to=10500", b"")
+        self.assertEqual(status, 410)
+        self.assertEqual(json.loads(raw)["code"], "session_expired")
+
+    def test_evicted_handle_is_410(self):
+        webui._spool_remove(self.handle)
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=10000&to=10500" % self.handle, b"")
+        self.assertEqual(status, 410)
+        self.assertEqual(json.loads(raw)["code"], "session_expired")
+
+    def test_invalid_window_params_are_400(self):
+        for params in ("from=abc&to=10500", "from=10000&to=xyz",
+                       "from=10000&to=10500&window=0",
+                       "from=10000&to=10500&window=-1",
+                       "from=10000&to=10500&sections=bogus"):
+            status, _, raw = self._post(
+                "/api/analyze?handle=%s&%s" % (self.handle, params), b"")
+            self.assertEqual(status, 400, params)
+
+    def test_memo_lru_bounded(self):
+        for i in range(12):
+            self._window(10000 + i, 10050 + i)
+        entry = webui.spool_get(self.handle)
+        self.assertLessEqual(len(entry.analysis.memo), webui.MEMO_LRU)
+        self.assertGreater(len(entry.analysis.memo), 0)
+        size_before = len(entry.analysis.memo)
+        self._window(10000, 10050)
+        entry = webui.spool_get(self.handle)
+        self.assertLessEqual(len(entry.analysis.memo), webui.MEMO_LRU)
+        self.assertGreaterEqual(len(entry.analysis.memo), 1)
+
+    def test_empty_window_is_empty_not_error(self):
+        payload = self._window(500000, 500100)
+        self.assertEqual(payload["window_count"], 0)
+        self.assertEqual(payload["series"]["t"], [])
+
+
+class TestHandleWindowMultiRun(_LLSpoolEnv):
+    def setUp(self):
+        super().setUp()
+        self.body = self._log().encode("utf-8")
+        self.records = webui._records_from_bytes(self.body)
+
+    @staticmethod
+    def _log():
+        lines = [
+            {"type": "client", "t": 100.0, "id": 7, "userid": 7, "ping": 10},
+            {"type": "shutdown", "t": 200.0, "reason": "graceful"},
+            {"type": "client", "t": 300.0, "id": 7, "userid": 7, "ping": 20},
+            {"type": "server", "t": 305.0, "fps": 60.0},
+            {"type": "drop", "t": 310.0, "id": 7, "userid": 7,
+             "reason": "Timeout", "category": "timeout"},
+        ]
+        return "\n".join(json.dumps(x) for x in lines) + "\n"
+
+    def test_window_after_run_boundary_carries_seeded_run(self):
+        status, _, raw = self._post("/api/analyze", self.body)
+        handle = json.loads(raw)["handle"]
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=250&to=320" % handle, b"")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        ref = _reference_window(self.records, 250.0, 320.0)
+        recs = [r for r, _ in ref]
+        runs = [rn for _, rn in ref]
+        self.assertEqual(payload["client_series"],
+                         webui._bucket_client_series(
+                             hldsmon.client_series(recs, runs=runs)))
+        self.assertIn("1:u7", payload["client_series"])
+        self.assertEqual(payload["focus_points"],
+                         hldsmon.focus_points(recs, runs=runs))
+        self.assertNotIn("drops", payload)
+
+
+class TestHandleWindowNonMonotonicFallback(_LLSpoolEnv):
+    def setUp(self):
+        super().setUp()
+        lines = [
+            {"type": "client", "t": 100.0, "id": 7, "userid": 7, "ping": 10},
+            {"type": "client", "t": 200.0, "id": 7, "userid": 7, "ping": 20},
+            {"type": "client", "t": 150.0, "id": 7, "userid": 7, "ping": 30},
+            {"type": "server", "t": 160.0, "fps": 60.0},
+            {"type": "client", "t": 300.0, "id": 7, "userid": 7, "ping": 40},
+            {"type": "server", "t": 305.0, "fps": 60.0},
+            {"type": "client", "t": 330.0, "id": 7, "userid": 7, "ping": 50},
+        ]
+        self.body = ("\n".join(json.dumps(x) for x in lines) + "\n").encode()
+        self.records = webui._records_from_bytes(self.body)
+        status, _, raw = self._post("/api/analyze", self.body)
+        self.assertEqual(status, 200, raw)
+        self.handle = json.loads(raw)["handle"]
+
+    def _window(self, lo, hi):
+        original = webui._scan_window
+        calls = []
+
+        def wrapper(*args, **kwargs):
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        webui._scan_window = wrapper
+        try:
+            status, _, raw = self._post(
+                "/api/analyze?handle=%s&from=%s&to=%s"
+                % (self.handle, lo, hi), b"")
+        finally:
+            webui._scan_window = original
+        self.assertEqual(status, 200, raw)
+        return json.loads(raw), calls
+
+    def _assert_matches_reference(self, windowed, lo, hi):
+        ref = _reference_window(self.records, lo, hi)
+        recs = [r for r, _ in ref]
+        runs = [rn for _, rn in ref]
+        self.assertEqual(windowed["window_count"], len(ref))
+        self.assertEqual(windowed["series"], webui.build_series(recs))
+        self.assertEqual(windowed["client_series"],
+                         webui._bucket_client_series(
+                             hldsmon.client_series(recs, runs=runs)))
+
+    def test_flagged_with_inversion_origin(self):
+        entry = webui.spool_get(self.handle)
+        self.assertFalse(entry.analysis.monotonic)
+        self.assertEqual(entry.analysis.index.last_inv_t, 200.0)
+
+    def test_window_crossing_inversion_falls_back(self):
+        windowed, calls = self._window(120, 180)
+        self.assertEqual(calls, [])
+        self._assert_matches_reference(windowed, 120.0, 180.0)
+
+    def test_window_beyond_inversion_uses_fast_path(self):
+        windowed, calls = self._window(300, 350)
+        self.assertEqual(len(calls), 1)
+        self._assert_matches_reference(windowed, 300.0, 350.0)
+
+
+class TestEarlyInversionFastPath(_LLSpoolEnv):
+    """A single early backward step must not disable the index for later windows.
+
+    Mirrors the real ~740 MB day log: the first two records step ~2.3 s backward
+    at startup, everything after is monotonic. Windows past the inversion must
+    still be served in O(window) rather than falling back to a full scan.
+    """
+
+    def setUp(self):
+        super().setUp()
+        lines = [
+            {"type": "server", "t": 1000.0, "fps": 60.0},
+            {"type": "server", "t": 997.7, "fps": 60.0},
+        ]
+        for i in range(1, 101):
+            lines.append({"type": "server", "t": 1000.0 + i, "fps": 60.0})
+            if i % 10 == 0:
+                lines.append({"type": "client", "t": 1000.5 + i, "id": 7,
+                              "userid": 7, "ping": 40})
+        self.body = ("\n".join(json.dumps(x) for x in lines) + "\n").encode()
+        self.records = webui._records_from_bytes(self.body)
+        status, _, raw = self._post("/api/analyze", self.body)
+        self.assertEqual(status, 200, raw)
+        self.handle = json.loads(raw)["handle"]
+
+    def _window(self, lo, hi):
+        original = webui._scan_window
+        calls = []
+
+        def wrapper(*args, **kwargs):
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        webui._scan_window = wrapper
+        try:
+            status, _, raw = self._post(
+                "/api/analyze?handle=%s&from=%s&to=%s"
+                % (self.handle, lo, hi), b"")
+        finally:
+            webui._scan_window = original
+        self.assertEqual(status, 200, raw)
+        return json.loads(raw), calls
+
+    def test_index_records_early_inversion(self):
+        entry = webui.spool_get(self.handle)
+        self.assertFalse(entry.analysis.monotonic)
+        self.assertEqual(entry.analysis.index.last_inv_t, 1000.0)
+        self.assertEqual(entry.analysis.index.samples[0][0], 1000.0)
+
+    def test_window_after_inversion_uses_fast_path(self):
+        lo, hi = 1005.0, 1050.0
+        windowed, calls = self._window(lo, hi)
+        self.assertEqual(len(calls), 1)
+        ref = _reference_window(self.records, lo, hi)
+        self.assertEqual(windowed["window_count"], len(ref))
+        self.assertEqual(windowed["series"],
+                         webui.build_series([r for r, _ in ref]))
+
+    def test_window_crossing_inversion_falls_back(self):
+        lo, hi = 996.0, 999.0
+        windowed, calls = self._window(lo, hi)
+        self.assertEqual(calls, [])
+        ref = _reference_window(self.records, lo, hi)
+        self.assertEqual(windowed["window_count"], len(ref))
+        self.assertEqual(windowed["series"],
+                         webui.build_series([r for r, _ in ref]))
+
+    def test_windows_both_sides_are_correct(self):
+        for lo, hi in ((996.0, 999.0), (1005.0, 1050.0)):
+            windowed, _ = self._window(lo, hi)
+            ref = _reference_window(self.records, lo, hi)
+            self.assertEqual(windowed["window_count"], len(ref))
+            self.assertEqual(windowed["series"],
+                             webui.build_series([r for r, _ in ref]))
+            self.assertEqual(windowed["client_series"],
+                             webui._bucket_client_series(
+                                 hldsmon.client_series(
+                                     [r for r, _ in ref],
+                                     runs=[rn for _, rn in ref])))
+
+
+class TestSelectiveSections(_LLSpoolEnv):
+    def test_body_form_sections_gates_returned_fields(self):
+        status, _, raw = self._post("/api/analyze?sections=series", fixture_bytes())
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertIn("series", payload)
+        for omitted in ("digest", "client_series", "host_series",
+                        "client_identities", "clients", "sessions", "drops",
+                        "anomalies", "events", "config", "focus_points"):
+            self.assertNotIn(omitted, payload)
+
+    def test_handle_window_sections_gates_returned_fields(self):
+        status, _, raw = self._post("/api/analyze", fixture_bytes())
+        handle = json.loads(raw)["handle"]
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=1000&to=1003" % handle, b"")
+        self.assertEqual(status, 200)
+        full = json.loads(raw)
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=1000&to=1003&sections=series,"
+            "client_series,focus_points" % handle, b"")
+        self.assertEqual(status, 200)
+        gated = json.loads(raw)
+        self.assertIn("series", gated)
+        self.assertIn("client_series", gated)
+        self.assertIn("focus_points", gated)
+        for omitted in ("digest", "host_series", "client_identities",
+                        "clients", "sessions", "drops", "anomalies", "events",
+                        "config"):
+            self.assertNotIn(omitted, gated)
+        self.assertEqual(gated["series"], full["series"])
+
+    def test_unknown_section_on_body_is_400(self):
+        status, _, raw = self._post("/api/analyze?sections=bogus",
+                                    fixture_bytes())
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(raw)["ok"])
+
+    def test_coarse_recompute_reenables_heavy_section(self):
+        status, _, raw = self._post("/api/analyze", fixture_bytes())
+        handle = json.loads(raw)["handle"]
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&sections=series,drops" % handle, b"")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertTrue(payload["coarse"])
+        self.assertIn("drops", payload)
+        self.assertIn("series", payload)
+        self.assertNotIn("clients", payload)
+        entry = webui.spool_get(handle)
+        self.assertIsNone(entry.analysis.coarse_series)
+
+    def test_sections_skip_per_record_work(self):
+        agg = hldsmon.StreamAggregator(
+            server_fields=("t", "fps"), client_fields=hldsmon._SERIES_KEYS,
+            host_fields=("t",) + hldsmon.HOST_FIELDS,
+            sections={"series"})
+        agg.add({"type": "server", "t": 1.0, "fps": 60.0}, 0)
+        agg.add({"type": "client", "t": 2.0, "id": 7, "userid": 7, "ping": 1}, 0)
+        agg.add({"type": "drop", "t": 3.0, "id": 7, "reason": "x"}, 0)
+        self.assertEqual(agg._drops, [])
+        self.assertEqual(agg._client_acc, {})
+        result = agg.finish()
+        self.assertEqual(len(result["series"]["t"]), 1)
+
+
+# ---------------------------------------------------------------------------
+# Stage 13 (instant-period) IP-P3: adaptive epoch-aligned min/max/avg/n
+# bucketing (QAS-I6/I17, INV-I10).
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveBucketing(unittest.TestCase):
+    def _bucketer(self, **kwargs):
+        return hldsmon._Bucketer(("t", "v"), **kwargs)
+
+    def test_min_avg_max_and_n(self):
+        builder = self._bucketer()
+        for i, value in enumerate((10, 2, 6, None, 4)):
+            builder.add(float(i), {"v": value})
+        result = builder.finish()
+        self.assertEqual(result["t"], [0.0, 1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(result["v"]["min"], [10, 2, 6, None, 4])
+        self.assertEqual(result["v"]["max"], [10, 2, 6, None, 4])
+        self.assertEqual(result["v"]["avg"], [10, 2, 6, None, 4])
+        self.assertEqual(result["v"]["n"], [1, 1, 1, 0, 1])
+
+    def test_empty_bucket_metric_is_null_not_zero(self):
+        builder = self._bucketer()
+        builder.add(0.0, {"v": None})
+        result = builder.finish()
+        self.assertEqual(result["t"], [0.0])
+        self.assertIsNone(result["v"]["min"][0])
+        self.assertIsNone(result["v"]["max"][0])
+        self.assertIsNone(result["v"]["avg"][0])
+        self.assertEqual(result["v"]["n"][0], 0)
+
+    def test_bucket_start_is_epoch_aligned(self):
+        self.assertEqual(hldsmon._Bucketer._start(12.0, 5), 10.0)
+        self.assertEqual(hldsmon._Bucketer._start(12.0, 4), 12.0)
+        builder = self._bucketer(min_resolution=5)
+        builder.add(12.0, {"v": 1})
+        self.assertEqual(builder.finish()["t"], [10.0])
+
+    def test_merge_preserves_peaks_and_cap(self):
+        builder = self._bucketer(max_points=5)
+        for i in range(100):
+            value = 0
+            if i == 50:
+                value = -3
+            elif i == 80:
+                value = 9
+            builder.add(float(i), {"v": value})
+        result = builder.finish()
+        self.assertLessEqual(len(result["t"]), 5)
+        self.assertEqual(min(x for x in result["v"]["min"] if x is not None),
+                         -3)
+        self.assertEqual(max(x for x in result["v"]["max"] if x is not None),
+                         9)
+
+    def test_bucket_ordering_invariant(self):
+        builder = self._bucketer(max_points=2)
+        for i, value in enumerate((0, 10, 4, 6)):
+            builder.add(float(i), {"v": value})
+        result = builder.finish()
+        self.assertLessEqual(len(result["t"]), 2)
+        for i in range(len(result["t"])):
+            lo, avg, hi = (result["v"]["min"][i], result["v"]["avg"][i],
+                           result["v"]["max"][i])
+            self.assertLessEqual(lo, avg)
+            self.assertLessEqual(avg, hi)
+
+
+class TestBucketedSeriesContract(_LLSpoolEnv):
+    def _assert_triples(self, series, expected_t=None):
+        self.assertIn("t", series)
+        if expected_t is not None:
+            self.assertEqual(series["t"], expected_t)
+        for key, value in series.items():
+            if key == "t":
+                continue
+            self.assertEqual(set(value), {"min", "max", "avg", "n"}, key)
+            for arr in ("min", "max", "avg", "n"):
+                self.assertEqual(len(value[arr]), len(series["t"]), key)
+            for i in range(len(series["t"])):
+                if value["n"][i]:
+                    self.assertLessEqual(value["min"][i], value["avg"][i])
+                    self.assertLessEqual(value["avg"][i], value["max"][i])
+
+    def test_body_form_series_are_triples(self):
+        status, _, raw = self._post("/api/analyze", fixture_bytes())
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self._assert_triples(payload["series"],
+                             expected_t=[1000.0, 1001.0, 1002.0])
+        for entry in payload["client_series"].values():
+            self._assert_triples(entry)
+        self._assert_triples(payload["host_series"])
+
+    def test_windowed_handle_series_are_triples(self):
+        status, _, raw = self._post("/api/analyze", _windowed_log_bytes())
+        self.assertEqual(status, 200)
+        handle = json.loads(raw)["handle"]
+        status, _, raw = self._post(
+            "/api/analyze?handle=%s&from=10000&to=10500" % handle, b"")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self._assert_triples(payload["series"])
+        for entry in payload["client_series"].values():
+            self._assert_triples(entry)
+
+    def test_coarse_and_windowed_share_bucket_builder(self):
+        body = _windowed_log_bytes()
+        status, _, raw = self._post("/api/analyze?from=10000&to=10500", body)
+        windowed = json.loads(raw)["series"]
+        records = webui._records_from_bytes(body)
+        ref = _reference_window(records, 10000.0, 10500.0)
+        expected = webui.build_series([r for r, _ in ref])
+        self.assertEqual(windowed, expected)
 
 
 if __name__ == "__main__":

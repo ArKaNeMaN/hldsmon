@@ -28,6 +28,7 @@ Importable test surface (no socket required)::
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import csv
 import ftplib
@@ -80,6 +81,19 @@ SPOOL_TOTAL_MB = 8192
 #: startup cleanup of orphans). Overridable via ``--spool-ttl-sec``.
 SPOOL_TTL_S = 3600
 
+#: Interval (seconds) of the background spool sweeper that frees expired
+#: handles (file + budget + ``entry.analysis``) — the TTL-sweeper is really
+#: run, not only startup cleanup (stage ``instant-period``, INV-I7).
+SPOOL_SWEEP_S = 60
+
+#: Per-handle analysis-session budget (MiB); exceeding it drops the window
+#: memo and coarse rows while keeping the sparse index (INV-I6).
+ANALYSIS_SESSION_MB = 16
+
+#: LRU size of the per-handle window memo; key ``(from,to,window,sections)``
+#: (owner decision O13).
+MEMO_LRU = 8
+
 #: Streaming chunk size (bytes) used while spooling a request body. Ingest
 #: memory is O(SPOOL_CHUNK), independent of the body size.
 SPOOL_CHUNK = 64 * 1024
@@ -115,8 +129,17 @@ DEFAULT_FTP_TIMEOUT = 30.0
 #: though the value coincides (plan LL-P2 window contract).
 ANALYZE_DEFAULT_WINDOW_S = 1800.0
 
-#: Maximum points per downsampled coarse series row (mirrors ``hldsmon``).
+#: Maximum buckets per series row and the initial bucket width (mirrors
+#: ``hldsmon``; stage ``instant-period``, O11 / INV-I10). ``SERIES_MAX_POINTS``
+#: is kept as a backwards-compatible alias of ``CHART_MAX_POINTS``.
+CHART_MAX_POINTS = hldsmon.CHART_MAX_POINTS
 SERIES_MAX_POINTS = hldsmon.SERIES_MAX_POINTS
+MIN_RESOLUTION_S = hldsmon.MIN_RESOLUTION_S
+
+#: Sparse-index knobs (mirrors ``hldsmon``; stage ``instant-period``, INV-I1).
+INDEX_STEP_S = hldsmon.INDEX_STEP_S
+INDEX_STEP_BYTES = hldsmon.INDEX_STEP_BYTES
+INDEX_MAX_ENTRIES = hldsmon.INDEX_MAX_ENTRIES
 
 #: In-memory FTP tail sessions. Credentials live here only, are never returned
 #: to a client, never logged, and never written to disk. Guarded by ``_FTP_LOCK``.
@@ -148,6 +171,7 @@ class _Config:
         self.spool_session_bytes = SPOOL_SESSION_MB * _MIB
         self.spool_total_bytes = SPOOL_TOTAL_MB * _MIB
         self.spool_ttl = SPOOL_TTL_S
+        self.analysis_session_bytes = ANALYSIS_SESSION_MB * _MIB
 
 
 _CONFIG = _Config()
@@ -232,16 +256,41 @@ class _SpoolBudget:
             self._used = max(0, self._used - n)
 
 
+class AnalysisSession:
+    """Bounded per-handle analysis cache (stage ``instant-period``, INV-I6).
+
+    Holds only the sparse index, the whole-log scalar summary, and — filled by
+    later phases — bucketed coarse rows and the window memo. Heavy full-day
+    lists (drops/clients/sessions/identities/config/events/anomalies) are never
+    stored here; they are rebuilt in the coarse response each time.
+    """
+
+    __slots__ = ("index", "t_lo", "t_hi", "segments", "monotonic",
+                 "summary", "coarse_series", "memo", "lock")
+
+    def __init__(self, index=None, summary=None):
+        self.index = index
+        self.t_lo = index.t_lo if index is not None else None
+        self.t_hi = index.t_hi if index is not None else None
+        self.segments = index.segments if index is not None else 0
+        self.monotonic = index.monotonic if index is not None else True
+        self.summary = summary
+        self.coarse_series = None
+        self.memo = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+
 class SpoolHandle:
     """A server-owned spool file and its lifecycle metadata."""
 
-    __slots__ = ("handle", "path", "created", "size")
+    __slots__ = ("handle", "path", "created", "size", "analysis")
 
     def __init__(self, handle, path, created):
         self.handle = handle
         self.path = path
         self.created = created
         self.size = 0
+        self.analysis = None
 
 
 _SPOOL_BUDGET = _SpoolBudget(_CONFIG.spool_total_bytes)
@@ -356,6 +405,7 @@ def _spool_remove(handle):
     with _SPOOL_LOCK:
         entry = _SPOOLS.pop(handle, None)
     if entry is not None:
+        entry.analysis = None
         _SPOOL_BUDGET.release(entry.size)
         _silent_remove(entry.path)
     return entry
@@ -391,13 +441,18 @@ def spool_get(handle):
             _SPOOLS.pop(handle, None)
         else:
             return entry
+    entry.analysis = None
     _SPOOL_BUDGET.release(entry.size)
     _silent_remove(entry.path)
     return None
 
 
 def spool_sweep(now=None):
-    """Reap handles older than the TTL; return the number removed."""
+    """Reap handles older than the TTL; return the number removed.
+
+    Frees each expired handle's file, process budget, and ``entry.analysis``
+    (INV-I7). Called by the background sweeper started in :func:`main`.
+    """
     now = time.time() if now is None else float(now)
     ttl = _CONFIG.spool_ttl
     expired = []
@@ -406,9 +461,57 @@ def spool_sweep(now=None):
             if ttl and now - entry.created > ttl:
                 expired.append(_SPOOLS.pop(handle))
     for entry in expired:
+        entry.analysis = None
         _SPOOL_BUDGET.release(entry.size)
         _silent_remove(entry.path)
     return len(expired)
+
+
+class _Sweeper:
+    """Periodic daemon thread running :func:`spool_sweep` (INV-I7)."""
+
+    def __init__(self, interval):
+        self.interval = float(interval)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name="hldsmon-spool-sweeper", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                spool_sweep()
+            except Exception:  # never let the sweeper thread die
+                pass
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
+_SWEEPER = None
+
+
+def start_sweeper(interval=None):
+    """Start the background TTL sweeper thread; return its controller (INV-I7)."""
+    global _SWEEPER
+    stop_sweeper()
+    _SWEEPER = _Sweeper(SPOOL_SWEEP_S if interval is None
+                        else float(interval)).start()
+    return _SWEEPER
+
+
+def stop_sweeper():
+    """Stop the background TTL sweeper thread, if running."""
+    global _SWEEPER
+    if _SWEEPER is not None:
+        _SWEEPER.stop()
+        _SWEEPER = None
 
 
 def spool_startup_cleanup(spool_dir=None):
@@ -574,7 +677,36 @@ def _resource_dir():
 INDEX_PATH = os.path.join(_resource_dir(), "webui", "index.html")
 
 SERVICE_NAME = "hldsmon-webui"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+
+#: Canonical ``sections=`` keys (design §29.3 п.11 / R3-m1). Key == payload
+#: field; ``identities`` is never a key (the field is ``client_identities``).
+SECTION_KEYS = ("digest", "series", "host_series", "client_series",
+                "client_identities", "clients", "sessions", "drops",
+                "anomalies", "events", "config", "focus_points")
+
+
+def _want(sections, key):
+    """Return ``True`` when ``key`` is requested (``None`` sections = all)."""
+    return sections is None or key in sections
+
+
+def _parse_sections(raw):
+    """Parse a comma-separated ``sections`` param; ``None``/empty => all.
+
+    Raises ``ValueError`` for an unknown section key (mapped to HTTP 400).
+    """
+    if raw in (None, ""):
+        return None
+    keys = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part not in SECTION_KEYS:
+            raise ValueError("unknown section: %r" % (part,))
+        keys.add(part)
+    return keys or None
 
 #: Ordered series accessors. Each maps a ``server`` record to a JSON value.
 #: ``real_players`` is the wire name for the schema's ``real`` field (Appendix
@@ -640,6 +772,10 @@ fetch("/api/health").then(function (r) { return r.json(); })
 # ---------------------------------------------------------------------------
 
 def _silent_remove(path):
+    # Windows: removing a still-open file raises PermissionError and this
+    # returns False; eviction is then deferred to spool_startup_cleanup, which
+    # is harmless because spool files are opened only for the duration of a
+    # request (stage ``instant-period`` residual, design §29.3 п.3).
     try:
         os.remove(path)
         return True
@@ -665,19 +801,32 @@ def _records_from_bytes(data):
         _silent_remove(path)
 
 
-def build_series(records):
-    """Build per-sample series from ``server`` records, in file order.
+def build_series(records, *, max_points=CHART_MAX_POINTS):
+    """Build a bucketed ``server`` series from ``records`` (single pass).
 
-    Every array has identical length (== number of server records); absent or
-    non-numeric values are ``None`` (JSON ``null``).
+    Returns ``{"t": [bucket_start, ...], field: {min,max,avg,n}}`` — the shared
+    bucket timestamp plus one ``{min,max,avg,n}`` triple per metric (INV-I10).
+    A bucket with no numeric value for a metric yields ``None``/``n=0``.
     """
-    series = dict((name, []) for name in _SERIES_FIELDS)
+    builder = hldsmon._Bucketer(_SERIES_FIELDS, max_points)
     for rec in records:
         if rec.get("type") != "server":
             continue
-        for name in _SERIES_FIELDS:
-            series[name].append(hldsmon.server_series_value(rec, name))
-    return series
+        builder.add(hldsmon.server_series_value(rec, "t"),
+                    {name: hldsmon.server_series_value(rec, name)
+                     for name in _SERIES_FIELDS})
+    return builder.finish()
+
+
+def _bucket_client_series(flat, *, max_points=CHART_MAX_POINTS):
+    """Bucket per-session flat ``client_series`` into the triple contract."""
+    return {skey: hldsmon._bucket_flat(entry, max_points=max_points)
+            for skey, entry in flat.items()}
+
+
+def _bucket_host_series(flat, *, max_points=CHART_MAX_POINTS):
+    """Bucket a flat ``host_series`` into the triple contract (nulls kept)."""
+    return hldsmon._bucket_flat(flat, max_points=max_points)
 
 
 def _as_str(value):
@@ -802,66 +951,85 @@ def _parse_window(value):
 
 
 def _payload_from_agg(result, files, focus, series, client_series,
-                      host_series, lo, hi, coarse, window_count):
-    """Assemble the ``/api/analyze`` coarse-overview contract payload."""
+                      host_series, lo, hi, coarse, window_count,
+                      sections=None):
+    """Assemble the ``/api/analyze`` coarse-overview contract payload.
+
+    ``sections`` (``None`` = all) gates which fields are included; the always-on
+    core is ``ok``/``version``/``files``/``records_count``/``window``/``coarse``/
+    ``window_count``/``log_end``.
+    """
     counts = result["counts_by_type"]
-    digest = {
-        "files": files,
-        "records": result["records"],
-        "counts_by_type": {k: counts.get(k, 0) for k in hldsmon.KNOWN_TYPES},
-        "period": result["period"],
-        "players": result["players"],
-        "sessions": result["session_count"],
-        "drop_count": counts.get("drop", 0),
-        "top_drop_reasons": result["top_drop_reasons"],
-        "hitch_lines": counts.get("hitch", 0),
-        "lag_spikes": result["lag_spikes"],
-        "modnet": result["modnet_block"],
-        "config": result["config_block"],
-        "host": result["host_block"],
-        "log_end": result["log_end"],
-        "exclusions": result["exclusions"],
-        "anomalies_excluded": len(result["anomalies_excluded"]),
-        "focus_point_count": len(focus),
-    }
-    identities = result["identities"]
-    drops = [_drop_entry(rec, run, identities)
-             for rec, run in result["drops_raw"]]
-    return {
+    payload = {
         "ok": True,
         "version": PROTOCOL_VERSION,
         "files": files,
-        "digest": digest,
-        "series": series,
-        "clients": result["clients"],
-        "sessions": result["player_groups"],
-        "session_count": result["session_count"],
-        "drops": drops,
-        "anomalies": result["anomalies"],
         "records_count": result["records"],
-        "client_series": client_series,
-        "client_identities": identities,
-        "events": result["exclusions"],
         "log_end": result["log_end"],
-        "anomalies_excluded": result["anomalies_excluded"],
-        "focus_points": focus,
-        "host_series": host_series,
-        "host_caveats": HOST_CAVEATS,
-        "config": result["config_series"],
         "window": {"from": lo, "to": hi},
         "coarse": coarse,
         "window_count": window_count,
     }
+    if _want(sections, "digest"):
+        payload["digest"] = {
+            "files": files,
+            "records": result["records"],
+            "counts_by_type": {k: counts.get(k, 0)
+                               for k in hldsmon.KNOWN_TYPES},
+            "period": result["period"],
+            "players": result["players"],
+            "sessions": result["session_count"],
+            "drop_count": counts.get("drop", 0),
+            "top_drop_reasons": result["top_drop_reasons"],
+            "hitch_lines": counts.get("hitch", 0),
+            "lag_spikes": result["lag_spikes"],
+            "modnet": result["modnet_block"],
+            "config": result["config_block"],
+            "host": result["host_block"],
+            "log_end": result["log_end"],
+            "exclusions": result["exclusions"],
+            "anomalies_excluded": len(result["anomalies_excluded"]),
+            "focus_point_count": len(focus),
+        }
+    if _want(sections, "series"):
+        payload["series"] = series
+    if _want(sections, "client_series"):
+        payload["client_series"] = client_series
+    if _want(sections, "host_series"):
+        payload["host_series"] = host_series
+        payload["host_caveats"] = HOST_CAVEATS
+    if _want(sections, "focus_points"):
+        payload["focus_points"] = focus
+    if _want(sections, "client_identities"):
+        payload["client_identities"] = result["identities"]
+    if _want(sections, "clients"):
+        payload["clients"] = result["clients"]
+    if _want(sections, "sessions"):
+        payload["sessions"] = result["player_groups"]
+        payload["session_count"] = result["session_count"]
+    if _want(sections, "drops"):
+        identities = result["identities"]
+        payload["drops"] = [_drop_entry(rec, run, identities)
+                            for rec, run in result["drops_raw"]]
+    if _want(sections, "anomalies"):
+        payload["anomalies"] = result["anomalies"]
+    if _want(sections, "events"):
+        payload["events"] = result["exclusions"]
+        payload["anomalies_excluded"] = result["anomalies_excluded"]
+    if _want(sections, "config"):
+        payload["config"] = result["config_series"]
+    return payload
 
 
-def _analyze_iter(pairs, files, from_ts, to_ts, window_s):
+def _analyze_iter(pairs, files, from_ts, to_ts, window_s, sections=None):
     """One-pass streaming analysis of ``(record, run)`` pairs.
 
     The whole spool is folded through a :class:`hldsmon.StreamAggregator` while
     only the requested window (``[from, to]`` inclusive, or the default
     ``ANALYZE_DEFAULT_WINDOW_S`` ending at the newest record) is materialized
     for full-resolution series/``focus_points``. Raw records are never all
-    retained.
+    retained. ``sections`` (``None`` = all) gates both the per-record work and
+    the returned fields (REQ-I10).
     """
     files_list = list(files) if files else []
     size = window_s if (window_s and window_s > 0) else ANALYZE_DEFAULT_WINDOW_S
@@ -876,7 +1044,7 @@ def _analyze_iter(pairs, files, from_ts, to_ts, window_s):
         client_fields=hldsmon._SERIES_KEYS,
         host_fields=("t",) + hldsmon.HOST_FIELDS + ("present_mask",
                                                     "caveat_mask"),
-        max_points=SERIES_MAX_POINTS)
+        max_points=CHART_MAX_POINTS, sections=sections)
 
     window_pairs = []
     if coarse:
@@ -910,23 +1078,32 @@ def _analyze_iter(pairs, files, from_ts, to_ts, window_s):
 
     window_records = [rec for rec, _ in window_pairs]
     window_runs = [run for _, run in window_pairs]
-    focus = hldsmon.focus_points(window_records, runs=window_runs)
+    focus = (hldsmon.focus_points(window_records, runs=window_runs)
+             if _want(sections, "focus_points") else [])
     if coarse:
         series = result["series"]
         client_series = result["client_series"]
         host_series = result["host_series"]
     else:
-        series = build_series(window_records)
-        client_series = hldsmon.client_series(window_records, runs=window_runs)
-        host_series = hldsmon.host_series(window_records)
+        series = (build_series(window_records)
+                  if _want(sections, "series") else {})
+        client_series = (
+            _bucket_client_series(hldsmon.client_series(window_records,
+                                                        runs=window_runs))
+            if _want(sections, "client_series") else {})
+        host_series = (
+            _bucket_host_series(hldsmon.host_series(window_records))
+            if _want(sections, "host_series") else {})
     return _payload_from_agg(result, files_list, focus, series, client_series,
-                             host_series, lo, hi, coarse, len(window_pairs))
+                             host_series, lo, hi, coarse, len(window_pairs),
+                             sections)
 
 
 def analyze_records(records, files=None, *, from_ts=None, to_ts=None,
-                    window_s=None):
+                    window_s=None, sections=None):
     """Return the ``/api/analyze`` payload for parsed ``records``."""
-    return _analyze_iter(_iter_pairs(records), files, from_ts, to_ts, window_s)
+    return _analyze_iter(_iter_pairs(records), files, from_ts, to_ts, window_s,
+                         sections)
 
 
 def analyze_bytes(data, files=None):
@@ -935,21 +1112,81 @@ def analyze_bytes(data, files=None):
     return analyze_records(records, files)
 
 
-def _iter_spool_pairs(paths):
+def _iter_spool_pairs(paths, index_builder=None, on_progress=None):
     """Yield ``(record, run)`` across ordered spool ``paths``, runs continuous.
 
     The run index keeps counting across segment boundaries (a ``shutdown`` or
     ``crash`` in one segment advances the run for the next), so a windowed
-    analysis of a segmented spool matches a single-file reference.
+    analysis of a segmented spool matches a single-file reference. When
+    ``index_builder`` is given, each record also feeds the sparse index with its
+    byte offset and segment index in the same pass (REQ-I2).
     """
     if isinstance(paths, (str, bytes)):
         paths = [paths]
     run = 0
-    for path in paths:
-        for rec in hldsmon.iter_records(path):
+    for segment_idx, path in enumerate(paths):
+        for rec, _run, offset, _seg in hldsmon.iter_records_offsets(
+                path, on_progress=on_progress):
+            if index_builder is not None:
+                index_builder.add(
+                    hldsmon._record_ts(rec), run, offset, segment_idx)
             yield rec, run
             if rec.get("type") in ("shutdown", "crash"):
                 run += 1
+
+
+#: Rough per-sample in-memory footprint (bytes) for the session budget estimate.
+_INDEX_SAMPLE_BYTES = 64
+
+
+def analysis_session_bytes(analysis):
+    """Estimate the in-memory size (bytes) of an :class:`AnalysisSession`."""
+    if analysis is None:
+        return 0
+    total = 0
+    if analysis.index is not None:
+        total += len(analysis.index.samples) * _INDEX_SAMPLE_BYTES
+    if analysis.summary is not None:
+        total += len(json.dumps(analysis.summary, default=str))
+    if analysis.coarse_series is not None:
+        total += len(json.dumps(analysis.coarse_series, default=str))
+    for fragment in analysis.memo.values():
+        total += len(json.dumps(fragment, default=str))
+    return total
+
+
+def _enforce_analysis_budget(analysis):
+    """Drop memo/coarse rows when over the per-handle budget; keep the index."""
+    if analysis is None:
+        return False
+    if analysis_session_bytes(analysis) <= _CONFIG.analysis_session_bytes:
+        return False
+    analysis.memo = collections.OrderedDict()
+    analysis.coarse_series = None
+    return True
+
+
+def _build_analysis_session(payload, index):
+    """Build the bounded per-handle session from a coarse payload + index."""
+    digest = payload.get("digest") or {}
+    summary = {
+        "files": payload.get("files") or [],
+        "records": digest.get("records"),
+        "counts_by_type": digest.get("counts_by_type"),
+        "period": digest.get("period"),
+        "players": digest.get("players") or [],
+        "players_count": len(digest.get("players") or []),
+        "session_count": payload.get("session_count"),
+        "drop_count": digest.get("drop_count"),
+        "top_drop_reasons": digest.get("top_drop_reasons"),
+        "hitch_lines": digest.get("hitch_lines"),
+        "lag_spikes": digest.get("lag_spikes"),
+        "log_end": digest.get("log_end"),
+        "anomalies_excluded": digest.get("anomalies_excluded"),
+    }
+    analysis = AnalysisSession(index=index, summary=summary)
+    _enforce_analysis_budget(analysis)
+    return analysis
 
 
 def _iter_spool_records(paths):
@@ -962,28 +1199,93 @@ def _iter_spool_records(paths):
 
 
 def coarse_overview(path, files=None, *, from_ts=None, to_ts=None,
-                    window_s=None, on_progress=None):
+                    window_s=None, on_progress=None, index_builder=None,
+                    sections=None):
     """Stream the spool at ``path`` and return the coarse-overview payload.
 
-    ``on_progress`` (optional) is threaded to :func:`hldsmon.iter_records` as
-    its byte-offset reporter (local-file parse progress).
+    ``on_progress`` (optional) is threaded to the parser as its byte-offset
+    reporter (local-file parse progress). When ``index_builder`` is given, the
+    sparse index is built in the **same** pass over the spool (REQ-I2).
+    ``sections`` (``None`` = all) gates computed/returned fields (REQ-I10).
     """
-    return _analyze_iter(
-        _iter_pairs(hldsmon.iter_records(path, on_progress=on_progress)),
-        files, from_ts, to_ts, window_s)
+    if index_builder is None:
+        pairs = _iter_pairs(hldsmon.iter_records(path, on_progress=on_progress))
+    else:
+        pairs = _iter_spool_pairs([path], index_builder=index_builder,
+                                  on_progress=on_progress)
+    return _analyze_iter(pairs, files, from_ts, to_ts, window_s, sections)
 
 
 def coarse_overview_paths(paths, files=None, *, from_ts=None, to_ts=None,
-                          window_s=None):
+                          window_s=None, sections=None):
     """Coarse-overview payload across an ordered list of spool segments."""
     return _analyze_iter(_iter_spool_pairs(paths), files,
-                         from_ts, to_ts, window_s)
+                         from_ts, to_ts, window_s, sections)
 
 
-def window_records(path, from_ts, to_ts):
-    """Materialize ``[(record, run), ...]`` within ``[from, to]`` inclusive."""
+def _scan_window(path, offset, run, lo, hi):
+    """Read ``[lo, hi]`` from ``path`` starting at byte ``offset`` with ``run``.
+
+    ``run`` is the run index of the record at ``offset``; it is advanced on
+    every read ``shutdown``/``crash`` (including time-filtered records), so the
+    window is run-correct even when it starts after a run boundary. Reading
+    stops at the first timed record beyond ``hi`` (INV-I4/I9).
+    """
+    out = []
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        while True:
+            start = fh.tell()
+            raw = fh.readline()
+            if not raw:
+                break
+            if start == 0 and raw.startswith(_BOM):
+                raw = raw[len(_BOM):]
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            rtype = obj.get("type")
+            if not isinstance(rtype, str) or rtype not in hldsmon._KNOWN_TYPES:
+                continue
+            t = hldsmon._record_ts(obj)
+            if t is not None and hi is not None and t > hi:
+                break
+            if t is not None and (lo is None or t >= lo):
+                out.append((obj, run))
+            if rtype in ("shutdown", "crash"):
+                run += 1
+    return out
+
+
+def window_records(path, from_ts, to_ts, *, index=None):
+    """Materialize ``[(record, run), ...]`` within ``[from, to]`` inclusive.
+
+    When ``index`` (a :class:`hldsmon.IndexBuilder`) is supplied, the spool is
+    seeked to the greatest sample with ``t <= from`` and the sample's ``run``
+    seeds the run counter (O(window)). The fast path is taken only when the
+    chosen seek sample lies strictly beyond every ``t`` inversion recorded by
+    the builder (``index.last_inv_t``): from there the stream is monotonic, so
+    the ``t > to`` early stop is sound. An early startup backward step thus
+    keeps the index usable for every later window; only a window that still
+    crosses the inversion falls back to a full run-aware scan (INV-I3/I8).
+    """
     lo = hldsmon._num(from_ts)
     hi = hldsmon._num(to_ts)
+    if index is not None and index.samples and lo is not None:
+        sample_ts = [s[0] for s in index.samples]
+        pos = bisect.bisect_right(sample_ts, lo) - 1
+        if pos >= 0:
+            last_inv = getattr(index, "last_inv_t", None)
+            sample = index.samples[pos]
+            if last_inv is None or (sample[0] > last_inv and lo > last_inv):
+                _t, _seg, offset, run = sample
+                return _scan_window(path, offset, run, lo, hi)
     out = []
     for rec, run in _iter_pairs(hldsmon.iter_records(path)):
         t = hldsmon._record_ts(rec)
@@ -995,6 +1297,86 @@ def window_records(path, from_ts, to_ts):
             continue
         out.append((rec, run))
     return out
+
+
+def _window_payload(handle, analysis, lo, hi, window_count, series,
+                    client_series, host_series, focus, sections):
+    """Assemble a lightweight windowed ``/api/analyze`` response (N-M2).
+
+    Carries only ``handle``/``window``/``coarse:false`` + the windowed series
+    and ``focus_points`` + the **whole-log** scalar digest from the cached
+    summary (``period`` is ``[t_lo, t_hi]``, never the window). Heavy full-day
+    lists are omitted; the frontend merges them from the coarse response.
+    """
+    summary = analysis.summary if analysis is not None else {}
+    payload = {
+        "ok": True,
+        "version": PROTOCOL_VERSION,
+        "files": summary.get("files") or [],
+        "handle": handle,
+        "coarse": False,
+        "window": {"from": lo, "to": hi},
+        "window_count": window_count,
+        "records_count": summary.get("records"),
+        "log_end": summary.get("log_end"),
+    }
+    if _want(sections, "digest"):
+        payload["digest"] = {
+            "files": summary.get("files") or [],
+            "records": summary.get("records"),
+            "counts_by_type": summary.get("counts_by_type"),
+            "period": summary.get("period"),
+            "players": summary.get("players"),
+            "sessions": summary.get("session_count"),
+            "drop_count": summary.get("drop_count"),
+            "top_drop_reasons": summary.get("top_drop_reasons"),
+            "hitch_lines": summary.get("hitch_lines"),
+            "lag_spikes": summary.get("lag_spikes"),
+            "log_end": summary.get("log_end"),
+            "anomalies_excluded": summary.get("anomalies_excluded"),
+            "focus_point_count": len(focus),
+        }
+    if _want(sections, "series"):
+        payload["series"] = series
+    if _want(sections, "client_series"):
+        payload["client_series"] = client_series
+    if _want(sections, "host_series"):
+        payload["host_series"] = host_series
+        payload["host_caveats"] = HOST_CAVEATS
+    if _want(sections, "focus_points"):
+        payload["focus_points"] = focus
+    return payload
+
+
+def serve_window(entry, from_ts, to_ts, window_s, sections=None):
+    """Serve ``[from, to]`` from a spool's cached analysis session (REQ-I1/I3).
+
+    Seeks the spool via the cached sparse index (falling back to a full scan
+    when the index is missing or non-monotonic, INV-I8); returns the windowed
+    lightweight response. Raises ``OSError`` if the spool file vanished
+    (caller maps that to ``session_expired``).
+    """
+    analysis = getattr(entry, "analysis", None)
+    size = window_s if (window_s and window_s > 0) else ANALYZE_DEFAULT_WINDOW_S
+    lo, hi = from_ts, to_ts
+    if lo is None:
+        lo = float(hi) - size
+    if hi is None:
+        hi = float(lo) + size
+    index = analysis.index if analysis is not None else None
+    pairs = window_records(entry.path, lo, hi, index=index)
+    records = [rec for rec, _ in pairs]
+    runs = [run for _, run in pairs]
+    series = (build_series(records) if _want(sections, "series") else {})
+    client_series = (
+        _bucket_client_series(hldsmon.client_series(records, runs=runs))
+        if _want(sections, "client_series") else {})
+    host_series = (_bucket_host_series(hldsmon.host_series(records))
+                   if _want(sections, "host_series") else {})
+    focus = (hldsmon.focus_points(records, runs=runs)
+             if _want(sections, "focus_points") else [])
+    return _window_payload(entry.handle, analysis, lo, hi, len(pairs), series,
+                           client_series, host_series, focus, sections)
 
 
 def export_records(records, rtype=None):
@@ -2100,6 +2482,10 @@ class _Handler(BaseHTTPRequestHandler):
         return hldsmon.parse_records([entry.path])
 
     def _handle_analyze(self, query):
+        handle = self._first(query, "handle", None)
+        if handle:
+            self._handle_analyze_window(handle, query)
+            return
         job = (self._first(query, "job", None) or "").strip() or None
         try:
             entry = self._read_body()
@@ -2114,13 +2500,16 @@ class _Handler(BaseHTTPRequestHandler):
         def _on_progress(offset):
             _progress_set(job, offset, total, phase="parse")
 
+        index = hldsmon.IndexBuilder()
         try:
+            sections = _parse_sections(self._first(query, "sections", None))
             from_ts = _parse_epoch(self._first(query, "from", None))
             to_ts = _parse_epoch(self._first(query, "to", None))
             window_s = _parse_window(self._first(query, "window", None))
             payload = coarse_overview(
                 entry.path, files, from_ts=from_ts, to_ts=to_ts,
-                window_s=window_s, on_progress=_on_progress if job else None)
+                window_s=window_s, on_progress=_on_progress if job else None,
+                index_builder=index, sections=sections)
         except Exception as exc:  # noqa: BLE001 - surface any analyzer error
             if job:
                 _progress_finish(job, ok=False, error=str(exc))
@@ -2129,8 +2518,68 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if job:
             _progress_finish(job, ok=True)
+        entry.analysis = _build_analysis_session(payload, index)
         payload["handle"] = entry.handle
         self._send_json(200, payload)
+
+    def _handle_analyze_window(self, handle, query):
+        """Handle-form ``/api/analyze``: serve from the session, body forbidden."""
+        content_length = self.headers.get("Content-Length")
+        if content_length is not None and content_length.strip() not in ("", "0"):
+            length = _parse_content_length(content_length)
+            if length is not None:
+                self._drain_body(length)
+            else:
+                self.close_connection = True
+            self._send_json(400, {"ok": False,
+                                  "code": "handle_body_conflict"})
+            return
+        entry = spool_get(handle)
+        if entry is None:
+            self._expired()
+            return
+        try:
+            from_ts = _parse_epoch(self._first(query, "from", None))
+            to_ts = _parse_epoch(self._first(query, "to", None))
+            window_s = _parse_window(self._first(query, "window", None))
+            sections = _parse_sections(self._first(query, "sections", None))
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        files = self._query_files(query)
+        try:
+            if from_ts is None and to_ts is None:
+                payload = coarse_overview(entry.path, files, sections=sections)
+                payload["handle"] = entry.handle
+            else:
+                payload = self._memoized_window(
+                    entry, from_ts, to_ts, window_s, sections)
+        except (FileNotFoundError, OSError):
+            self._expired()
+            return
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, payload)
+
+    def _memoized_window(self, entry, from_ts, to_ts, window_s, sections):
+        """Serve a window through the per-handle memo (LRU = ``MEMO_LRU``)."""
+        analysis = entry.analysis
+        if analysis is None:
+            return serve_window(entry, from_ts, to_ts, window_s, sections)
+        key = (from_ts, to_ts, window_s,
+               None if sections is None else tuple(sorted(sections)))
+        with analysis.lock:
+            cached = analysis.memo.get(key)
+            if cached is not None:
+                analysis.memo.move_to_end(key)
+                return cached
+            payload = serve_window(entry, from_ts, to_ts, window_s, sections)
+            analysis.memo[key] = payload
+            while len(analysis.memo) > MEMO_LRU:
+                analysis.memo.popitem(last=False)
+            _enforce_analysis_budget(analysis)
+            return payload
 
     def _expired(self):
         self._send_json(410, {"ok": False, "code": "session_expired"})
@@ -2507,6 +2956,7 @@ def main(argv=None):
         spool_startup_cleanup()
     except OSError:
         pass
+    start_sweeper()
     warn_unlimited_nonloopback(args.host)
     server = make_server(args.host, args.port)
     port = server.server_address[1]
@@ -2522,6 +2972,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        stop_sweeper()
         server.server_close()
     return 0
 

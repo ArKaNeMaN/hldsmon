@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 import time
@@ -163,14 +164,36 @@ MAP_PRE_S = 5.0
 MAP_POST_S = 15.0
 END_WINDOW_S = 15.0
 
-#: Maximum number of points kept per downsampled series row by the streaming
-#: coarse-overview aggregator (stage ``large-logs``, design §28.3 п.1).
-SERIES_MAX_POINTS = 2000
+#: Target maximum number of buckets per series row (stage ``instant-period``,
+#: owner decision O11 / design §29.3 п.7). The adaptive bucketer merges adjacent
+#: buckets until a row holds at most this many.
+CHART_MAX_POINTS = 2000
+
+#: Backwards-compatible alias kept for existing callers/tests (same value).
+SERIES_MAX_POINTS = CHART_MAX_POINTS
+
+#: Initial bucket width in seconds before any adaptive merge (O11).
+MIN_RESOLUTION_S = 1
 
 #: Minimum interval (seconds) between :func:`iter_records` ``on_progress``
 #: callbacks — a read throttle so the optional byte-offset reporter (web UI
 #: local-file progress bar) never burdens the hot parse loop.
 PROGRESS_INTERVAL_S = 0.25
+
+#: UTF-8 byte-order mark, stripped exactly once at offset 0 by
+#: :func:`iter_records_offsets` (the binary reader used for the sparse index).
+_BOM = b"\xef\xbb\xbf"
+
+#: Minimum time interval (seconds) between sparse-index samples (stage
+#: ``instant-period``, design §29.3 п.1 / INV-I1).
+INDEX_STEP_S = 5
+
+#: Minimum byte distance between sparse-index samples (1 MiB, INV-I1).
+INDEX_STEP_BYTES = 1 * 1024 * 1024
+
+#: Hard cap on sparse-index samples; reaching it doubles both steps so the
+#: index stays sorted and bounded (INV-I1).
+INDEX_MAX_ENTRIES = 20000
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +241,55 @@ def iter_records(path, on_progress=None):
             if not isinstance(rtype, str) or rtype not in _KNOWN_TYPES:
                 continue
             yield obj
+
+
+def iter_records_offsets(path, on_progress=None, *, run_start=0, segment_idx=0):
+    """Yield ``(record, run, byte_offset, segment_idx)`` from a JSONL file.
+
+    Binary-mode companion to :func:`iter_records` used to build the sparse
+    index (design §29.3 п.1 / INV-I9). Each line's byte offset is captured
+    *before* it is read, so the offset points at the start of the line and a
+    later ``seek`` lands exactly there. The line is decoded as UTF-8 with
+    ``errors="replace"``; a leading UTF-8 BOM is stripped at offset 0.
+    Tolerance matches :func:`iter_records` (blank lines, invalid JSON,
+    non-objects and unknown ``type`` are silently skipped). ``run`` counts
+    ``shutdown``/``crash`` records strictly before the line, starting at
+    ``run_start`` (so segments stay continuous). :func:`iter_records` itself is
+    never modified.
+    """
+    last = 0.0
+    run = int(run_start)
+    with open(path, "rb") as fh:
+        while True:
+            offset = fh.tell()
+            raw = fh.readline()
+            if not raw:
+                break
+            if on_progress is not None:
+                now = time.monotonic()
+                if now - last >= PROGRESS_INTERVAL_S:
+                    last = now
+                    try:
+                        on_progress(fh.tell())
+                    except Exception:
+                        on_progress = None
+            if offset == 0 and raw.startswith(_BOM):
+                raw = raw[len(_BOM):]
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            rtype = obj.get("type")
+            if not isinstance(rtype, str) or rtype not in _KNOWN_TYPES:
+                continue
+            yield obj, run, offset, segment_idx
+            if rtype in ("shutdown", "crash"):
+                run += 1
 
 
 def parse_records(paths):
@@ -411,6 +483,89 @@ def player_key(identity):
     if isinstance(session, str) and session != "":
         return session
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sparse time -> byte-offset index (stage ``instant-period``, INV-I1)
+# ---------------------------------------------------------------------------
+
+class IndexBuilder:
+    """Sparse ``time -> (segment, byte-offset, run)`` index, built in one pass.
+
+    Fed one record at a time via :meth:`add` while the first analysis pass
+    streams the spool. A sample is ``(t, segment_idx, byte_offset, run)``; a new
+    sample is taken when the time since the last sample reaches ``step_s``
+    **or** the byte distance reaches ``step_bytes`` (whichever comes first), and
+    the first timed record is always sampled. When the sample count reaches
+    ``max_entries`` both steps are doubled and the existing samples are thinned
+    by half (keeping the first), so the index stays sorted and bounded — memory
+    is O(points), never O(records). Non-decreasing ``t`` is validated in the
+    same pass: any ``t`` below the previous record's ``t`` sets
+    :attr:`monotonic` to ``False`` and records the inversion's origin in
+    :attr:`last_inv_t` (the highest ``t`` at/below which an inversion occurred).
+    A seek sample strictly above :attr:`last_inv_t` starts inside a monotonic
+    tail, so the fast seek path stays valid for windows past an early backward
+    step (the caller only falls back when the seek crosses an inversion).
+    Records without a numeric ``t`` are not sampled.
+    """
+
+    __slots__ = ("step_s", "step_bytes", "max_entries", "samples",
+                 "t_lo", "t_hi", "segments", "monotonic", "last_inv_t",
+                 "_prev_t", "_last_t", "_last_off", "_last_seg")
+
+    def __init__(self, step_s=INDEX_STEP_S, step_bytes=INDEX_STEP_BYTES,
+                 max_entries=INDEX_MAX_ENTRIES):
+        self.step_s = float(step_s)
+        self.step_bytes = int(step_bytes)
+        self.max_entries = int(max_entries)
+        self.samples = []
+        self.t_lo = None
+        self.t_hi = None
+        self.segments = 0
+        self.monotonic = True
+        self.last_inv_t = None
+        self._prev_t = None
+        self._last_t = None
+        self._last_off = None
+        self._last_seg = None
+
+    def add(self, t, run, byte_offset, segment_idx=0):
+        """Fold one record's ``t``/``run``/``byte_offset`` into the index."""
+        if t is None:
+            return
+        if self.t_lo is None or t < self.t_lo:
+            self.t_lo = t
+        if self.t_hi is None or t > self.t_hi:
+            self.t_hi = t
+        if self._prev_t is not None and t < self._prev_t:
+            self.monotonic = False
+            if self.last_inv_t is None or self._prev_t > self.last_inv_t:
+                self.last_inv_t = self._prev_t
+        self._prev_t = t
+
+        if segment_idx != self._last_seg:
+            self.segments = 1 if self._last_seg is None else self.segments + 1
+            self._last_seg = segment_idx
+
+        if self._should_sample(t, byte_offset):
+            if len(self.samples) >= self.max_entries:
+                self._grow()
+            self.samples.append(
+                (t, segment_idx, int(byte_offset), int(run)))
+            self._last_t = t
+            self._last_off = int(byte_offset)
+
+    def _should_sample(self, t, byte_offset):
+        if self._last_t is None:
+            return True
+        if (t - self._last_t) >= self.step_s:
+            return True
+        return (int(byte_offset) - self._last_off) >= self.step_bytes
+
+    def _grow(self):
+        self.step_s *= 2
+        self.step_bytes *= 2
+        self.samples = self.samples[::2]
 
 
 # ---------------------------------------------------------------------------
@@ -1739,33 +1894,123 @@ def build_digest(records, files=None):
 # Streaming coarse-overview aggregator (stage ``large-logs``, design §28.3 п.1)
 # ---------------------------------------------------------------------------
 
-class _Decimator:
-    """Uniform streaming downsampler over parallel per-row field values."""
+class _Bucketer:
+    """Adaptive, epoch-aligned min/max/avg/n bucketer (INV-I10).
 
-    __slots__ = ("fields", "max_points", "rows")
+    Folds one sample at a time (single pass — the coarse pass does not know the
+    span up front). Buckets are epoch-aligned to ``width`` seconds
+    (``start = floor(t / width) * width``); ``width`` starts at
+    ``min_resolution`` and doubles — merging adjacent buckets with the
+    associative ``min``/``max``/``sum``/``n`` merge — whenever the bucket count
+    exceeds ``2 * max_points``. :meth:`finish` normalizes to at most
+    ``max_points`` buckets, so the result is bounded regardless of the span.
 
-    def __init__(self, fields, max_points):
-        self.fields = tuple(fields)
+    ``finish`` returns ``{"t": [bucket_start, ...], field: {"min","max","avg",
+    "n"}}``. ``n`` is the number of numeric samples in the bucket (the average's
+    weight); a bucket with no numeric value for a metric yields ``None`` for
+    ``min``/``max``/``avg`` and ``n`` ``0`` (null is never a zero).
+    """
+
+    __slots__ = ("fields", "max_points", "width", "_buckets", "_starts")
+
+    def __init__(self, fields, max_points=CHART_MAX_POINTS,
+                 min_resolution=MIN_RESOLUTION_S):
+        self.fields = tuple(f for f in fields if f != "t")
         self.max_points = int(max_points) if max_points else None
-        self.rows = []
+        self.width = (float(min_resolution)
+                      if min_resolution and min_resolution > 0 else 1.0)
+        self._buckets = {}
+        self._starts = []
 
-    def add(self, values):
-        self.rows.append(tuple(values.get(name) for name in self.fields))
-        limit = self.max_points
-        if limit and len(self.rows) > 2 * limit:
-            self.rows = self.rows[::2]
+    @staticmethod
+    def _start(t, width):
+        return math.floor(t / width) * width
+
+    def add(self, t, values):
+        if t is None:
+            return
+        start = self._start(t, self.width)
+        bucket = self._buckets.get(start)
+        if bucket is None:
+            bucket = {f: [None, None, 0.0, 0] for f in self.fields}
+            self._buckets[start] = bucket
+            self._starts.append(start)
+        for f in self.fields:
+            value = values.get(f)
+            if value is None:
+                continue
+            acc = bucket[f]
+            if acc[0] is None or value < acc[0]:
+                acc[0] = value
+            if acc[1] is None or value > acc[1]:
+                acc[1] = value
+            acc[2] += value
+            acc[3] += 1
+        if self.max_points and len(self._buckets) > 2 * self.max_points:
+            self._merge()
+
+    def _merge(self):
+        self.width *= 2
+        merged = {}
+        for start in sorted(self._starts):
+            key = self._start(start, self.width)
+            target = merged.get(key)
+            source = self._buckets[start]
+            if target is None:
+                merged[key] = source
+                continue
+            for f in self.fields:
+                a, b = target[f], source[f]
+                if b[0] is None:
+                    continue
+                if a[0] is None or b[0] < a[0]:
+                    a[0] = b[0]
+                if a[1] is None or b[1] > a[1]:
+                    a[1] = b[1]
+                a[2] += b[2]
+                a[3] += b[3]
+        self._buckets = merged
+        self._starts = sorted(merged)
 
     def finish(self):
-        rows = self.rows
-        limit = self.max_points
-        if limit and len(rows) > limit:
-            stride = -(-len(rows) // limit)
-            rows = rows[::stride]
-        cols = {name: [] for name in self.fields}
-        for row in rows:
-            for name, value in zip(self.fields, row):
-                cols[name].append(value)
-        return cols
+        if self.max_points:
+            while len(self._buckets) > self.max_points:
+                self._merge()
+        starts = sorted(self._buckets)
+        out = {"t": [float(s) for s in starts]}
+        for f in self.fields:
+            mn, mx, avg, n = [], [], [], []
+            for s in starts:
+                acc = self._buckets[s][f]
+                if acc[3]:
+                    mn.append(acc[0])
+                    mx.append(acc[1])
+                    avg.append(acc[2] / acc[3])
+                    n.append(acc[3])
+                else:
+                    mn.append(None)
+                    mx.append(None)
+                    avg.append(None)
+                    n.append(0)
+            out[f] = {"min": mn, "max": mx, "avg": avg, "n": n}
+        return out
+
+
+def _bucket_flat(flat, *, max_points=CHART_MAX_POINTS,
+                 min_resolution=MIN_RESOLUTION_S):
+    """Bucket a flat ``{"t": [...], field: [...]}`` series into triples.
+
+    Shared builder for the windowed/FTP paths, where the full-resolution
+    per-record series is materialized first (the window is O(window)); the
+    coarse path streams through :class:`_Bucketer` directly.
+    """
+    times = flat.get("t") or []
+    fields = [name for name in flat if name != "t"]
+    builder = _Bucketer(fields, max_points, min_resolution)
+    for idx, t in enumerate(times):
+        builder.add(t, {name: (flat[name][idx] if idx < len(flat[name])
+                               else None) for name in fields})
+    return builder.finish()
 
 
 def _clients_from_acc(acc, identities):
@@ -1812,25 +2057,38 @@ def _clients_from_acc(acc, identities):
     return clients
 
 
+#: Sections fed by the per-client accumulator (a client record may be needed by
+#: several of them for its identities/aggregates/anomaly state).
+_CLIENT_SECTIONS = frozenset((
+    "client_series", "clients", "client_identities", "sessions", "drops",
+    "anomalies", "events"))
+
+
 class StreamAggregator:
     """One-pass streaming aggregator for the coarse ``/api/analyze`` overview.
 
     Memory is O(window)+O(players)+O(drops)+O(points), never O(records): the
-    full-day series are uniformly downsampled to ``max_points`` rows per row;
-    per-client identities/aggregates and the anomaly detectors keep only
-    per-session/per-client state. Raw records are never retained. ``add`` folds
+    full-day series are reduced to adaptive epoch-aligned ``min``/``max``/``avg``/
+    ``n`` buckets (at most ``max_points`` per row); per-client identities/
+    aggregates and the anomaly detectors keep only per-session/per-client state.
+    Raw records are never retained. ``add`` folds
     one ``(record, run)``; :meth:`finish` returns neutral aggregates that the web
     UI maps onto the wire contract (design §28.3 п.1 / INV-L2).
+
+    ``sections`` (``None`` = all) gates the per-record accumulators so a
+    caller asking for a subset skips the work of the disabled sections
+    (stage ``instant-period``, REQ-I10 / QAS-I19).
     """
 
     def __init__(self, *, server_fields=(), client_fields=_SERIES_KEYS,
                  host_fields=(("t",) + HOST_FIELDS + ("present_mask",
                                                       "caveat_mask")),
-                 max_points=SERIES_MAX_POINTS):
+                 max_points=CHART_MAX_POINTS, sections=None):
         self._server_fields = tuple(server_fields)
         self._client_fields = tuple(client_fields)
         self._host_fields = tuple(host_fields)
         self._max_points = int(max_points) if max_points else None
+        self._sections = None if sections is None else frozenset(sections)
 
         self._counts = Counter()
         self._t_lo = None
@@ -1845,9 +2103,9 @@ class StreamAggregator:
         self._lag_spikes = 0
         self._identities = {}
         self._client_acc = {}
-        self._server = _Decimator(self._server_fields, self._max_points)
+        self._server = _Bucketer(self._server_fields, self._max_points)
         self._client = {}
-        self._host = _Decimator(self._host_fields, self._max_points)
+        self._host = _Bucketer(self._host_fields, self._max_points)
         self._configs = []
         self._config_count = 0
         self._host_count = 0
@@ -1860,6 +2118,12 @@ class StreamAggregator:
         self._mapchanges = []
         self._fill = {}
         self._loss = {}
+
+    def _want(self, name):
+        return self._sections is None or name in self._sections
+
+    def _any(self, *names):
+        return self._sections is None or not self._sections.isdisjoint(names)
 
     # -- folding ------------------------------------------------------------
     def add(self, rec, run):
@@ -1879,40 +2143,46 @@ class StreamAggregator:
             self._players.add(int(cid))
 
         if rtype == "server":
-            self._server.add(
-                {name: server_series_value(rec, name)
-                 for name in self._server_fields})
+            if self._want("series"):
+                self._server.add(
+                    t, {name: server_series_value(rec, name)
+                        for name in self._server_fields})
             hitch = rec.get("hitch")
             if isinstance(hitch, dict):
                 gt100 = _num(hitch.get("gt100"))
                 if gt100 is not None and gt100 > 0:
                     self._lag_spikes += 1
         elif rtype == "client":
-            self._add_client(rec, run)
+            if self._any(*_CLIENT_SECTIONS):
+                self._add_client(rec, run)
         elif rtype == "drop":
-            self._drops.append((rec, run))
-            if t is not None:
+            if self._want("drops"):
+                self._drops.append((rec, run))
+            if t is not None and self._any("drops", "anomalies", "events"):
                 self._drop_times.append(t)
-            reason = rec.get("reason")
-            self._drop_reasons[
-                str(reason) if reason not in (None, "") else "(unknown)"] += 1
+            if self._any("drops", "digest"):
+                reason = rec.get("reason")
+                self._drop_reasons[
+                    str(reason) if reason not in (None, "") else "(unknown)"] += 1
         elif rtype == "hitch":
             self._hitch_lines += 1
-            if t is not None:
+            if t is not None and self._any("anomalies", "events"):
                 self._hitch_times.append(t)
         elif rtype == "config":
-            self._configs.append(rec)
-            self._config_count += 1
+            if self._any("config", "digest"):
+                self._configs.append(rec)
+                self._config_count += 1
         elif rtype == "host":
             self._host_count += 1
             self._host_latest = rec
-            self._host.add({name: _num(rec.get(name))
-                            for name in self._host_fields})
+            if self._want("host_series"):
+                self._host.add(t, {name: _num(rec.get(name))
+                                   for name in self._host_fields})
         elif rtype == "modnet":
             self._modnet_count += 1
             _modnet_summary_add(self._modnet, rec)
         elif rtype == "mapchange":
-            if t is not None:
+            if t is not None and self._any("events", "anomalies"):
                 map_name = rec.get("map")
                 if not isinstance(map_name, str):
                     map_name = "" if map_name is None else str(map_name)
@@ -1956,9 +2226,10 @@ class StreamAggregator:
 
         dec = self._client.get(skey)
         if dec is None:
-            dec = _Decimator(self._client_fields, self._max_points)
+            dec = _Bucketer(self._client_fields, self._max_points)
             self._client[skey] = dec
-        dec.add({name: _num(rec.get(name)) for name in self._client_fields})
+        dec.add(_record_ts(rec),
+                {name: _num(rec.get(name)) for name in self._client_fields})
 
         cid = _num(rec.get("id"))
         if cid is None:

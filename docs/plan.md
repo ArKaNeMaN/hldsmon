@@ -1742,3 +1742,363 @@ INV-1..6; гейт `plugin_enabled()`; `LogWriter` — sink (pull).
 **Fine (не менять):** scope `tools/analyzer` + плагинный дефолт `hldsmon_max_mb`; схема P1/`KNOWN_TYPES`/`exports.whitelist` без изменений; stdlib-only; `iter_records`/`log_writer.cpp` не трогаются; фазовая декомпозиция и карта REQ-L/QAS-L/INV-L.
 
 **Гейт:** plan-review пройден (PASS-WITH-REVISIONS; все H/M и опциональные L1/L2 сложены) — **plan-gate ЗАКРЫТ; implementation-gate ОТКРЫТ**. Коммит — только по явной просьбе владельца.
+
+---
+
+# Стадия 13 — `instant-period` — план реализации (rev 2 — plan-review пройден: PASS-WITH-REVISIONS; H1/M1/M2 и опц. L1/L2 сложены; **plan-gate ЗАКРЫТ; стадия ВЫПОЛНЕНА И ВЕРИФИЦИРОВАНА; релиз 0.4.1**)
+
+> Смена периода на локальном файле перестаёт пере-загружать тело и пере-разбирать файл целиком: данные периода обслуживаются из серверной сессии по `handle` (разрежённый индекс `time→byte-offset→run`, O(окна) по времени); backend отдаёт единый бакетный контракт `min/max/avg/n` (адаптивная бакетировка), а режим отрисовки выбирает фронт **по типу графика**; плюс два расширения владельца — **селективные секции** и **двухуровневый (детальный) таймлайн**. Дизайн — §29 (rev 16; B1/B2, M1–M4, m1–m6, R2-N-M1..N-M3, R3-m1..m3 сложены; R1/R2 — PASS-WITH-REVISIONS, R3 — PASS, design-gate ЗАКРЫТ, §29.11). **Plan-review:** `momus` (PASS-WITH-REVISIONS — H1/M1/M2 + опц. L1/L2 сложены; plan-gate ЗАКРЫТ). **Scope:** `tools/analyzer` (`webui.py`, `hldsmon.py`, `webui/index.html`, `tools/analyzer/tests/`). **`src/` не трогается; схема JSONL P1 и `KNOWN_TYPES` не меняются; stdlib-only (INV-6).** FTP-**период** остаётся клиентским, но **форма рядов FTP меняется на бакетные тройки** (общий `_payload_from_agg`, §29.5/§29.7). Зависит от §28 (диск-spool, handle, coarse-overview, `_source_paths`, TTL/бюджет).
+
+## Заголовок стадии (bindings)
+- **Design:** `docs/design.md` §29 (rev 16). **Design-review:** `oracle` (R1 PASS-WITH-REVISIONS; R2 PASS-WITH-REVISIONS; **R3 PASS — design-gate ЗАКРЫТ**, §29.11). **Plan-review:** `momus` — **PASS-WITH-REVISIONS (plan-review пройден); замечания H1/M1/M2 + опц. L1/L2 сложены (folded)** — см. раздел «Раздел ревью плана (momus) — стадия `instant-period`»; **plan-gate ЗАКРЫТ; стадия выполнена и верифицирована; релиз 0.4.1**. **Design doc:** `docs/design.md`; **Plan:** `docs/plan.md` (этот раздел); **Journal:** `docs/journal.md`; **Открытые вопросы:** `docs/design.md` §16.
+- **Язык документации:** русский; идентификаторы/код — английский.
+- **Решения владельца `instant-period` (закрыто, §16/§29.9):** **O10** — индекс `INDEX_STEP_S=5`, `INDEX_STEP_BYTES=1 МиБ`, `INDEX_MAX_ENTRIES=20000` (удвоение шага при cap); **O11** — `CHART_MAX_POINTS=2000`, `min_resolution=1 с`; **O12** — отрисовка **разная по типу графика** (общий «Все датасеты» — один `min` **или** `max`, тоггл default `max`, band запрещён; per-metric — `min–max` band + линия `avg`; персист `hldsmon.ui.*`); **O13** — memo-кэш окон LRU=**8**, ключ `(from,to,window,sections)`; **O14** — детальный таймлайн автопоказывается при `span(window) < DETAIL_TIMELINE_RATIO·span(fullRange)`, `DETAIL_TIMELINE_RATIO=0.05`; **O15** — default `sections` = **все**, выбор персистится глобально в `localStorage` (`hldsmon.ui.*`). Открытых вопросов по стадии нет.
+- **Верификация (точно как в `AGENTS.md`):** `make` (сборка 32-бит); `make test` (хостовые C++ unit + Python-тесты анализатора); для точечного прогона Python-тестов — `cd tools/analyzer && python3 -m unittest discover -s tests -v`. **Линтер — компилятор `-Wall -Wextra`** (отдельного нет).
+- **Коммит:** только по **явной** просьбе владельца, один связный коммит на стадию (код + тесты + доки + запись журнала). Без авто-коммитов.
+- **Интеграционная проверка:** серверный путь анализатора покрывается хостовыми Python-тестами (`test_webui.py`/`test_hldsmon.py`); смена периода в реальном браузере на файле владельца (~740 МБ) и UI-QAS-I7/I14/I20/I21/I23 — **вне `make test`** (метод — ручной QA + page-`selfTest` `webui/index.html`).
+
+## Границы стадии (не-цели)
+Дизайн §29.7. Действует на всех фазах.
+- Схема JSONL P1, `KNOWN_TYPES`, `exports.whitelist`, Makefile, `src/` (плагин), ABI/хуки — **не трогаются**.
+- FTP-**период** (клиентская фильтрация) и FTP-UX — без изменений; FTP-индекс/сессия **не** строятся. **Форма рядов FTP при этом меняется на тройки** (IP-P5).
+- Аутентификация/многопользовательская модель; персистентный на диске индекс/сессия (индекс — только в RAM); resumable/chunked-upload; внешние зависимости; Windows-специфика как отдельная фаза.
+- Кэширование полного списка записей (запрещено INV-L2/INV-I1); кэширование тяжёлых полнодневных списков в сессии (запрещено INV-I6).
+- Инкрементальный анализ «на лету» поверх растущего FTP-spool сверх необходимого для локального spool.
+- Селективные секции для `/api/export`,`/api/bundle` (они уже узкие: тип/окно/ключ drop).
+
+## Глобальные инварианты стадии `instant-period`
+Дизайн §29.3. Действуют на всех фазах; проверяются картой QAS ниже.
+- **INV-I1** — индекс разрежён: сэмпл = `(t, segment_idx, byte_offset, run)`; ≤ `INDEX_MAX_ENTRIES`; сэмплирование по времени (≥ `INDEX_STEP_S`) и/или байтам (≥ `INDEX_STEP_BYTES`); при cap — **удвоение шага** (индекс отсортирован); память O(точек), **НЕ** O(records)/O(файл).
+- **INV-I2** — память анализа — O(окна) + O(бакетов); полный список сырых записей не удерживается (наследует INV-L2).
+- **INV-I3** — время оконного запроса — O(окна + T); телесный путь — O(файла) **один раз**; при немонотонном `t` (INV-I8) оконный путь деградирует до O(файла) (fallback), но корректен.
+- **INV-I4** — корректность окна: `from`/`to` (включительно) дают то же множество записей, что полный скан; оконные run-чувствительные артефакты (`client_series`, `focus_points`) несут тот же `run`/`session_key`, что полный скан. Coarse-only списки (`drops`/`clients`/`sessions`/`client_identities`) в оконный ответ не входят.
+- **INV-I5** — stdlib-only; схема P1/`KNOWN_TYPES` без изменений; анализ работает и на Windows (без POSIX-only вызовов); аутентификации нет, `handle` — непрозрачный случайный токен.
+- **INV-I6** — per-handle сессия ограничена: `entry.analysis` хранит только индекс + краткую сводку + бакетные coarse-ряды; тяжёлые списки (`drops`/`clients`/`sessions`/`client_identities`/`config`/`events`/`anomalies`) **не** кэшируются; per-handle cap `ANALYSIS_SESSION_MB`; превышение ⇒ memo/coarse-ряды сбрасываются, индекс сохраняется.
+- **INV-I7** — TTL-sweeper реально исполняется: освобождает файл+budget+`entry.analysis` по TTL (фоновый поток либо тик по запросу); заброшенные handle не текут.
+- **INV-I8** — монотонность `t` валидируется дешёво в проходе; при нарушении индекс помечается немонотонным и `_serve_window` откатывается на полный скан (корректность важнее скорости).
+- **INV-I9** — offsets — истинные байтовые (бинарный режим; снятие **до** `readline()`): seek попадает точно на начало строки; `_seek_aligned` — только защитный fallback.
+- **INV-I10** — адаптивная бакетировка потоковая: старт с `min_resolution`; при > 2·`CHART_MAX_POINTS` — слияние соседних бакетов удвоением ширины (ассоциативно min/max/avg/n); итог ≤ `CHART_MAX_POINTS`; эпохально-выровнено.
+- **Сквозные INV-5/INV-6** (из базового плана): формат JSONL P1 не меняется; границы (без БД/внешнего агента/Windows-специфики) сохраняются. `hldsmon.iter_records` **не трогается** (§29.3 п.1).
+
+## Новые константы стадии
+Все — модульные константы/переопределяемые, значения ниже — **зафиксированные дефолты** (O10–O15).
+| Константа | Где | Default | Семантика |
+|---|---|---|---|
+| `INDEX_STEP_S` | `hldsmon.py`/`webui.py` | **`5` с** | Мин. временной шаг сэмпла индекса (O10, INV-I1). |
+| `INDEX_STEP_BYTES` | `hldsmon.py`/`webui.py` | **`1 МиБ`** (`1048576`) | Мин. байтовый шаг сэмпла индекса (O10, INV-I1). |
+| `INDEX_MAX_ENTRIES` | `hldsmon.py`/`webui.py` | **`20000`** | Cap числа сэмплов; при достижении — **удвоение** обоих шагов (O10, INV-I1). |
+| `CHART_MAX_POINTS` | `hldsmon.py:168` (переименование `SERIES_MAX_POINTS`; алиас сохранён) | **`2000`** | Целевой максимум точек/бакетов на ряд (O11, INV-I10). |
+| `MIN_RESOLUTION_S` | `hldsmon.py` | **`1` с** | Базовая ширина бакета до слияния (O11). |
+| `DETAIL_TIMELINE_RATIO` | `webui/index.html` | **`0.05`** | Автопоказ детального brush при `span(window) < ratio·span(fullRange)` (O14, REQ-I11). |
+| `MEMO_LRU` | `webui.py` | **`8`** | Размер LRU memo окон на handle; ключ `(from,to,window,sections)` (O13). |
+| `ANALYSIS_SESSION_MB` | `webui.py` | **`16` МиБ** | Per-handle cap `entry.analysis`; превышение ⇒ сброс memo/coarse-рядов, индекс сохраняется (INV-I6). |
+| `SPOOL_SWEEP_S` | `webui.py` (рядом с `SPOOL_TTL_S`) | **`60` с** | Интервал фонового sweeper'а, освобождающего file+budget+`entry.analysis` (INV-I7). |
+| `PROTOCOL_VERSION` | `webui.py:577` | **`1` → `2`** | Форма рядов — тройки `{min,max,avg,n}` (§29.3 п.13). |
+
+**Канонический набор ключей `sections` (R3-m1, §29.3 п.11).** Ключ = имя поля payload; `identities` **не** используется: `digest`, `series`, `host_series`, `client_series`, **`client_identities`**, `clients`, `sessions`, `drops`, `anomalies`, `events`, `config`, `focus_points`. Default = **все** (O15). Обязательное ядро (для мгновенного окна) — spool+handle+индекс+`t_lo/t_hi`; `series`/`client_series`/`host_series` включены по умолчанию.
+
+## Маппинг QAS-I1..I24 → фаза/метод (design §29.8)
+| QAS-I | Фаза | Метод проверки |
+|---|---|---|
+| **QAS-I1** (2-й+ запросы не шлют тело; отклик ≪ первого) | IP-P2 (+P4) | Python-тест (handle-запрос без тела) + ручной QA на ~740 МБ |
+| **QAS-I2** (оконный запрос читает ~O(окна) байт, не файл) | IP-P2 | Python-тест (счётчик прочитанных из spool байт) |
+| **QAS-I3** (первый проход: coarse+индекс за один проход; `handle`; coarse == новый эталон — бакетные тройки) | IP-P1 (+P2/P3) | Python-тест vs эталон (полный скан, тройки) |
+| **QAS-I4** (оконная корректность vs эталон; граница seek; `from>to`/за границами детерминированы) | IP-P2 | Python-тест |
+| **QAS-I5** (границы: до первого сэмпла / после последнего / пустое окно; seed `run=0`/`offset=0`) | IP-P2 | Python-тест |
+| **QAS-I6** (`min≤avg≤max`, `n`=число записей; пустой бакет `null`; ≤ `CHART_MAX_POINTS`) | IP-P3 | Python-тест |
+| **QAS-I7** (отрисовка по типу графика, O12) | IP-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-I8** (маркеры drop/hitch/event выровнены в любом режиме) | IP-P3 (+P4) | Python-тест (эпохально-выровненные бакеты) + ручной QA |
+| **QAS-I9** (вытесненный handle ⇒ 410 `session_expired`; handle+тело ⇒ 400 `handle_body_conflict`; фронт reset) | IP-P2 | Python-тест (+ ручной QA reset) |
+| **QAS-I10** (память сервера не растёт при N сменах; memo≤8; тяжёлые не кэшируются) | IP-P1/P2 | Python-тест (структурный + `ru_maxrss`) |
+| **QAS-I11** (конкурентные оконные запросы; eviction во время чтения ⇒ `session_expired`, не 500) | IP-P2 | Python-тест (параллельные потоки) |
+| **QAS-I12** (churn: N загрузок+смен; sweeper освобождает file+budget+`analysis`; RSS плоский) | IP-P1 | Python-тест (subprocess + `ru_maxrss`) |
+| **QAS-I13** (stdlib-only; схема P1 без изменений; старые Python-тесты + новые зелёные; Windows-совместимо) | IP-P6 (сквозь P1–P5) | `make test` |
+| **QAS-I14** (тогглы режима/секций/таймлайна + персист) | IP-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-I15** (multi-run: окно после `shutdown`/`crash` ⇒ `client_series`/`focus_points` == полный скан; `drops`/`clients`/`sessions`/`client_identities` coarse-only) | IP-P1 (индекс run) + IP-P2 | Python-тест |
+| **QAS-I16** (немонотонный `t` ⇒ fallback на полный скан) | IP-P1 (+P2) | Python-тест (синтетический spool с «шагом назад») |
+| **QAS-I17** (адаптивные бакеты ≤ `CHART_MAX_POINTS`; слитые min/max == по-секундной истине) | IP-P3 | Python-тест |
+| **QAS-I18** (offsets/multibyte: UTF-8 + CRLF ⇒ границы окна корректны) | IP-P1 (+P2) | Python-тест |
+| **QAS-I19** (селективные секции: `sections=series` реально пропускает работу и не отдаёт; default все; ключ `client_identities`; лёгкая ⇒ оконный `?handle&from&to`; тяжёлая ⇒ coarse-recompute без кэша) | IP-P2 (+P4 UI) | Python-тест (измеримо) + ручной QA UI |
+| **QAS-I20** (двухуровневый таймлайн: авто-показ при <0.05·span; правка сужает окно; маркеры) | IP-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-I21** (миграция троек: все потребители рендерят корректно; `selfTest` через `computeView` зелёный) | IP-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-I22** (полный vs оконный поля; merge с coarse; FTP-ряды из троек; оконная сводка полнодневная; `fullRange` не сбрасывается) | IP-P2 (+P4/P5) | Python-тест (форма ответа) + ручной QA (merge) |
+| **QAS-I23** (N-M2: после `coarse:false` `fullRange`/главный brush полнодневные; `digest.period`==весь лог) | IP-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-I24** (N-M3: включение тяжёлой секции при окне ⇒ handle-запрос без `from`/`to`, `coarse:true`, полные списки за один проход, без кэша; re-merge) | IP-P2 (+P4) | Python-тест (+ ручной QA re-merge) |
+
+**Покрытие REQ-I:** REQ-I1 → IP-P2(+P4); REQ-I2 → IP-P1; REQ-I3 → IP-P1(индекс run)+IP-P2(seek); REQ-I4 → IP-P3; REQ-I5 → IP-P3+IP-P4; REQ-I6 → IP-P2; REQ-I7 → IP-P3(+P4); REQ-I8 → IP-P1; REQ-I9 → IP-P1+IP-P2; REQ-I10 → IP-P2(+P4); REQ-I11 → IP-P4.
+
+**Покрытие INV-I:** INV-I1 → IP-P1; INV-I2 → IP-P1/P3; INV-I3 → IP-P2; INV-I4 → IP-P2; INV-I5 → IP-P5/P6; INV-I6 → IP-P1; INV-I7 → IP-P1; INV-I8 → IP-P1/P2; INV-I9 → IP-P1; INV-I10 → IP-P3.
+
+---
+
+## IP-P1 — Analyzer core: разрежённый индекс + сессия + монотонность + sweeper
+**Цель.** Первый (телесный) анализ в **одном** проходе строит coarse-overview И разрежённый индекс `(t, seg, offset, run)`; индекс несёт `run` и флаг монотонности; сессия анализу кэширует только индекс+краткую сводку+бакетные ряды (INV-I6); сервер **реально** запускает периодический sweeper (INV-I7).
+
+**Файлы.**
+- `tools/analyzer/hldsmon.py`:
+  - **+** `iter_records_offsets(path)` — **бинарный** режим (`open(path,"rb")`), снятие `offset = fh.tell()` **до** `readline()` (начало строки, INV-I9), декод строки (`utf-8` + `errors="replace"`, BOM снимается при offset 0), терпимые пропуски как в `iter_records`; **`iter_records` не трогается** (§29.3 п.1). Выдаёт `(record, run, offset, segment_idx)`.
+  - Простая функция-строитель индекса (host-testable) — сэмплирование по `(t−last_t) ≥ INDEX_STEP_S` **или** `(offset−last_off) ≥ INDEX_STEP_BYTES` (что раньше), первая запись — всегда; при `INDEX_MAX_ENTRIES` — **удвоение** обоих шагов (append-порядок сохраняет сортировку ⇒ бинарный поиск валиден, INV-I1); в том же проходе валидация неубывания `t` (`t < last_t` ⇒ `monotonic=False`, INV-I8).
+  - `run` = число `shutdown`/`crash` **строго до** offset (run, которому принадлежит запись; сверка/реюз `_attach_runs` `:342-355`).
+- `tools/analyzer/webui.py`:
+  - `StreamAggregator`/coarse-путь (`coarse_overview`) → строить индекс **в том же проходе**; новый `_IndexBuilder` (индекс + `t_lo/t_hi` + `segments` + `monotonic`).
+  - `SpoolHandle.__slots__` (`:235-244`) **+** поле `analysis`; `entry.analysis` хранит **только** индекс, `t_lo/t_hi`, `segments`, `monotonic`, краткую сводку (counts_by_type/period/players/sessions/drop_count/top_drop_reasons/hitch/lag/log_end/anomalies_excluded), бакетные coarse-ряды, memo (LRU=8) — **тяжёлые списки не кэшируются** (INV-I6); per-handle `ANALYSIS_SESSION_MB=16` ⇒ сброс memo/coarse-рядов при превышении, индекс сохраняется.
+  - `spool_sweep` (`:399-411`) → вернуть в исполнение: **фоновый daemon-поток** с интервалом `SPOOL_SWEEP_S=60` (старт в `main`, рядом со `spool_startup_cleanup` `:414-427`/вызов `:2507`), освобождающий на TTL spool-файл+budget+`entry.analysis` (INV-I7). `spool_get` остаётся ленивым быстрым путём; `_SPOOL_LOCK` берётся при `spool_get`/`_spool_remove`/`spool_sweep`.
+- `tools/analyzer/tests/test_hldsmon.py` (+`fixtures/`): `iter_records_offsets` vs `iter_records` (равные записи/runs); сэмплирование/границы/cap-удвоение; run на границе shutdown/crash; multibyte UTF-8 + CRLF offsets; немонотонный `t`.
+- `tools/analyzer/tests/test_webui.py`: lifecycle/TTL/sweeper/`ANALYSIS_SESSION_MB`; один проход строит и coarse, и индекс.
+
+**Границы (не-цели фазы).** Обслуживание окон/контракты/memo/секции — IP-P2; бакетер — IP-P3; фронт — IP-P4; FTP — IP-P5. `iter_records`/схема P1 не трогаются. Индекс на диск не персистится.
+
+**Инварианты.** INV-I1, INV-I6, INV-I7, INV-I8, INV-I9; INV-I2 (каркас).
+
+**Acceptance (QAS-I3, QAS-I10-структ., QAS-I12, QAS-I15-индекс, QAS-I16, QAS-I18):**
+- [ ] Первый телесный запрос: coarse-overview и индекс построены за **один** проход; ответ содержит `handle` (QAS-I3).
+- [ ] Индекс: сэмпл `(t,seg,offset,run)`; ≤ `INDEX_MAX_ENTRIES=20000`; при cap шаги **удваиваются**, порядок отсортирован (INV-I1/QAS-I17-предпосылка).
+- [ ] `run` на сэмпле соответствует run, которому принадлежит запись (границы `shutdown`/`crash`), — seed для окна в IP-P2 корректен (QAS-I15).
+- [ ] Немонотонный `t` в проходе ⇒ `monotonic=False`, без ошибки (QAS-I16-предпосылка).
+- [ ] Offsets — истинные байтовые (снятие до `readline`); UTF-8/CRLF не портят границы (QAS-I18).
+- [ ] `entry.analysis` не содержит тяжёлых списков; per-handle `ANALYSIS_SESSION_MB=16` сбрасывает memo/coarse-ряды, индекс сохраняется (QAS-I10, INV-I6).
+- [ ] Фоновый sweeper (`SPOOL_SWEEP_S=60`) освобождает file+budget+`analysis` по TTL; RSS плоский при churn (QAS-I12, INV-I7).
+
+**Тесты.** `test_hldsmon.py`: offsets/run/сэмплирование/cap/монотонность/multibyte-CRLF; `test_webui.py`: один проход, `entry.analysis`-состав, бюджет, sweeper-churn (subprocess + `ru_maxrss`).
+
+**Риски.** Cмещение capture-точки offset (снятие до `readline`) — покрыть multibyte/CRLF-тестом; sweeper-поток vs in-flight read — `_SPOOL_LOCK`, eviction ⇒ `session_expired`/перехват `OSError`/`FileNotFoundError`; на **Windows** удаление открытого файла даёт `PermissionError` (`_silent_remove`→`False`) ⇒ eviction откладывается до `spool_startup_cleanup` (безвредно, §29.3 п.3); флейки RSS — фиксированные пороги как в §28.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; затем `make test`.
+
+**DoD фазы.** Acceptance зелёный; INV-I1/I6/I7/I8/I9 покрыты; `iter_records`/схема P1 не изменены; существующие Python-тесты не красные.
+
+---
+
+## IP-P2 — Оконное обслуживание по `handle` + контракты + memo + селективные секции
+**Цель.** Handle-форма `/api/analyze` (без тела) обслуживает окно **seek'ом** (O(окна)), seed'я `run` из индекса; оконный ответ несёт только облегчённые поля + полнодневную краткую сводку; memo-кэш окон; `sections=` гейтит вычисления; coarse-recompute тяжёлых секций; корректные коды ошибок; обратная совместимость телесной формы.
+
+**Файлы.**
+- `tools/analyzer/webui.py`:
+  - `_handle_analyze` (`:2102-2133`) → **ветка `handle`**: `POST /api/analyze?handle=<id>&from&to&window&sections&job`, **без тела**. `Content-Length>0`/непустое тело ⇒ HTTP **400** `{"ok":false,"code":"handle_body_conflict"}` (не «осушать/игнорировать», §29.3 п.4). Handle резолвится через `spool_get` (**локальный** spool); FTP-сессионные handle этим путём **не** принимаются. `_UPLOAD_SEM` не берётся.
+  - Новый `_serve_window(entry, from, to, window, sections)`: бинарный поиск наибольшего сэмпла с `t ≤ from`; `seek(offset)`; `run` **seed'ится** значением сэмпла; чтение **от сэмпла**, `run` инкрементится по каждому `shutdown`/`crash` **для всех прочитанных записей, включая отфильтрованные по времени** (границы run до `from` учтены); включаются `lo ≤ t ≤ hi`; стоп на первой `t > to`. **Если ни один сэмпл не имеет `t ≤ from`** ⇒ seed `run=0`, `offset=0` (начало spool), скан с начала сегмента. `_seek_aligned` — защитный fallback (изменённый файл). При `monotonic == False` ⇒ **fallback на полный скан** `_iter_spool_pairs` (корректно, O(файла); INV-I8).
+  - **Memo** LRU=`MEMO_LRU=8` на сессии (тот же `threading.Lock`, что и построение индекса), ключ `(from,to,window,sections)` → фрагмент (O13).
+  - **Форма оконного ответа** (§29.3 п.10/§29.5): `handle`(эхо), `window`, `window_count`, `coarse:false`, бакетные `series`/`client_series`/`host_series` (окно), `focus_points` (окно), **краткая сводка** — **полнодневная** из индекса `t_lo/t_hi` (`digest.period = [t_lo,t_hi]`, **не** окно; N-M2). Тяжёлые списки в оконном ответе **отсутствуют** (coarse-only).
+  - **Coarse-recompute тяжёлых секций** (N-M3/R3-m2): handle-запрос **без** `from`/`to` ⇒ сервер выполняет **один O(файла) проход**, возвращает **`coarse:true`** + полные списки; тяжёлые **не** кэшируются (INV-I6).
+  - **Селективные секции** (`sections=`, R3-m1/O15): сервер **гейтит** соответствующие аккумуляторы `StreamAggregator.add`/`finish`; `_payload_from_agg` включает только запрошенные; default = все. **Re-enable:** лёгкая секция при активном окне ⇒ оконный `?handle&from&to` (**O(окна)**, INV-I3, не полный проход); тяжёлая ⇒ coarse-recompute.
+  - **Ошибки** (§29.3 п.16): unknown/expired handle ⇒ **410** `session_expired`; handle+тело ⇒ **400** `handle_body_conflict`; невалидные `from`/`to`/`window`/`sections` ⇒ **400**; пустое окно ⇒ 200 с пустыми рядами. `job`: handle-путь принимает опц. `job` и эмитит терминальный `_progress_finish` (или ничего) — без byte-offset прогресса. `PROTOCOL_VERSION` `1→2`.
+  - **Телесная форма (первый, body) `POST /api/analyze`** — аддитивно расширяется: она **принимает опциональный `sections=`** (default = все; REQ-I10, §29.5), и **гейтинг секций применяется к ней так же**, как к handle-форме; во всём остальном (приём тела, построение coarse+индекса за один проход, возврат `handle`) — **без изменений** (она **не** handle-based: это первый запрос, порождающий handle). `PROTOCOL_VERSION` → `2` отражается в обоих ответах.
+  - `/api/export`,`/api/bundle` — **без изменений** (уже handle-based: тип/окно/ключ drop; M2/L1).
+  - **Reuse `window_records` (L2):** `_serve_window` **заменяет/расширяет** существующий run-aware хелпер `window_records` (`webui.py:983-997`, покрыт `TestWindowRunPreservation`), сохраняя его run-seeding-семантику; при этом хелпер возвращает **бакетные тройки** (IP-P3) вместо плоского full-resolution окна.
+- `tools/analyzer/tests/test_webui.py` (+`fixtures/`).
+
+**Границы.** Бакетер — IP-P3 (окно отдаёт ряды через бакетер из IP-P3; до него — существующая форма); фронт — IP-P4; FTP — IP-P5. `iter_records`/схема P1 не трогаются.
+
+**Инварианты.** INV-I3, INV-I4, INV-I6, INV-I8 (fallback), INV-I2; подтверждает INV-I1-использование.
+
+**Acceptance (QAS-I1-сервер, QAS-I2, QAS-I4, QAS-I5, QAS-I9, QAS-I10, QAS-I11, QAS-I15, QAS-I19-сервер, QAS-I22-сервер, QAS-I24-сервер):**
+- [ ] Handle-запрос **без тела** обслуживается из сессии; окно читает ~O(окна)+граница байт, кратно меньше полного скана (QAS-I1/I2).
+- [ ] Оконная корректность `[from,to]` (включительно) == эталон (полный скан); частичная строка на границе seek отброшена, первая полная не потеряна (QAS-I4).
+- [ ] Границы: `from` до первого сэмпла ⇒ seed `run=0`/`offset=0`; после последнего / `from>to` / пустое окно ⇒ пустой ряд, без ошибок и тихих нулей (QAS-I5).
+- [ ] Multi-run: окно после `shutdown`/`crash` ⇒ `client_series`/`focus_points` == полный скан (run seed'нут); `drops`/`clients`/`sessions`/`client_identities` в оконном ответе **отсутствуют** (QAS-I15).
+- [ ] Немонотонный индекс ⇒ fallback на полный скан, результат == эталону (QAS-I16-сквозной).
+- [ ] Вытесненный/TTL handle ⇒ **410** `session_expired`; handle+тело ⇒ **400** `handle_body_conflict`; невалидные параметры ⇒ 400 (QAS-I9).
+- [ ] Память при N сменах периода не растёт; memo LRU≤8; тяжёлые списки не кэшируются; оконный ответ не содержит тяжёлых списков (QAS-I10/I22).
+- [ ] Конкурентные оконные запросы к одному handle не портят индекс/memo; eviction во время чтения ⇒ `session_expired`, не 500 (QAS-I11).
+- [ ] `sections=series` измеримо **пропускает** работу по drops/anomalies/clients и не отдаёт их — на **обеих** формах `/api/analyze` (телесной и handle; default = все, M2); ключ `client_identities`; лёгкая секция в окне включается **оконным** запросом (O(окна)); тяжёлая ⇒ coarse-recompute с `coarse:true` и полными списками за один проход, без кэша (QAS-I19/I24).
+- [ ] Оконная сводка полнодневная (`digest.period == [t_lo,t_hi]`) (QAS-I22).
+
+**Тесты.** `test_webui.py`: handle-форма/`handle_body_conflict`; оконная корректность vs полный скан (вкл. multi-run); границы/пустое окно; немонотонный fallback; memo; конкурентность; `session_expired`; `sections`-гейтинг (измеримо, обе формы); coarse-recompute; форма ответа (нет тяжёлых списков).
+
+**Миграция существующих тестов под новый контракт (H1, обязательна — иначе suite красный).** Существующий `test_webui.py` кодирует **старый** контракт (flat-ряды / full-resolution / `version==1`); под тройки + адаптивную бакетировку + `PROTOCOL_VERSION 1→2` эти ассерты мигрируются в той же фазе:
+- `test_top_level_keys_and_files_echo` (`~91`) и `TestHTTP` (`~422`): `version == 1` → **`== 2`**.
+- `test_series_lengths_and_values` (`~95-100`): flat `series["frame_ms_min"] == [1.0,1.5,None]` → форма **тройки** (`{min,max,avg,n}` + `t[]`; `null`-бакет сохраняется).
+- `test_client_series_shape` (`~146`): flat `series["0:i7:gNone"]["ping"] == [40,50]` → тройки.
+- `test_host_series_key` (`~303`): flat `host_series["udp_rcvbuf_errors"] == [5,None]` → тройки.
+- `test_explicit_window_matches_client_filter` (`~1725`): `payload["series"]["t"]` flat → `t[]` + тройки (сверка множества окон).
+- `test_windowed_full_resolution_and_default_downsampled` (`~1734`): flat-счётчики → бакетные тройки (окно и coarse).
+- **`test_constants` — зелёный** за счёт сохранённого алиаса `SERIES_MAX_POINTS` (значение `2000`).
+- `TestWindowRunPreservation` — сверяет run-aware семантику `window_records`/`_serve_window`; при миграции на тройки сверка идёт по содержимому бакетов/`n`, а не по flat-индексу.
+- (Ассерт `len(series["t"]) == 7000` из `TestCoarseDownsampling` — **IP-P3**.)
+
+**Риски.** Случайная материализация списка в оконном пути (регресс памяти) — структурный тест (ответ без тяжёлых полей) + RSS; расхождение seed `run` — multi-run-тест; неверный merge оконного/coarse на фронте — IP-P4; `handle+тело` — детерминированный 400.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; `make test`.
+
+**DoD фазы.** Acceptance зелёный; INV-I3/I4/I6/I8 покрыты; телесная форма принимает опц. `sections` (default все) и не сломана; `/api/export`/`/api/bundle` не сломаны; перечисленные flat-ассерты `test_webui.py` (H1) **мигрированы** на новый контракт и suite зелёный.
+
+---
+
+## IP-P3 — Адаптивная бакетировка backend (`min/max/avg/n`)
+**Цель.** Единый бакетный контракт `{min,max,avg,n}` + общий `t[]`, потоковая адаптивная эпохально-выровненная бакетировка с удвоением-слиянием, ≤ `CHART_MAX_POINTS`; маркеры выравниваются по времени при любой группировке; пустой бакет ⇒ `null` (не 0).
+
+**Файлы.**
+- `tools/analyzer/hldsmon.py`:
+  - `_Decimator` (`:1742-1768`) → **адаптивный бакетер min/max/avg/n** (замена/расширение). Старт с `MIN_RESOLUTION_S=1`; эпохально-выровненные бакеты (`t // bucket_s * bucket_s`); при > 2·`CHART_MAX_POINTS` — слияние соседних бакетов **удвоением ширины**: `min=min(a,b)`, `max=max(a,b)`, `avg=(a.avg·a.n + b.avg·b.n)/(a.n+b.n)`, `n=a.n+b.n` (ассоциативно, null-aware); итог ≤ `CHART_MAX_POINTS=2000` (INV-I10). Пустой бакет ⇒ `null`.
+  - `SERIES_MAX_POINTS` (`:168`) → **`CHART_MAX_POINTS`** (алиас `SERIES_MAX_POINTS` сохранён для совместимости); на webui-стороне — та же константа.
+  - Метрика → `{min,max,avg,n}` + общий `t[]`; `series`/`client_series`/`host_series` — во **всех** формах ответа (телесной, оконной, coarse-recompute, **FTP**).
+- `tools/analyzer/webui.py`: `build_series`/payload → тройки; эпохально-выровненные бакеты; маркеры (drop/hitch/event/config) несут точный `t` и не снапятся к центрам бакетов.
+- `tools/analyzer/tests/test_hldsmon.py`/`test_webui.py` (+`fixtures/`).
+
+**Границы.** Отрисовка режимов — IP-P4; FTP-UX/период — IP-P5; схема P1 не трогается.
+
+**Инварианты.** INV-I10; INV-I2 (бакеты O(points)); подтверждает INV-I4 (окно — бакетные тройки).
+
+**Acceptance (QAS-I6, QAS-I8, QAS-I17, QAS-I3-эталон):**
+- [ ] Каждый бакет: `min ≤ avg ≤ max`; `n` = число записей бакета; пустой бакет ⇒ `null` (не 0) (QAS-I6).
+- [ ] Число бакетов ≤ `CHART_MAX_POINTS=2000` для полнодневного coarse; слияние удвоением корректно (QAS-I17).
+- [ ] Слитые `min`/`max` равны по-секундной истине (эталон) (QAS-I17).
+- [ ] Маркеры drop/hitch/event выровнены в любом режиме (эпохально-выровненные бакеты; `t` не снапится) (QAS-I8).
+- [ ] Coarse == новый эталон (полный скан, бакетные тройки) (QAS-I3).
+
+**Тесты.** `test_hldsmon.py`: `min≤avg≤max`, `n`, пустой бакет `null`, ассоциативное слияние (min/max == по-секундной истине), ≤ cap; `test_webui.py`: ряды во всех формах ответа — тройки.
+
+**Миграция существующих тестов (H1).** `TestCoarseDownsampling.test_coarse_series_capped_at_series_max_points` (`~1777`) ассертит `len(windowed["series"]["t"]) == n` (`7000`) — **противоречит** новому адаптивному cap'у; ассерт меняется на **`len(...) ≤ CHART_MAX_POINTS (2000)`** + проверку сохранения пиков (слитые min/max == по-секундной истине). Тест-имя/набор могут быть переименованы под `CHART_MAX_POINTS`; алиас `SERIES_MAX_POINTS` (2000) сохраняется, чтобы `test_constants` остался зелёным.
+
+**Риски.** Потеря пиков при слиянии (регресс `_Decimator`) — тест против по-секундной истины; null-aware-путаница (`null` vs 0) — правило «null ≠ ноль».
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; `make test`.
+
+**DoD фазы.** Acceptance зелёный; INV-I10 покрыт; `SERIES_MAX_POINTS`-алиас сохранён; ассерт coarse-cap (`7000` → ≤ `CHART_MAX_POINTS`, H1) мигрирован и suite зелёный.
+
+---
+
+## IP-P4 — Frontend (`webui/index.html`): миграция троек + отрисовка по типу графика + двухуровневый таймлайн + селективные тогглы + merge
+**Цель.** Все фронт-потребители переведены на тройки через единую проекцию в `computeView`; рендер различается по типу графика (O12); handle-путь без Blob; слияние оконного ответа с coarse; двухуровневый таймлайн; селективные тогглы блоков с персистом; `session_expired` ⇒ reset.
+
+**Файлы.** `tools/analyzer/webui/index.html`:
+
+**Серверно-контрактная интеграция.**
+- `fetchAnalyze` (`:1396-1442`) → handle-путь **без** `Blob`/тела; читает ключи ответа (`handle`, `window`, `coarse`, `window_count`, `series`/`client_series`/`host_series`-тройки, сводку); `state.body`-реюз для `/api/export` (`:1205`)/`/api/bundle` (`:1239`) → handle.
+- `applyPeriodValues` (`:2389-2393`): для `source === "local"` — handle-запрос окна (не `state.fileBlob` через XHR `:1408`/`:1417`).
+- **Оконный ответ (`coarse:false`) НЕ трогает `state.fullRange`** (`:1425-1426`) — домен главного brush остаётся полнодневным `[t_lo,t_hi]` (N-M2).
+- **Слияние** оконного ответа с сохранённым coarse: обновляются `series`/`client_series`/`host_series`/`focus_points`/`window`/краткая сводка; `client_identities`/`sessions`/`drops`/`events`/`config`/`host_caveats`/`clients`/`anomalies` остаются из coarse; при coarse-recompute (тяжёлая секция) — заменяются **только** тяжёлые таблицы (R3-m2).
+- `localProgressStart` (`:1327`/`:1406`) — **пропускается** на handle-пути (загрузки нет).
+- `session_expired` (как `downloadCsv` `:1459`) ⇒ сброс `state.handle` + reset.
+
+**Миграция потребителей троек (R1-M3/O12), per-consumer:**
+| Потребитель | Роль | Миграция |
+|---|---|---|
+| `computeView` (`:1032-1118`) | срез периода + **единая нормализация** | **меняется**: режет тройки по индексам, проецирует в плоский `view.series[key]` выбранного режима (`avg`/`min`/`max`) + строит `view.band[key]={lo,hi}` (min/max) при band-режиме |
+| `sliceByIdx`/`seriesIndices` (`:925`/`:929`) | индексация по общему `t` | без изменений |
+| `aggregateSeries` (`:945`) | сводка client_series | без изменений (получает спроецированные плоские) |
+| `mergeSessions` (`:1015`) | слияние сессий | без изменений |
+| player-group merge (`:1123-1167`) | слияние групп игроков | без изменений (через `mergeSessions`) |
+| `buildCharts` (`:3187`) | серверные **per-metric** ряды | **+** передаёт `band` (min–max) + линию avg в `buildChart` |
+| `buildClientCharts` (`:3236`) | клиентские **per-metric** ряды | **+** передаёт `band` (min–max) + линию avg |
+| `buildAllChart` (`:3370`) + `ALL_DATASETS[].values(s)` (`:3076-3092`) | **общий** «Все датасеты» | **+** читает выбранную проекцию `min`/`max` (**band запрещён**); тоггл `min↔max` (default `max`) |
+| `fillAllChart` (`:3424`) | заполнение общего графика | **+** совместим с выбранной проекцией общего графика (band не передаётся) |
+| `alignToServerTime`/`alignHostToServerTime` (`:3296`/`:3324`) | ресемплинг | без изменений |
+| `buildChart` (рендер) | линия/бар | **меняется**: band (fill lo..hi) + линия avg; для **общего** графика band **не** передаётся (только min **или** max) |
+| `selfTest` (`:4444`) | демо-проверка | демо-payload переводится на тройки; **сначала прогоняется через `computeView`** (`:4452`/`:4454`), затем `buildCharts`/`buildClientCharts` (N-m1) |
+| `downloadCsv` (`:1444`) | экспорт | без изменений |
+
+**Отрисовка по типу графика (O12).** Backend всегда отдаёт `{min,max,avg,n}`; рендер: **общий «Все датасеты»** — **один** из `min`/`max` (тоггл `min↔max`, **default `max`**, band/min+max **запрещён**), персист `hldsmon.ui.*`; **per-metric** — `min–max` band (fill) + линия `avg`. Payload одинаков ⇒ смена тоггла/режима — **без запроса**.
+
+**Селективные тогглы блоков (REQ-I10/O15).** Тогглы по каноническим ключам; выбор персистится **глобально** в `localStorage` (`hldsmon.ui.*`, рядом с `COLLAPSED_KEY:1737`/`DATASETS_KEY:1758`; helper персиста — по символу, не по строке). Лёгкая секция при активном окне ⇒ оконный `?handle&from&to` с расширенным `sections`; **тяжёлая** ⇒ handle-запрос **без** `from`/`to` (coarse-recompute) + re-merge тяжёлых таблиц (N-M3/R3-m2).
+
+**Двухуровневый таймлайн (REQ-I11/O14).** Главный brush — домен `state.fullRange` (выбор = `[from,to]`, подсветка); детальный brush — домен `[from,to]`, ручки задают поддиапазон, commit сужает окно, детальный re-доменизируется; повторный drag = вложенный зум. **Автопоказ** при `span(window) < DETAIL_TIMELINE_RATIO·span(fullRange)` (`=0.05`); иначе только главный. Правка ⇒ мгновенный handle-запрос (без повторной загрузки/разбора). Короче span ⇒ мельче бакеты (адаптивная схема IP-P3).
+
+**Границы.** Серверные контракты/индекс/бакетер — IP-P1/P2/P3; FTP — IP-P5; схема не трогается.
+
+**Инварианты.** INV-I5 (UI-часть), INV-I2 (клиент не держит полный payload); сервер остаётся stdlib-only.
+
+**Acceptance (QAS-I7, QAS-I14, QAS-I20, QAS-I21, QAS-I23 — **вне `make test`**; QAS-I1-фронт, QAS-I9-reset, QAS-I19-UI, QAS-I22-merge, QAS-I24-re-merge):**
+- [ ] **I7 (O12):** общий «Все датасеты» — **один** из `min`/`max` (тоггл, default `max`, **без band**); per-metric — `min–max` band + линия `avg`; всё из **одного** payload, смена тоггла/режима **не шлёт** запрос.
+- [ ] **I14:** тогглы режима/секций/таймлайна работают; персист в `localStorage` и восстановление после reload.
+- [ ] **I20:** детальный brush авто-показывается при `span(window) < 0.05·span(fullRange)`; его правка сужает окно ⇒ более мелкие бакеты; главный brush отражает окно; маркеры выровнены.
+- [ ] **I21:** все потребители рендерят корректно (общий — min **или** max без band; per-metric — band+avg; player-group merge/сводные колонки); `selfTest` на тройках зелёный (через `computeView`).
+- [ ] **I23:** после оконного запроса `coarse:false` `state.fullRange`/главный brush — полнодневные `[t_lo,t_hi]`; `digest.period` = весь лог.
+- [ ] **I1 (фронт):** 2-й+ запросы не шлют тело; отклик ≪ первого.
+- [ ] **I9 (reset):** `session_expired` ⇒ сброс `state.handle` + reset (как `downloadCsv`).
+- [ ] **I19 (UI):** тоггл лёгкой секции в окне ⇒ оконный запрос; тоггл тяжёлой ⇒ coarse-recompute без `from`/`to` + re-merge.
+- [ ] **I22 (merge):** оконный ответ сливается с coarse — таблицы/drops/config сохранены; FTP-ряды из троек.
+
+**Метод проверки UI-QAS (обязателен, §29.8).** QAS-I7/I14/I20/I21/I23 **не покрываются `make test`** (там C++ host-тесты + Python `unittest`; JS-рендер `index.html` не покрыт — лишь doctype smoke-test `test_get_index_html`). Механизм: **ручной QA-чеклист** (фиксируется в `docs/journal.md`) **и/или** прогон page-`selfTest` (`webui/index.html:4444`) с новыми кейсами (min/max-тоггл общего графика — band отсутствует; per-metric band+avg; персист тогглов секций/режима; автопоказ детального brush; полнодневный домен после оконного ответа). Python-статическая проверка допустима только для реально проверяемого (наличие ключа тоггла/константы в HTML/JS) — добавляется в `test_webui.py`.
+
+**Риски.** Пропущенный потребитель троек (билдер ломается) — таблица выше + `selfTest` через `computeView`; сброс `state.fullRange` оконным ответом — N-M2-тест/QA; регресс merge (потеря таблиц) — чеклист; тоггл band для общего графика — запрет в коде + QA.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v` (Python + sanity `test_webui`); `make test`; **ручной QA-чеклист** + прогон `selfTest` в браузере (для I7/I14/I20/I21/I23).
+
+**DoD фазы.** I7/I14/I20/I21/I23 подтверждены ручным QA/`selfTest` (запись в журнале); I1/I9/I19/I22/I24 зелёные.
+
+---
+
+## IP-P5 — FTP: форма рядов на тройки (период остаётся клиентским)
+**Цель.** Зафиксировать: FTP-**период** не меняется (клиентская фильтрация; FTP-индекс/сессия **не** строятся), но **форма рядов FTP** становится бакетными тройками через общий `_payload_from_agg`; фронт рисует тройки и для FTP.
+
+**Файлы.** `tools/analyzer/webui.py` (FTP-remote идёт через тот же `_payload_from_agg` — `_ftp_analyze` `:1621`; handle-форма `/api/analyze` FTP-сессионные handle **не** принимает); `tools/analyzer/webui/index.html` (рендер FTP-троек); `tools/analyzer/tests/test_webui.py`.
+
+**Границы.** FTP-**период**/FTP-UX — без изменений; FTP-индекс/сессия не строятся; экспорт-путь FTP не затронут.
+
+**Инварианты.** INV-I5; подтверждает INV-I4 (ряды — бакетные тройки везде).
+
+**Acceptance (QAS-I22-FTP):**
+- [ ] FTP-ответ отдаёт бакетные `series`/`client_series`/`host_series` (тройки) через `_payload_from_agg`; фронт корректно рисует тройки для FTP (QAS-I22).
+- [ ] FTP-**период** остаётся клиентским; FTP-сессионный handle не принимается handle-формой `/api/analyze`.
+
+**Тесты.** `test_webui.py`: FTP-payload несёт тройки; handle-форма отклоняет FTP-handle.
+
+**Риски.** Смешение FTP-клиентской фильтрации с серверным окном — не допускается; форма рядов — единая (тройки) во всём payload.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; `make test`. Реальный FTP — вне CI (ручной прогон).
+
+**DoD фазы.** Acceptance зелёный; FTP-период не изменён; форма рядов FTP — тройки.
+
+---
+
+## IP-P6 — Верификация, документация, журнал
+**Цель.** Финальная сквозная верификация стадии; запись журнала; сверка доков; фиксация UI-QA.
+
+**Файлы.** `docs/journal.md` (запись стадии `instant-period`: что сделано, UI-QA-результат, коммит-статус); `README.md` (раздел анализатора/веб-UI — обновить описание мгновенного периода/селективных секций/таймлайна, если нужно); сверка `docs/design.md` §29/§16; индексы (`AGENTS.md` уже указывает на `docs/plan.md`).
+
+**Acceptance (QAS-I13):**
+- [ ] **stdlib-only** сохранён; схема P1/`KNOWN_TYPES`/`exports.whitelist` **без изменений**; `src/`/Makefile не тронуты.
+- [ ] **Существующие Python-ассерты мигрированы** на новый контракт (тройки / полнодневная сводка / адаптивный cap / `PROTOCOL_VERSION=2`; перечень — IP-P2/IP-P3 «Миграция существующих тестов (H1)»); suite (мигрированные + новые) зелёный; `make`/`make test` зелёные; Windows-совместимость (без POSIX-only вызовов).
+- [ ] Каждый QAS-I1..I24 прослеживается к тесту/методу (карта выше); I7/I14/I20/I21/I23 — ручной QA/`selfTest` записан.
+- [ ] `docs/journal.md` заполнен. **Коммит** — только по явной просьбе владельца.
+
+**Верификация.** `make`; `make test`; `cd tools/analyzer && python3 -m unittest discover -s tests -v`.
+
+**DoD фазы.** Все артефакты стадии на месте; журнал закрыт.
+
+---
+
+## Definition of Done (стадия `instant-period`)
+- [ ] **REQ-I1** (мгновенная смена периода, без пере-загрузки/полного разбора) — IP-P2/P4, QAS-I1/I2.
+- [ ] **REQ-I2** (первый проход строит coarse+индекс) — IP-P1, QAS-I3.
+- [ ] **REQ-I3** (окно seek'ом; run seed'нут; coarse-only списки) — IP-P1/P2, QAS-I4/I15.
+- [ ] **REQ-I4** (бакеты min/max/avg/n) — IP-P3, QAS-I6/I17.
+- [ ] **REQ-I5** (отрисовка по типу графика) — IP-P3/P4, QAS-I7.
+- [ ] **REQ-I6** (обратная совместимость форм) — IP-P2, QAS-I9.
+- [ ] **REQ-I7** (маркеры выровнены) — IP-P3/P4, QAS-I8.
+- [ ] **REQ-I8** (память: разрежённый индекс; сессия ограничена) — IP-P1, QAS-I10.
+- [ ] **REQ-I9** (multi-run корректность оконных артефактов) — IP-P1/P2, QAS-I15.
+- [ ] **REQ-I10** (селективные секции) — IP-P2/P4, QAS-I19/I24.
+- [ ] **REQ-I11** (двухуровневый таймлайн) — IP-P4, QAS-I20.
+- [ ] **INV-I1..INV-I10** покрыты (карта выше); INV-5/INV-6 сохранены; `iter_records`/`src/` не тронуты.
+- [ ] QAS-I1..I24: каждая прослеживается к фазе/методу; **I7/I14/I20/I21/I23 вне `make test`** — подтверждены ручным QA-чеклистом + `selfTest`, запись в журнале.
+- [ ] `make` и `make test` зелёные; `cd tools/analyzer && python3 -m unittest discover -s tests -v` зелёный.
+- [ ] JSONL-схема P1/`KNOWN_TYPES`/`exports.whitelist`/Makefile/`src/` не изменены; stdlib-only; `PROTOCOL_VERSION` = 2.
+- [ ] `docs/journal.md` заполнен; `README.md` и `docs/design.md §29` согласованы.
+- [ ] Коммит — только по явной просьбе владельца (один связный коммит стадии).
+
+## Риски и откат (стадия)
+| Риск | Митигация | Откат |
+|---|---|---|
+| **Немонотонный `t`** (продюсер — `CLOCK_REALTIME`; NTP-шаг назад) | Валидация в проходе; `monotonic=False` ⇒ `_serve_window` → полный скан (INV-I8, QAS-I16) | Оконный путь отключить (всегда полный скан) до фикса |
+| **Sweeper-поток vs in-flight read** (гонки, eviction во время чтения) | `_SPOOL_LOCK` на `spool_get`/`_spool_remove`/`spool_sweep`; eviction ⇒ `session_expired`/перехват `OSError`/`FileNotFoundError` (не 500); QAS-I11/I12 | Остановить фоновый поток; вернуться к lazy-TTL в `spool_get` |
+| **Windows: удаление открытого файла** (`PermissionError` → `_silent_remove`→`False`) | Eviction откладывается до `spool_startup_cleanup`; безвредно (spool-файлы открыты лишь на время запроса) (§29.3 п.3) | Оставить handle до startup-cleanup следующего запуска |
+| **Память сессии** (множество handle × кэш) | INV-I6: кэш = индекс+сводка+бакеты; тяжёлые не кэшируются; per-handle `ANALYSIS_SESSION_MB=16`; TTL/бюджет §28; QAS-I10/I12 | Уменьшить `ANALYSIS_SESSION_MB`; ужать TTL |
+| **Расхождение фронта с тройками** (пропущенный потребитель) | Единая проекция в `computeView`; таблица потребителей IP-P4; `selfTest` через `computeView`; QAS-I21 | Откат фронта (IP-P4) к прежнему upload-потоку (телесная форма сохранена) |
+| **Регресс контрактов** (полный vs оконный ответ) | Аддитивность: телесная форма и export/bundle без изменений; оконный ответ не несёт тяжёлых списков; merge на фронте; QAS-I9/I22 | Вернуть прежний клиентский период (телесная форма `/api/analyze`) |
+| **Избыточность кэша memo** (LRU растёт) | LRU=8 (O13); ключ `(from,to,window,sections)`; сброс при `ANALYSIS_SESSION_MB` | Уменьшить `MEMO_LRU` |
+
+## Раздел ревью плана (momus) — стадия `instant-period`
+**Ревьюер:** `momus`. **Вердикт: PASS-WITH-REVISIONS — блокеров нет; plan-gate ЗАКРЫТ после сложения H1/M1/M2 (L1/L2 — опциональные, сложены).** implementation-gate ОТКРЫТ.
+
+| ID | Severity | Замечание | Disposition |
+|---|---|---|---|
+| H1 | High | Существующие Python-тесты кодируют **старый** flat-series / full-resolution контракт (`version==1`; flat `series`/`client_series`/`host_series`) и станут красными под тройки + адаптивную бакетировку + `PROTOCOL_VERSION 1→2`; план их не перечислял, а IP-P6 DoD требовал «existing tests green unchanged». | **Внесено** — перечень миграции в IP-P2/IP-P3 («Миграция существующих тестов (H1)»): `test_top_level_keys_and_files_echo`/`TestHTTP` — `version 1→2`; `test_series_lengths_and_values`, `test_client_series_shape`, `test_host_series_key`, `test_explicit_window_matches_client_filter`, `test_windowed_full_resolution_and_default_downsampled` — flat → **тройки**/`t[]`; `TestCoarseDownsampling.test_coarse_series_capped_at_series_max_points` (`len==7000`) → **`≤ CHART_MAX_POINTS (2000)`** (противоречил новому cap); `test_constants` остаётся зелёным за счёт алиаса `SERIES_MAX_POINTS=2000`. Формулировки DoD IP-P2/IP-P3/IP-P6 изменены на «ассерты мигрированы; suite зелёный». |
+| M1 | Med | Устаревшие/неверные line-anchors. | **Внесено** — `PROTOCOL_VERSION` `webui.py:553` → **`webui.py:577`**; персист-ключи `COLLAPSED_KEY:1422`/`DATASETS_KEY:1443`, helper `:1380` → **`COLLAPSED_KEY:1737`/`DATASETS_KEY:1758`**, helper — по символу (без номера строки; `:1380` — не storage-helper). |
+| M2 | Med | `sections` на первой (телесной) форме `POST /api/analyze` заявлен двусмысленно («без изменений»), тогда как REQ-I10/§29.5 требуют `sections` на **обеих** формах. | **Внесено** — IP-P2 явно: телесная форма **аддитивно принимает опц. `sections=`** (default все), гейтинг применяется и к ней; acceptance-пункт `sections` переформулирован на «обе формы». |
+| L1 | Low | IP-P2 объединял `/api/export`,`/api/bundle` с body-формой как «уже handle-based/без изменений»; первая форма `/api/analyze` не handle-based. | **Внесено** — разделено: body-форма `/api/analyze` — аддитивно `+sections` (первый запрос, порождает handle); `/api/export`/`/api/bundle` — действительно без изменений (уже handle-based). |
+| L2 | Low | `_serve_window` вводился без указания связи с существующим run-aware `window_records` (`webui.py:983-997`, `TestWindowRunPreservation`). | **Внесено** — строка в IP-P2: `_serve_window` **заменяет/расширяет** `window_records`, сохраняя run-seeding, но возвращая бакетные тройки. |
+
+**Fine (не менять):** scope `tools/analyzer` (`webui.py`/`hldsmon.py`/`webui/index.html`/`tests`), `src/`/схема P1/`KNOWN_TYPES`/`exports.whitelist`/Makefile без изменений; stdlib-only; `iter_records` не трогается; `iter_records_offsets` — аддитивно; фазовая декомпозиция IP-P1..IP-P6 и карта REQ-I/QAS-I/INV-I.
+
+**Гейт:** plan-review пройден (PASS-WITH-REVISIONS; H1/M1/M2 и опциональные L1/L2 сложены) — **plan-gate ЗАКРЫТ; implementation-gate ОТКРЫТ**. Коммит — только по явной просьбе владельца.
