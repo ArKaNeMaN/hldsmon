@@ -433,18 +433,9 @@
   .period-brush .period-brush-handle:focus { outline: none; }
   .period-brush .period-brush-handle:focus .handle-bar { fill: var(--accent-2); stroke: var(--text); stroke-width: 1.5; }
   .period-timeline-label { font-size: 12px; color: var(--text-mut); font-variant-numeric: tabular-nums; margin-top: 4px; font-family: var(--mono); }
-  .period-presets { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-  .period-presets-label { font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
 
-  /* period "follow" (live end): checkbox + live pill + live brush styling */
-  .period-follow { display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-  .period-follow-toggle {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 11.5px; color: var(--text-mut); cursor: pointer; user-select: none;
-    text-transform: uppercase; letter-spacing: .5px;
-  }
-  .period-follow-toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
-  .period-follow-toggle:has(input:disabled) { opacity: .42; cursor: not-allowed; }
+  /* period "follow" (live end): a non-interactive live pill + live brush styling.
+     Following == the period has NO upper bound (state.period.to == null). */
   .period-live {
     display: none; align-items: center; gap: 5px;
     font-size: 11px; font-weight: 600; color: var(--ok);
@@ -569,15 +560,25 @@
   /* ------------------------------------------------------------------ */
   /*  Stage 12 «large-logs» — compact «Период» (L7) + sticky toggle (L8)  */
   /*  The whole sticky block must stay <= PERIOD_MAX_HEIGHT_PX (96px):     */
-  /*  one compact row = mini-timeline + from/to + presets + follow + the   */
-  /*  one global client picker + the sticky toggle.                        */
+  /*  row 1 (header) = title + status pill + range text + live cue + the   */
+  /*  one global client picker + the sticky toggle;                        */
+  /*  row 2 (body)   = the full-width draggable timeline.                  */
   /* ------------------------------------------------------------------ */
-  .period-panel .panel-head { padding: 3px 12px; }
+  .period-panel .panel-head {
+    padding: 3px 12px;
+    /* keep the header on ONE line at any width (horizontal scroll on narrow
+       viewports instead of wrapping) so the block height stays constant. */
+    flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; min-width: 0;
+    scrollbar-width: none; -ms-overflow-style: none;
+  }
+  .period-panel .panel-head::-webkit-scrollbar { display: none; width: 0; height: 0; }
   .period-panel .panel-head h2 { font-size: 13.5px; }
+  .period-panel .panel-toggle { flex-wrap: nowrap; white-space: nowrap; flex: 0 0 auto; }
   .period-panel .panel-body { padding: 6px 12px; }
   .period-row {
     display: flex; align-items: center; gap: var(--sp-2);
-    flex-wrap: nowrap; overflow-x: auto; overflow-y: visible;
+    flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
+    min-width: 0;
     /* L7: a visible horizontal scrollbar on a narrow viewport adds ~15px and
        breaks the <= PERIOD_MAX_HEIGHT_PX (96px) budget. Keep the scroll (wheel/
        trackpad/touch) but hide the bar so the block height stays constant. */
@@ -586,16 +587,17 @@
   .period-row::-webkit-scrollbar { display: none; width: 0; height: 0; }
   .period-row .field { flex: 0 0 auto; }
   .period-row .field label { display: none; }
-  .period-row .period-tl { flex: 1 1 200px; min-width: 150px; }
-  .period-row .period-tl .period-timeline { margin-bottom: 0; }
-  .period-row .period-brush { height: 26px; }
-  .period-row .period-timeline-label { margin-top: 1px; font-size: 10.5px; line-height: 1.15; white-space: nowrap; }
-  .period-row .period-timeline-empty { padding: 0; font-size: 11px; }
-  .period-row .period-input {
-    min-width: 0; width: 148px; padding: 4px 7px; font-size: 12px; font-family: var(--mono);
-  }
   .period-row select { min-width: 0; padding: 4px 7px; font-size: 12px; }
-  .period-row .period-preset, .period-row .period-follow { flex: 0 0 auto; }
+  .period-range {
+    flex: 0 0 auto; font-family: var(--mono); font-size: 11.5px;
+    color: var(--text-mut); font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .period-timeline-row { margin-top: 2px; }
+  .period-timeline-row .period-tl { width: 100%; }
+  .period-timeline-row .period-timeline { margin-bottom: 0; }
+  .period-timeline-row .period-brush { width: 100%; height: 26px; }
+  .period-timeline-row .period-timeline-label { margin-top: 1px; font-size: 10.5px; line-height: 1.15; white-space: nowrap; }
+  .period-timeline-row .period-timeline-empty { padding: 0; font-size: 11px; }
   .period-sticky-toggle {
     display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
     font-size: 11.5px; color: var(--text-mut); cursor: pointer; user-select: none;
@@ -678,6 +680,10 @@
             <button class="btn ghost" id="btnClear" type="button" hidden>Очистить результаты</button>
           </div>
           <div id="status" class="status info" role="status" aria-live="polite" style="margin-top:10px"></div>
+          <div class="ftp-progress" id="localProgress" hidden>
+            <div class="ftp-progress-track" id="localProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Прогресс анализа" aria-valuetext="ожидание"><div class="ftp-progress-fill" id="localProgressFill"></div></div>
+            <div class="ftp-progress-label" id="localProgressLabel"></div>
+          </div>
         </div>
 
         <div class="file-list">
@@ -834,6 +840,36 @@ function fmtClock(epoch) {
   if (!isNum(epoch)) return "—";
   return new Date(epoch * 1000).toISOString().slice(11, 19);
 }
+/* Period range text: seconds precision, rendered in the BROWSER timezone
+   (fallback Europe/Moscow when the environment exposes none). `fmtRange` is the
+   single formatter for the «Период» block text — do NOT reuse it for the other
+   `fmtIso` (UTC) readouts elsewhere in the page. */
+const RANGE_TZ_FALLBACK = "Europe/Moscow";
+function rangeTimeZone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (tz) return tz;
+  } catch (e) { /* no Intl/root locale -> fall back to MSK */ }
+  return RANGE_TZ_FALLBACK;
+}
+function fmtRange(epoch) {
+  if (!isNum(epoch)) return "—";
+  const d = new Date(epoch * 1000);
+  const mk = (tz, withName) => new Intl.DateTimeFormat("ru-RU", Object.assign({
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false, timeZone: tz,
+  }, withName ? { timeZoneName: "short" } : null));
+  try {
+    return mk(rangeTimeZone(), true).format(d);
+  } catch (e) {
+    try { return mk(rangeTimeZone(), false).format(d); }        // timeZoneName unsupported
+    catch (e2) {
+      try { return mk(RANGE_TZ_FALLBACK, false).format(d); }    // unsupported timezone -> MSK
+      catch (e3) { return fmtIso(epoch); }
+    }
+  }
+}
 function fmtMbFromKb(kb) { return isNum(kb) ? fmtFloat(kb / 1024, 1) + " МБ" : "—"; }
 function fmtBool(v) {
   if (v === true) return "да";
@@ -885,14 +921,6 @@ const state = {
 let refreshAllPanelUI = null;
 
 /* ---------- period parsing + filtered view ---------- */
-function parseTimeInput(str) {
-  const s = (str || "").trim();
-  if (!s) return null;
-  if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
-  const ms = Date.parse(s);
-  if (!isNaN(ms)) return ms / 1000;
-  return NaN;
-}
 function inRangeF(v, lo, hi) { return isNum(v) && v >= lo && v <= hi; }
 function sliceByIdx(arr, idx) {
   if (!Array.isArray(arr)) return idx.map(() => null);
@@ -1264,18 +1292,107 @@ function httpErrorText(status, data) {
   if (data && data.error) return data.error;
   return "HTTP " + status;
 }
-async function readJsonOrThrow(res) {
-  let data = null;
-  try { data = await res.json(); } catch (e) { data = null; }
-  if (res.ok && data && data.ok === true) return data;
-  throw new Error(httpErrorText(res.status, data));
+/* Local-file analysis progress: a two-phase determinate bar.
+   Phase 1 = upload bytes (XMLHttpRequest.upload.onprogress);
+   Phase 2 = server-side parse bytes, polled via /api/analyze/progress. */
+const localProgress = { timer: null };
+
+function localProgressLabel(text) {
+  const l = $("#localProgressLabel");
+  if (l) l.textContent = text || "";
+}
+
+function localProgressPhaseLabel(prefix, pct) {
+  const n = (pct != null && isFinite(pct)) ? Math.round(pct) : 0;
+  return prefix + " " + n + "%";
+}
+
+function localProgressSet(pct, done, total, label) {
+  const box = $("#localProgress");
+  const fill = $("#localProgressFill");
+  const track = $("#localProgressTrack");
+  if (!box || !fill) return;
+  box.hidden = false;
+  box.classList.remove("indeterminate", "analyzing");
+  const has = (pct != null && isFinite(pct));
+  const clamped = has ? Math.max(0, Math.min(100, pct)) : 0;
+  fill.style.width = clamped + "%";
+  if (track) {
+    track.setAttribute("aria-valuenow", String(Math.round(clamped)));
+    track.setAttribute("aria-valuetext", has ? (Math.round(clamped) + "%") : "ожидание");
+  }
+  if (label != null) localProgressLabel(label);
+}
+
+function localProgressStart() {
+  const box = $("#localProgress");
+  if (box) { box.hidden = false; box.classList.remove("indeterminate", "analyzing"); }
+  localProgressSet(0, null, null, "Загрузка на сервер… 0%");
+}
+
+function localProgressStopPoll() {
+  if (localProgress.timer) { clearInterval(localProgress.timer); localProgress.timer = null; }
+}
+
+function localProgressHide() {
+  localProgressStopPoll();
+  const box = $("#localProgress");
+  if (box) box.hidden = true;
+}
+
+function localProgressPollStart(job) {
+  localProgressStopPoll();
+  localProgress.timer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/analyze/progress?id=" + encodeURIComponent(job));
+      const data = await res.json();
+      const p = data && data.progress;
+      if (!p || p.finished) return;
+      const parse = p.phase === "parse";
+      const label = localProgressPhaseLabel(parse ? "Разбор данных…" : "Загрузка на сервер…", p.pct);
+      localProgressSet(p.pct, p.done, p.total, label);
+    } catch (e) { /* progress is best-effort */ }
+  }, 400);
+}
+
+function analyzeViaXhr(url, blob, job) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && ev.total > 0) {
+        const pct = 100.0 * ev.loaded / ev.total;
+        localProgressSet(pct, ev.loaded, ev.total, localProgressPhaseLabel("Загрузка на сервер…", pct));
+      } else {
+        localProgressSet(null, ev.loaded, null, "Загрузка на сервер…");
+      }
+    };
+    xhr.upload.onload = () => {
+      localProgressSet(0, 0, null, "Разбор данных… 0%");
+      localProgressPollStart(job);
+    };
+    xhr.onload = () => {
+      localProgressStopPoll();
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+      if (xhr.status >= 200 && xhr.status < 300 && data && data.ok === true) resolve(data);
+      else reject(new Error(httpErrorText(xhr.status, data)));
+    };
+    xhr.onerror = () => { localProgressStopPoll(); reject(new Error("сетевая ошибка")); };
+    xhr.onabort = () => { localProgressStopPoll(); reject(new Error("запрос прерван")); };
+    xhr.ontimeout = () => { localProgressStopPoll(); reject(new Error("таймаут запроса")); };
+    xhr.send(blob);
+  });
 }
 
 /* fetchAnalyze: direct Blob upload + SERVER-SIDE period (stage 12).
    - no from/to -> coarse whole-day overview + handle (downsampled series)
    - from/to   -> materialized full-resolution window (coarse=false)
    The period is chosen BEFORE the request; local results are never filtered
-   from a full-resolution payload client-side. `reset` starts a fresh upload. */
+   from a full-resolution payload client-side. `reset` starts a fresh upload.
+   Uses XMLHttpRequest (not fetch) so the upload-progress phase is observable;
+   a per-request `job` id drives the server-side parse-progress poll. */
 async function fetchAnalyze(opts) {
   opts = opts || {};
   if (!state.files.length) { setStatus("Сначала выберите файлы.", "error"); return; }
@@ -1286,6 +1403,7 @@ async function fetchAnalyze(opts) {
   state.analyzing = true;
   setLoading(true);
   setStatus((isNum(from) || isNum(to)) ? "Запрос окна…" : "Загрузка и анализ (обзор дня)…", "info");
+  localProgressStart();
   try {
     const blob = state.fileBlob || buildUploadBlob(state.files);
     state.fileBlob = blob;
@@ -1294,12 +1412,9 @@ async function fetchAnalyze(opts) {
     q.set("files", names.join(","));
     if (isNum(from)) q.set("from", String(from));
     if (isNum(to)) q.set("to", String(to));
-    const res = await fetch("/api/analyze?" + q.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: blob,
-    });
-    const data = await readJsonOrThrow(res);
+    const job = ftpNewJob();
+    q.set("job", job);
+    const data = await analyzeViaXhr("/api/analyze?" + q.toString(), blob, job);
     revokeUrls();
     state.source = "local";
     state.demo = false;
@@ -1320,6 +1435,7 @@ async function fetchAnalyze(opts) {
     setStatus("Ошибка анализа: " + msg, "error");
     toast("Ошибка анализа: " + msg, "error");
   } finally {
+    localProgressHide();
     state.analyzing = false;
     setLoading(false);
   }
@@ -1677,6 +1793,10 @@ function datasetsSave() {
 const STICKY_KEY = "hldsmon.ui.sticky.v1";
 /* compact «Период» target height in px (QAS-L17; asserted by the page selfTest) */
 const PERIOD_MAX_HEIGHT_PX = 96;
+/* follow hit area: dragging the right handle within this many SCREEN px of the
+   track end turns following ON (no upper bound). Converted to viewBox/time units
+   against the rendered SVG width inside buildPeriodTimeline.commit(). */
+const FOLLOW_SNAP_PX = 10;
 
 function stickyLoad() {
   const store = ftpPrefsStore();
@@ -2035,51 +2155,43 @@ function buildGlobalClientPicker(view) {
   return picker;
 }
 
-/* ----- period selector (compact single row; target <= PERIOD_MAX_HEIGHT_PX) ----- */
+/* ----- period selector (two compact rows; target <= PERIOD_MAX_HEIGHT_PX) -----
+   Row 1 (header): range text + live cue + the ONE global client picker + sticky toggle.
+   Row 2 (body): the full-width draggable timeline — the ONLY way to edit the period. */
 function buildPeriodPanel(result) {
   const view = state.view || computeView(result);
+  const fr = (view && view.fullRange) || {};
+  const fullEnd = isNum(fr.end) ? fr.end : null;
+  const follow = !isNum(state.period.to);   // no upper bound == following the newest sample
 
-  const fromInput = el("input", "period-input");
-  fromInput.type = "text"; fromInput.id = "periodFrom";
-  fromInput.setAttribute("aria-label", "Начало периода (ISO или epoch)");
-  fromInput.placeholder = "от: ISO / epoch";
-  fromInput.value = state.period.from != null ? fmtIso(state.period.from) : "";
+  // selected range as text (seconds precision, browser timezone). While following
+  // the right side shows the newest sample / the open end of the log.
+  const rangeEl = el("span", "period-range");
+  rangeEl.title = "Выбранный период (таймзона браузера)";
+  const fullStart = isNum(fr.start) ? fr.start : null;
+  const paintRange = (from, to) => {
+    const left = isNum(from) ? from : fullStart;   // no lower bound == start of the log
+    const right = isNum(to) ? to : fullEnd;         // no upper bound == newest sample (follow)
+    rangeEl.textContent = fmtRange(left) + " — " + fmtRange(right);
+  };
+  paintRange(state.period.from, state.period.to);
 
-  const toInput = el("input", "period-input");
-  toInput.type = "text"; toInput.id = "periodTo";
-  toInput.setAttribute("aria-label", "Конец периода (ISO или epoch)");
-  toInput.placeholder = "по: ISO / epoch";
-  toInput.value = state.period.to != null ? fmtIso(state.period.to) : "";
+  // optional non-interactive follow cue (following == no upper bound)
+  const live = el("span", "period-live" + (follow && fullEnd != null ? " on" : ""));
+  live.title = "Правая граница следует за новыми данными";
+  live.appendChild(el("span", "live-dot"));
+  live.appendChild(el("span", null, "слежение"));
 
-  const row = el("div", "controls period-row");
+  // header row: range text + live cue + the global client picker + sticky toggle
+  const headRow = el("div", "period-row");
+  headRow.appendChild(rangeEl);
+  headRow.appendChild(live);
 
-  // draggable mini-timeline (compact) — still the primary period control
-  const tl = el("div", "period-tl");
-  tl.appendChild(buildPeriodTimeline(view, {
-    onLive: (from, to) => { fromInput.value = fmtIso(from); toInput.value = fmtIso(to); },
-    onCommit: (from, to) => applyPeriodValues(from, to),
-  }));
-  row.appendChild(tl);
-
-  row.appendChild(fromInput);
-  row.appendChild(toInput);
-
-  const applyBtn = el("button", "btn primary sm", "Применить");
-  applyBtn.type = "button";
-  const resetBtn = el("button", "btn ghost sm", "Сбросить");
-  resetBtn.type = "button";
-  applyBtn.addEventListener("click", () => applyPeriod(fromInput.value, toInput.value));
-  resetBtn.addEventListener("click", () => applyPeriodValues(null, null));
-  row.appendChild(applyBtn);
-  row.appendChild(resetBtn);
-  row.appendChild(buildPeriodPresets(view));
-  row.appendChild(buildPeriodFollow(view));
-
-  // the ONE global client selector, kept visible in the sticky row
+  // the ONE global client selector, kept visible in the sticky header
   const clientField = el("div", "field");
   clientField.appendChild(el("label", null, "Клиент"));
   clientField.appendChild(buildGlobalClientPicker(view));
-  row.appendChild(clientField);
+  headRow.appendChild(clientField);
 
   // REQ-L8: user-controlled pinning, persisted in localStorage, applied live
   const stickyLabel = el("label", "period-sticky-toggle");
@@ -2091,83 +2203,23 @@ function buildPeriodPanel(result) {
   stickyCb.addEventListener("change", () => applySticky(stickyCb.checked));
   stickyLabel.appendChild(stickyCb);
   stickyLabel.appendChild(el("span", null, "закрепить"));
-  row.appendChild(stickyLabel);
+  headRow.appendChild(stickyLabel);
+
+  // second row: the timeline on its OWN full-width line
+  const tlRow = el("div", "period-timeline-row");
+  const tl = el("div", "period-tl");
+  tl.appendChild(buildPeriodTimeline(view, {
+    onLive: (from, to) => paintRange(from, to),
+    onCommit: (from, to) => applyPeriodValues(from, to),
+  }));
+  tlRow.appendChild(tl);
 
   const pill = (state.period.from != null || state.period.to != null) ? "фильтр активен" : "полный диапазон";
-  const panelEl = panel("Период", pill, row);
+  const panelEl = panel("Период", pill, tlRow, headRow);
   panelEl.id = "periodPanel";
   panelEl.classList.add("panel-sticky", "period-panel");
   if (!state.sticky) panelEl.classList.add("no-sticky");
   return panelEl;
-}
-
-/* buildPeriodPresets: compact preset menu (REQ-L7 «пресеты одной линией/меню»).
-   An option shorter than the log picks `[fullEnd-secs, end]` (follow); an empty
-   value resets to the whole log (server-side coarse overview for local files). */
-function buildPeriodPresets(view) {
-  const sel = el("select", "period-preset");
-  sel.id = "periodPreset";
-  sel.title = "Быстрый выбор периода";
-  sel.setAttribute("aria-label", "Быстрый выбор периода");
-  sel.appendChild(new Option("Период ▾", ""));
-  const fr = (view && view.fullRange) || {};
-  const fullStart = isNum(fr.start) ? fr.start : null;
-  const fullEnd = isNum(fr.end) ? fr.end : null;
-  const dur = (fullStart != null && fullEnd != null) ? (fullEnd - fullStart) : null;
-  const defs = [
-    { label: "+5 мин", secs: 300 },
-    { label: "+30 мин", secs: 1800 },
-    { label: "+1 ч", secs: 3600 },
-    { label: "+6 ч", secs: 21600 },
-    { label: "+24 ч", secs: 86400 },
-  ];
-  for (const def of defs) {
-    const o = new Option(def.label, String(def.secs));
-    if (dur == null || dur < def.secs) { o.disabled = true; o.text = def.label + " (лог короче)"; }
-    sel.appendChild(o);
-  }
-  sel.value = "";
-  sel.addEventListener("change", () => {
-    const secs = parseInt(sel.value, 10);
-    if (!sel.value || !isNum(secs)) applyPeriodValues(null, null);
-    else if (fullEnd != null) applyPeriodValues(fullEnd - secs, null);
-    sel.value = "";
-  });
-  return sel;
-}
-
-/* buildPeriodFollow: «Слежение» — pin the right edge to the newest sample.
-   No new state field: following == the period has NO upper bound (state.period.to == null). */
-function buildPeriodFollow(view) {
-  const fr = (view && view.fullRange) || {};
-  const fullStart = isNum(fr.start) ? fr.start : null;
-  const fullEnd = isNum(fr.end) ? fr.end : null;
-  const hasData = fullStart != null && fullEnd != null && fullEnd > fullStart;
-  const follow = !isNum(state.period.to);
-
-  const wrap = el("div", "period-follow");
-
-  const label = el("label", "period-follow-toggle");
-  const cb = el("input");
-  cb.type = "checkbox"; cb.id = "periodFollow";
-  cb.checked = follow && hasData;
-  cb.disabled = !hasData;
-  cb.title = "Держать правую границу на самом новом сэмпле — новые данные подхватываются при обновлении";
-  cb.addEventListener("change", () => {
-    if (cb.checked) applyPeriodValues(state.period.from, null);        // follow ON
-    else applyPeriodValues(state.period.from, fullEnd);                // freeze at the current end
-  });
-  label.appendChild(cb);
-  label.appendChild(el("span", null, "Слежение"));
-  wrap.appendChild(label);
-
-  const live = el("span", "period-live" + (follow && hasData ? " on" : ""));
-  live.title = "Правая граница следует за новыми данными";
-  live.appendChild(el("span", "live-dot"));
-  live.appendChild(el("span", null, "в реальном времени"));
-  wrap.appendChild(live);
-
-  return wrap;
 }
 
 /* buildPeriodTimeline: draggable brush spanning the FULL log range. */
@@ -2242,7 +2294,7 @@ function buildPeriodTimeline(view, cb) {
     hLeft.setAttribute("transform", "translate(" + xf + ",0)");
     hRight.setAttribute("transform", "translate(" + xt + ",0)");
     endDot.setAttribute("transform", "translate(" + xt + ",0)");
-    labelEl.textContent = fmtIso(curFrom) + " — " + fmtIso(curTo);
+    labelEl.textContent = fmtRange(curFrom) + " — " + fmtRange(curTo);
   }
   function setSel(from, to, live) {
     curFrom = clampT(from); curTo = clampT(to);
@@ -2254,7 +2306,13 @@ function buildPeriodTimeline(view, cb) {
   function commit(atEnd) {
     let from = curFrom, to = curTo;
     if (atEnd && fullEnd != null) {
-      const snap = Math.max(1.5 * sample, 0.02 * (fullEnd - fullStart));
+      // Follow turns ON only when the right handle lands within FOLLOW_SNAP_PX SCREEN px
+      // of the track end. Convert screen px -> viewBox units via the rendered SVG width
+      // (svg.getBoundingClientRect().width / VW), then viewBox units -> seconds.
+      const rect = svg.getBoundingClientRect();
+      const pxPerVb = rect.width ? (rect.width / VW) : 0;
+      let snap = sample;   // safe fallback when the SVG is not laid out (width 0)
+      if (pxPerVb > 0) snap = (FOLLOW_SNAP_PX / pxPerVb) / (tx1 - tx0) * span;
       if (to >= fullEnd - snap) to = null;   // near the end -> no upper bound (follow ON)
     }
     if (cb.onCommit) cb.onCommit(from, to);
@@ -2324,23 +2382,9 @@ function buildPeriodTimeline(view, cb) {
   return wrap;
 }
 
-function applyPeriod(fromStr, toStr) {
-  const from = parseTimeInput(fromStr);
-  const to = parseTimeInput(toStr);
-  if (Number.isNaN(from) || Number.isNaN(to)) {
-    toast("Некорректная дата/время. Используйте ISO или epoch (секунды).", "error");
-    return;
-  }
-  if (from != null && to != null && from > to) {
-    toast("«С» позже, чем «По» — границы перепутаны.", "error");
-    return;
-  }
-  applyPeriodValues(from, to);
-}
-
-/* applyPeriodValues: the single funnel used by «Применить», the presets and the brush.
-   For local uploads the period is SERVER-side: re-request the window (the file is
-   streamed again as a Blob, never re-read into a JS string). FTP/demo keep
+/* applyPeriodValues: the single funnel used by the timeline brush (the only period
+   editor). For local uploads the period is SERVER-side: re-request the window (the
+   file is streamed again as a Blob, never re-read into a JS string). FTP/demo keep
    client-side filtering of the already-loaded data. */
 function applyPeriodValues(from, to) {
   state.period = { from: from, to: to };
@@ -4427,6 +4471,19 @@ function selfTest() {
     ["focus-panel", () => buildFocusPanel(view, demo)],
     ["clients", () => buildClientsTable(view.clients)],
     ["ftp-panel", () => { const p = $("#ftpPanel"); if (!p) throw new Error("нет #ftpPanel"); return p; }],
+    ["local-progress", () => {
+      const box = $("#localProgress");
+      if (!box) throw new Error("нет #localProgress");
+      const track = $("#localProgressTrack");
+      if (!track || track.getAttribute("role") !== "progressbar") throw new Error("нет роли progressbar у локального прогресс-бара");
+      if (track.getAttribute("aria-valuemin") !== "0" || track.getAttribute("aria-valuemax") !== "100") throw new Error("нет aria-valuemin/max у локального прогресс-бара");
+      if (typeof localProgressSet !== "function" || typeof localProgressPollStart !== "function" || typeof analyzeViaXhr !== "function") {
+        throw new Error("нет пломбинга прогресса локального анализа");
+      }
+      if (String(localProgressPollStart).indexOf("/api/analyze/progress") === -1) throw new Error("нет поллинга /api/analyze/progress");
+      if (String(analyzeViaXhr).indexOf("upload.onprogress") === -1) throw new Error("нет upload.onprogress в транспорте загрузки");
+      return box;
+    }],
     /* ---- Stage 12 UI QAS (L16/L17/L18) — browser-only, outside `make test` ---- */
     ["L16-ftp-window-controls", () => {
       const size = $("#ftpWindowSize");
@@ -4507,7 +4564,7 @@ function selfTest() {
 
 document.addEventListener("DOMContentLoaded", init);
 // expose for manual console verification
-window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime, fetchAnalyze, buildUploadBlob, buildPeriodPanel, buildPeriodPresets, applySticky, ftpUpdateRange, STICKY_KEY, PERIOD_MAX_HEIGHT_PX };
+window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime, fetchAnalyze, buildUploadBlob, buildPeriodPanel, fmtRange, applySticky, ftpUpdateRange, STICKY_KEY, PERIOD_MAX_HEIGHT_PX };
 </script>
 </body>
 </html>

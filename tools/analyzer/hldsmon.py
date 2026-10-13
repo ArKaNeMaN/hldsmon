@@ -32,6 +32,7 @@ import csv
 import json
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from statistics import mean
@@ -166,22 +167,43 @@ END_WINDOW_S = 15.0
 #: coarse-overview aggregator (stage ``large-logs``, design §28.3 п.1).
 SERIES_MAX_POINTS = 2000
 
+#: Minimum interval (seconds) between :func:`iter_records` ``on_progress``
+#: callbacks — a read throttle so the optional byte-offset reporter (web UI
+#: local-file progress bar) never burdens the hot parse loop.
+PROGRESS_INTERVAL_S = 0.25
+
 
 # ---------------------------------------------------------------------------
 # Parsing (tolerant, streaming)
 # ---------------------------------------------------------------------------
 
-def iter_records(path):
+def iter_records(path, on_progress=None):
     """Yield valid records from a single JSONL file, line by line.
 
     Blank lines, invalid JSON (including a truncated final line), JSON values
     that are not objects, and records whose ``type`` is missing/unknown are
     silently skipped. This function never raises on malformed content.
 
+    ``on_progress`` (optional) is invoked with the current file byte offset
+    (``fh.tell()``) while the file is read, throttled to
+    ``PROGRESS_INTERVAL_S``. The default ``None`` keeps the previous behaviour.
+
     File-open errors (e.g. missing file) still propagate to the caller.
     """
+    last = 0.0
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+        while True:
+            line = fh.readline()
+            if not line:
+                break
+            if on_progress is not None:
+                now = time.monotonic()
+                if now - last >= PROGRESS_INTERVAL_S:
+                    last = now
+                    try:
+                        on_progress(fh.tell())
+                    except Exception:
+                        on_progress = None
             line = line.strip()
             if not line:
                 continue

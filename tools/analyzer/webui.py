@@ -962,10 +962,15 @@ def _iter_spool_records(paths):
 
 
 def coarse_overview(path, files=None, *, from_ts=None, to_ts=None,
-                    window_s=None):
-    """Stream the spool at ``path`` and return the coarse-overview payload."""
-    return _analyze_iter(_iter_pairs(hldsmon.iter_records(path)), files,
-                         from_ts, to_ts, window_s)
+                    window_s=None, on_progress=None):
+    """Stream the spool at ``path`` and return the coarse-overview payload.
+
+    ``on_progress`` (optional) is threaded to :func:`hldsmon.iter_records` as
+    its byte-offset reporter (local-file parse progress).
+    """
+    return _analyze_iter(
+        _iter_pairs(hldsmon.iter_records(path, on_progress=on_progress)),
+        files, from_ts, to_ts, window_s)
 
 
 def coarse_overview_paths(paths, files=None, *, from_ts=None, to_ts=None,
@@ -1537,7 +1542,7 @@ def _emit_progress(done, total):
         pass
 
 
-def _progress_set(job, done, total):
+def _progress_set(job, done, total, phase="download"):
     if not job:
         return
     now = time.time()
@@ -1550,7 +1555,7 @@ def _progress_set(job, done, total):
             _PROGRESS.pop(key, None)
         _PROGRESS[job] = {
             "job": job,
-            "phase": "download",
+            "phase": str(phase),
             "done": int(done),
             "total": int(total) if total else None,
             "pct": pct,
@@ -2049,6 +2054,10 @@ class _Handler(BaseHTTPRequestHandler):
             query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
             job = (query.get("id") or [""])[0]
             self._send_json(200, {"ok": True, "progress": progress_get(job)})
+        elif path == "/api/analyze/progress":
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            job = (query.get("id") or [""])[0]
+            self._send_json(200, {"ok": True, "progress": progress_get(job)})
         else:
             self._not_found()
 
@@ -2091,22 +2100,35 @@ class _Handler(BaseHTTPRequestHandler):
         return hldsmon.parse_records([entry.path])
 
     def _handle_analyze(self, query):
+        job = (self._first(query, "job", None) or "").strip() or None
         try:
             entry = self._read_body()
         except _HttpError as exc:
             self._respond_error(exc)
             return
         files = self._query_files(query)
+        total = entry.size or None
+        if job:
+            _progress_set(job, 0, total, phase="parse")
+
+        def _on_progress(offset):
+            _progress_set(job, offset, total, phase="parse")
+
         try:
             from_ts = _parse_epoch(self._first(query, "from", None))
             to_ts = _parse_epoch(self._first(query, "to", None))
             window_s = _parse_window(self._first(query, "window", None))
-            payload = coarse_overview(entry.path, files, from_ts=from_ts,
-                                      to_ts=to_ts, window_s=window_s)
+            payload = coarse_overview(
+                entry.path, files, from_ts=from_ts, to_ts=to_ts,
+                window_s=window_s, on_progress=_on_progress if job else None)
         except Exception as exc:  # noqa: BLE001 - surface any analyzer error
+            if job:
+                _progress_finish(job, ok=False, error=str(exc))
             _spool_remove(entry.handle)
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
+        if job:
+            _progress_finish(job, ok=True)
         payload["handle"] = entry.handle
         self._send_json(200, payload)
 

@@ -186,6 +186,53 @@ def _session_fixture_bytes():
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+class TestIterRecordsProgress(unittest.TestCase):
+    """``iter_records`` optional byte-offset reporter (local-file progress)."""
+
+    def _write(self, lines):
+        fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="iterprog-")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def test_on_progress_called_with_increasing_offsets(self):
+        lines = [json.dumps({"type": "server", "t": float(i)})
+                 for i in range(40)]
+        path = self._write(lines)
+        saved = hldsmon.PROGRESS_INTERVAL_S
+        hldsmon.PROGRESS_INTERVAL_S = 0  # force a callback per line
+        offsets = []
+        try:
+            records = list(hldsmon.iter_records(path, on_progress=offsets.append))
+        finally:
+            hldsmon.PROGRESS_INTERVAL_S = saved
+        self.assertEqual(len(records), 40)
+        self.assertTrue(offsets, "on_progress was never invoked")
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertGreater(offsets[-1], 0)
+
+    def test_no_callback_reads_unchanged(self):
+        lines = [json.dumps({"type": "server", "t": float(i)})
+                 for i in range(5)]
+        path = self._write(lines)
+        self.assertEqual(len(list(hldsmon.iter_records(path))), 5)
+        self.assertEqual(
+            len(list(hldsmon.iter_records(path, on_progress=None))), 5)
+
+    def test_broken_callback_does_not_abort_parsing(self):
+        lines = [json.dumps({"type": "server", "t": float(i)})
+                 for i in range(5)]
+        path = self._write(lines)
+
+        def _boom(_offset):
+            raise RuntimeError("callback failure")
+
+        self.assertEqual(
+            len(list(hldsmon.iter_records(path, on_progress=_boom))), 5)
+
+
 class TestSessionAggregation(unittest.TestCase):
     def setUp(self):
         self.payload = webui.analyze_bytes(_session_fixture_bytes(),
@@ -441,6 +488,57 @@ class TestHTTP(unittest.TestCase):
     def test_unknown_path_404(self):
         status, headers, body = self._request("GET", "/nope")
         self.assertEqual(status, 404)
+
+    def test_analyze_progress_endpoint_reports_registered(self):
+        webui._progress_set("job-an", 3, 12, phase="parse")
+        status, headers, body = self._request(
+            "GET", "/api/analyze/progress?id=job-an")
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["progress"]["phase"], "parse")
+        self.assertEqual(data["progress"]["done"], 3)
+        self.assertEqual(data["progress"]["total"], 12)
+        self.assertEqual(data["progress"]["pct"], 25.0)
+
+    def test_analyze_progress_endpoint_unknown_id(self):
+        status, _, body = self._request(
+            "GET", "/api/analyze/progress?id=nope")
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        self.assertIsNone(data["progress"])
+
+    def test_post_analyze_with_job_sets_and_finishes_progress(self):
+        job = "job-analyze-1"
+        status, _, body = self._request(
+            "POST", "/api/analyze?files=day1.jsonl&job=" + job,
+            data=fixture_bytes(),
+            headers={"Content-Type": "application/octet-stream"})
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        entry = webui.progress_get(job)
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry["finished"])
+        self.assertEqual(entry["pct"], 100.0)
+        self.assertEqual(entry["phase"], "parse")
+        with urllib.request.urlopen(
+                self.base + "/api/analyze/progress?id=" + job, timeout=10) as resp:
+            polled = json.loads(resp.read().decode("utf-8"))
+        self.assertTrue(polled["ok"])
+        self.assertTrue(polled["progress"]["finished"])
+
+    def test_post_analyze_without_job_leaves_progress_untouched(self):
+        with webui._PROGRESS_LOCK:
+            webui._PROGRESS.clear()
+        status, _, body = self._request(
+            "POST", "/api/analyze?files=day1.jsonl", data=fixture_bytes())
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        with webui._PROGRESS_LOCK:
+            self.assertEqual(len(webui._PROGRESS), 0)
 
 
 def _server_record(t, **overrides):
