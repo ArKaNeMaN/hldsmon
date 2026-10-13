@@ -155,6 +155,17 @@ LOSS_SPIKE_DELTA = 15.0
 #: drop/hitch counts as a traffic burst; any ``conn_fail`` counts as an anomaly.
 MODNET_BURST_KBPS = 50.0
 
+#: Default exclusion-window margins (seconds) shared by :func:`exclusion_windows`
+#: and the streaming aggregator (stage ``large-logs``).
+WARMUP_S = 10.0
+MAP_PRE_S = 5.0
+MAP_POST_S = 15.0
+END_WINDOW_S = 15.0
+
+#: Maximum number of points kept per downsampled series row by the streaming
+#: coarse-overview aggregator (stage ``large-logs``, design §28.3 п.1).
+SERIES_MAX_POINTS = 2000
+
 
 # ---------------------------------------------------------------------------
 # Parsing (tolerant, streaming)
@@ -273,6 +284,29 @@ def _record_ts(rec):
     return _num(rec.get("t"))
 
 
+#: ``server`` series field name -> key inside the ``frame_ms`` sub-object.
+_SERVER_FRAME_KEYS = {"frame_ms_min": "min", "frame_ms_avg": "avg",
+                      "frame_ms_max": "max"}
+
+
+def server_series_value(rec, name):
+    """Extract one ``server`` series value (``real_players`` <- ``real``).
+
+    Missing/non-numeric values yield ``None`` (never a coerced zero).
+    """
+    if name == "t":
+        return _num(rec.get("t"))
+    if name == "real_players":
+        return _num(rec.get("real"))
+    frame_key = _SERVER_FRAME_KEYS.get(name)
+    if frame_key is not None:
+        frame = rec.get("frame_ms")
+        if isinstance(frame, dict):
+            return _num(frame.get(frame_key))
+        return None
+    return _num(rec.get(name))
+
+
 # ---------------------------------------------------------------------------
 # Run segmentation and connection keys
 # ---------------------------------------------------------------------------
@@ -297,6 +331,18 @@ def _attach_runs(records):
         if rec.get("type") in ("shutdown", "crash"):
             run += 1
     return out
+
+
+def _iter_with_runs(records, runs):
+    """Pair ``records`` with run indices.
+
+    ``runs`` is ``None`` to derive them via :func:`_attach_runs` (default), or a
+    same-length iterable of precomputed run indices -- used by windowed analysis
+    where the run boundary precedes the materialized slice.
+    """
+    if runs is None:
+        return _attach_runs(records)
+    return zip(records, runs)
 
 
 def _int_userid(value):
@@ -375,6 +421,14 @@ def _terminal_event(records):
     return None
 
 
+def _log_end_from_terminal(event):
+    """Map a :func:`_terminal_event` result to ``graceful``/``crash``/``unknown``."""
+    if event is None:
+        return "unknown"
+    _, kind = event
+    return "graceful" if kind == "shutdown" else "crash"
+
+
 def log_end_state(records):
     """Return how the log ended: ``"graceful"``, ``"crash"`` or ``"unknown"``.
 
@@ -382,56 +436,35 @@ def log_end_state(records):
     ``shutdown`` terminal is ``"graceful"``, a ``crash`` terminal is ``"crash"``.
     ``"unknown"`` when neither record type is present.
     """
-    event = _terminal_event(records)
-    if event is None:
-        return "unknown"
-    _, kind = event
-    return "graceful" if kind == "shutdown" else "crash"
+    return _log_end_from_terminal(_terminal_event(records))
 
 
-def exclusion_windows(records, map_pre=5.0, map_post=15.0,
-                      end_window=15.0, warmup=10.0):
-    """Return windows during which anomalies should not be reported.
+def _exclusion_windows_from(first_t, mapchanges, terminal, map_pre=MAP_PRE_S,
+                            map_post=MAP_POST_S, end_window=END_WINDOW_S,
+                            warmup=WARMUP_S):
+    """Build exclusion windows from pre-reduced material (streaming-friendly).
 
-    Each window is ``{"kind", "start", "end", "reason"}``. Windows cover:
-    a startup warmup, every map change, and the terminal shutdown/crash. The
-    list is sorted by ``start`` (ties broken deterministically); overlapping
-    windows are returned as-is, never merged.
+    ``mapchanges`` is ``[(t, reason), ...]`` and ``terminal`` is a
+    ``(t, kind)`` pair (or ``None``). Mirrors :func:`exclusion_windows`.
     """
     windows = []
-
-    # Warmup: the first ``warmup`` seconds after the earliest timestamp.
-    times = [t for t in (_record_ts(r) for r in records) if t is not None]
-    if times:
-        first_t = float(min(times))
+    if first_t is not None:
+        first_t = float(first_t)
         windows.append({
             "kind": "warmup",
             "start": first_t,
             "end": first_t + float(warmup),
             "reason": "warmup",
         })
-
-    # Map changes: a small window on either side of the event.
-    for rec in records:
-        if rec.get("type") != "mapchange":
-            continue
-        t = _record_ts(rec)
-        if t is None:
-            continue
-        map_name = rec.get("map")
-        if not isinstance(map_name, str):
-            map_name = "" if map_name is None else str(map_name)
+    for t, map_name in mapchanges:
         windows.append({
             "kind": "mapchange",
             "start": float(t) - float(map_pre),
             "end": float(t) + float(map_post),
             "reason": map_name,
         })
-
-    # Terminal shutdown/crash: the window leading up to it.
-    event = _terminal_event(records)
-    if event is not None and event[0] is not None:
-        t, kind = event
+    if terminal is not None and terminal[0] is not None:
+        t, kind = terminal
         start = float(t) - float(end_window)
         if start < 0.0:
             start = 0.0
@@ -441,9 +474,37 @@ def exclusion_windows(records, map_pre=5.0, map_post=15.0,
             "end": float(t),
             "reason": "graceful" if kind == "shutdown" else "crash",
         })
-
     windows.sort(key=lambda w: (w["start"], w["end"], w["kind"], w["reason"]))
     return windows
+
+
+def exclusion_windows(records, map_pre=MAP_PRE_S, map_post=MAP_POST_S,
+                      end_window=END_WINDOW_S, warmup=WARMUP_S):
+    """Return windows during which anomalies should not be reported.
+
+    Each window is ``{"kind", "start", "end", "reason"}``. Windows cover:
+    a startup warmup, every map change, and the terminal shutdown/crash. The
+    list is sorted by ``start`` (ties broken deterministically); overlapping
+    windows are returned as-is, never merged.
+    """
+    first_t = None
+    mapchanges = []
+    for rec in records:
+        t = _record_ts(rec)
+        if t is not None and (first_t is None or t < first_t):
+            first_t = t
+        if rec.get("type") != "mapchange":
+            continue
+        if t is None:
+            continue
+        map_name = rec.get("map")
+        if not isinstance(map_name, str):
+            map_name = "" if map_name is None else str(map_name)
+        mapchanges.append((t, map_name))
+    return _exclusion_windows_from(
+        first_t, mapchanges, _terminal_event(records),
+        map_pre=map_pre, map_post=map_post, end_window=end_window,
+        warmup=warmup)
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +630,7 @@ _SERIES_KEYS = ("t", "ping", "loss", "choke", "rel_fill", "dloss",
                 "delta_seq", "idle_ms", "flow_in_kbps", "flow_out_kbps")
 
 
-def client_series(records):
+def client_series(records, *, runs=None):
     """Return per-session parallel time series keyed by :func:`session_key`.
 
     Each entry holds
@@ -583,9 +644,12 @@ def client_series(records):
     ``idle_ms`` is the milliseconds since the client's last received packet at
     that sample (0/absent when the plugin did not report it); it lets a
     "Timed out" drop be read as a client that had gone silent beforehand.
+
+    ``runs`` overrides the per-record run index (windowed analysis; default
+    derives it via :func:`_attach_runs`).
     """
     series = {}
-    for rec, run in _attach_runs(records):
+    for rec, run in _iter_with_runs(records, runs):
         if rec.get("type") != "client":
             continue
         skey = session_key(rec, run)
@@ -650,7 +714,45 @@ def _identity_str(value):
     return None
 
 
-def client_identities(records):
+def _identity_add(identities, rec, run):
+    """Fold one ``client`` record into ``identities``; return its entry."""
+    skey = session_key(rec, run)
+    if skey is None:
+        return None
+    entry = identities.get(skey)
+    if entry is None:
+        entry = {name: "" for name in _ID_STR_FIELDS}
+        entry.update({name: None for name in _ID_NUM_FIELDS})
+        entry.update({name: None for name in _ID_BOOL_FIELDS})
+        entry.update({"first_t": None, "last_t": None, "samples": 0,
+                      "session": skey, "run": run, "id": None})
+        identities[skey] = entry
+    entry["samples"] += 1
+    for name in _ID_STR_FIELDS:
+        text = _identity_str(rec.get(name))
+        if text is not None:
+            entry[name] = text
+    for name in _ID_NUM_FIELDS:
+        value = _num(rec.get(name))
+        if value is not None:
+            entry[name] = value
+    cid = _num(rec.get("id"))
+    if cid is not None:
+        entry["id"] = int(cid)
+    for name in _ID_BOOL_FIELDS:
+        value = rec.get(name)
+        if isinstance(value, bool):
+            entry[name] = value
+    t = _record_ts(rec)
+    if t is not None:
+        if entry["first_t"] is None or t < entry["first_t"]:
+            entry["first_t"] = t
+        if entry["last_t"] is None or t > entry["last_t"]:
+            entry["last_t"] = t
+    return entry
+
+
+def client_identities(records, *, runs=None):
     """Return the last known identity per client session.
 
     Keyed by :func:`session_key` (``"<run>:u<userid>"`` or
@@ -659,55 +761,19 @@ def client_identities(records):
     Each entry also carries ``session``, ``run``, ``userid`` (int or ``None``),
     ``id`` (last slot id), ``slot`` (last 1-based slot), ``samples`` counting
     the session's ``client`` records and ``first_t``/``last_t`` bounds.
+
+    ``runs`` overrides the per-record run index (windowed analysis).
     """
     identities = {}
-    for rec, run in _attach_runs(records):
+    for rec, run in _iter_with_runs(records, runs):
         if rec.get("type") != "client":
             continue
-        skey = session_key(rec, run)
-        if skey is None:
-            continue
-        entry = identities.get(skey)
-        if entry is None:
-            entry = {name: "" for name in _ID_STR_FIELDS}
-            entry.update({name: None for name in _ID_NUM_FIELDS})
-            entry.update({name: None for name in _ID_BOOL_FIELDS})
-            entry.update({"first_t": None, "last_t": None, "samples": 0,
-                          "session": skey, "run": run, "id": None})
-            identities[skey] = entry
-        entry["samples"] += 1
-        for name in _ID_STR_FIELDS:
-            text = _identity_str(rec.get(name))
-            if text is not None:
-                entry[name] = text
-        for name in _ID_NUM_FIELDS:
-            value = _num(rec.get(name))
-            if value is not None:
-                entry[name] = value
-        cid = _num(rec.get("id"))
-        if cid is not None:
-            entry["id"] = int(cid)
-        for name in _ID_BOOL_FIELDS:
-            value = rec.get(name)
-            if isinstance(value, bool):
-                entry[name] = value
-        t = _record_ts(rec)
-        if t is not None:
-            if entry["first_t"] is None or t < entry["first_t"]:
-                entry["first_t"] = t
-            if entry["last_t"] is None or t > entry["last_t"]:
-                entry["last_t"] = t
+        _identity_add(identities, rec, run)
     return identities
 
 
-def player_groups(records):
-    """Return ``{player_key: group}`` linking sessions of the same player.
-
-    ``group`` carries ``player`` (the key), the last non-empty
-    ``steamid64``/``authid``/``name``, the ``sessions`` list (sorted by their
-    first timestamp) and the overall ``first_t``/``last_t``.
-    """
-    identities = client_identities(records)
+def player_groups_from_identities(identities):
+    """Build ``{player_key: group}`` from an identities mapping."""
     groups = {}
     for skey, ident in identities.items():
         pkey = player_key(ident)
@@ -745,6 +811,16 @@ def player_groups(records):
             s,
         ))
     return groups
+
+
+def player_groups(records, *, runs=None):
+    """Return ``{player_key: group}`` linking sessions of the same player.
+
+    ``group`` carries ``player`` (the key), the last non-empty
+    ``steamid64``/``authid``/``name``, the ``sessions`` list (sorted by their
+    first timestamp) and the overall ``first_t``/``last_t``.
+    """
+    return player_groups_from_identities(client_identities(records, runs=runs))
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +880,30 @@ def modnet_series(records):
     return series
 
 
+def _modnet_summary_add(acc, rec):
+    """Fold one ``modnet`` record into a :func:`modnet_summary` accumulator."""
+    module = _modnet_text(rec.get("module"))
+    entry = acc.get(module)
+    if entry is None:
+        entry = {name: 0 for name in _MODNET_SUM_FIELDS}
+        entry["peak_in_kbps"] = None
+        entry["peak_out_kbps"] = None
+        acc[module] = entry
+    for name in _MODNET_SUM_FIELDS:
+        value = _num(rec.get(name))
+        if value is not None:
+            entry[name] += value
+    for name, peak_name in (("in_kbps", "peak_in_kbps"),
+                            ("out_kbps", "peak_out_kbps")):
+        value = _num(rec.get(name))
+        if value is None:
+            continue
+        peak = entry[peak_name]
+        if peak is None or value > peak:
+            entry[peak_name] = value
+    return entry
+
+
 def modnet_summary(records):
     """Return ``{module: aggregate}`` over all ``modnet`` records.
 
@@ -817,25 +917,7 @@ def modnet_summary(records):
     for rec in records:
         if rec.get("type") != "modnet":
             continue
-        module = _modnet_text(rec.get("module"))
-        entry = acc.get(module)
-        if entry is None:
-            entry = {name: 0 for name in _MODNET_SUM_FIELDS}
-            entry["peak_in_kbps"] = None
-            entry["peak_out_kbps"] = None
-            acc[module] = entry
-        for name in _MODNET_SUM_FIELDS:
-            value = _num(rec.get(name))
-            if value is not None:
-                entry[name] += value
-        for name, peak_name in (("in_kbps", "peak_in_kbps"),
-                                ("out_kbps", "peak_out_kbps")):
-            value = _num(rec.get(name))
-            if value is None:
-                continue
-            peak = entry[peak_name]
-            if peak is None or value > peak:
-                entry[peak_name] = value
+        _modnet_summary_add(acc, rec)
     return acc
 
 
@@ -900,9 +982,8 @@ def correlate_modnet(records, window_s=5.0):
     return out
 
 
-def _modnet_digest_block(records):
-    """Return the digest ``modnet`` block: totals plus per-module rows."""
-    summary = modnet_summary(records)
+def _modnet_digest_block_from(summary, count):
+    """Build the digest ``modnet`` block from a summary accumulator."""
     total_in = 0
     total_out = 0
     total_fail = 0
@@ -915,12 +996,40 @@ def _modnet_digest_block(records):
                      agg["conn_fail"]])
     rows.sort(key=lambda row: (-(row[1] + row[2]), row[0]))
     return {
-        "records": sum(1 for r in records if r.get("type") == "modnet"),
+        "records": int(count),
         "in_bytes": total_in,
         "out_bytes": total_out,
         "conn_fail": total_fail,
         "modules": rows,
     }
+
+
+def _modnet_digest_block(records):
+    """Return the digest ``modnet`` block: totals plus per-module rows."""
+    return _modnet_digest_block_from(
+        modnet_summary(records),
+        sum(1 for r in records if r.get("type") == "modnet"))
+
+
+def _config_latest(rec):
+    """Return the normalized latest-config snapshot for one config record."""
+    if rec is None:
+        return None
+    latest = {
+        "t": _num(rec.get("t")),
+        "rehlds_major": _num(rec.get("rehlds_major")),
+        "rehlds_minor": _num(rec.get("rehlds_minor")),
+        "map": rec.get("map") if isinstance(rec.get("map"), str) else None,
+        "maxclients": _num(rec.get("maxclients")),
+    }
+    for key in CONFIG_FIELDS:
+        latest[key] = _num(rec.get(key))
+    return latest
+
+
+def _config_digest_block_from(latest_rec, count):
+    """Build the digest ``config`` block from the latest config record."""
+    return {"records": int(count), "latest": _config_latest(latest_rec)}
 
 
 def _config_digest_block(records):
@@ -929,19 +1038,8 @@ def _config_digest_block(records):
     ``null`` values (cvar absent on the server) pass through as ``None``.
     """
     configs = [r for r in records if r.get("type") == "config"]
-    latest = None
-    if configs:
-        rec = configs[-1]
-        latest = {
-            "t": _num(rec.get("t")),
-            "rehlds_major": _num(rec.get("rehlds_major")),
-            "rehlds_minor": _num(rec.get("rehlds_minor")),
-            "map": rec.get("map") if isinstance(rec.get("map"), str) else None,
-            "maxclients": _num(rec.get("maxclients")),
-        }
-        for key in CONFIG_FIELDS:
-            latest[key] = _num(rec.get(key))
-    return {"records": len(configs), "latest": latest}
+    return _config_digest_block_from(configs[-1] if configs else None,
+                                     len(configs))
 
 
 #: Tracked fields compared by :func:`config_diff`: the numeric
@@ -1074,6 +1172,29 @@ def host_series(records):
     return series
 
 
+def _host_latest_block(rec):
+    """Normalize the latest ``host`` record for the digest block."""
+    if rec is None:
+        return None
+    latest = {"t": _num(rec.get("t"))}
+    for key in HOST_FIELDS:
+        latest[key] = _num(rec.get(key))
+    present = _num(rec.get("present_mask"))
+    caveat = _num(rec.get("caveat_mask"))
+    latest["present_mask"] = present
+    latest["caveat_mask"] = caveat
+    latest["caveats"] = [
+        name for name, bit in sorted(HOST_CAVEAT_BITS.items())
+        if caveat is not None and (int(caveat) & bit)
+    ]
+    return latest
+
+
+def _host_digest_block_from(latest_rec, count):
+    """Build the digest ``host`` block from the latest host record."""
+    return {"records": int(count), "latest": _host_latest_block(latest_rec)}
+
+
 def _host_digest_block(records):
     """Return the digest ``host`` block: record count and latest snapshot.
 
@@ -1082,21 +1203,7 @@ def _host_digest_block(records):
     not attributable — design §23).
     """
     hosts = [r for r in records if r.get("type") == "host"]
-    latest = None
-    if hosts:
-        rec = hosts[-1]
-        latest = {"t": _num(rec.get("t"))}
-        for key in HOST_FIELDS:
-            latest[key] = _num(rec.get(key))
-        present = _num(rec.get("present_mask"))
-        caveat = _num(rec.get("caveat_mask"))
-        latest["present_mask"] = present
-        latest["caveat_mask"] = caveat
-        latest["caveats"] = [
-            name for name, bit in sorted(HOST_CAVEAT_BITS.items())
-            if caveat is not None and (int(caveat) & bit)
-        ]
-    return {"records": len(hosts), "latest": latest}
+    return _host_digest_block_from(hosts[-1] if hosts else None, len(hosts))
 
 
 # ---------------------------------------------------------------------------
@@ -1456,7 +1563,7 @@ def _short(value):
 # Focus points (extensible noteworthy-moment detectors)
 # ---------------------------------------------------------------------------
 
-def focus_points(records, idle_min_s=5.0, idle_growth_ms=2000.0):
+def focus_points(records, idle_min_s=5.0, idle_growth_ms=2000.0, *, runs=None):
     """Return noteworthy moments in ``records`` as an extensible list of dicts.
 
     Every entry carries a ``kind`` discriminator, so future detectors can append
@@ -1491,16 +1598,16 @@ def focus_points(records, idle_min_s=5.0, idle_growth_ms=2000.0):
     come from :func:`client_identities`. The result is sorted by ``start_t`` then
     session. Never raises on malformed input.
     """
-    identities = client_identities(records)
-    series = client_series(records)
+    identities = client_identities(records, runs=runs)
+    series = client_series(records, runs=runs)
 
     session_player = {}
-    for pkey, group in player_groups(records).items():
+    for pkey, group in player_groups(records, runs=runs).items():
         for skey in group.get("sessions", ()):
             session_player[skey] = pkey
 
     drop_times = defaultdict(list)
-    for rec, run in _attach_runs(records):
+    for rec, run in _iter_with_runs(records, runs):
         if rec.get("type") != "drop":
             continue
         skey = session_key(rec, run)
@@ -1604,6 +1711,358 @@ def build_digest(records, files=None):
             find_anomalies_detail(records, exclude=True)["excluded"]),
         "focus_point_count": len(focus_points(records)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Streaming coarse-overview aggregator (stage ``large-logs``, design §28.3 п.1)
+# ---------------------------------------------------------------------------
+
+class _Decimator:
+    """Uniform streaming downsampler over parallel per-row field values."""
+
+    __slots__ = ("fields", "max_points", "rows")
+
+    def __init__(self, fields, max_points):
+        self.fields = tuple(fields)
+        self.max_points = int(max_points) if max_points else None
+        self.rows = []
+
+    def add(self, values):
+        self.rows.append(tuple(values.get(name) for name in self.fields))
+        limit = self.max_points
+        if limit and len(self.rows) > 2 * limit:
+            self.rows = self.rows[::2]
+
+    def finish(self):
+        rows = self.rows
+        limit = self.max_points
+        if limit and len(rows) > limit:
+            stride = -(-len(rows) // limit)
+            rows = rows[::stride]
+        cols = {name: [] for name in self.fields}
+        for row in rows:
+            for name, value in zip(self.fields, row):
+                cols[name].append(value)
+        return cols
+
+
+def _clients_from_acc(acc, identities):
+    """Build the ``clients`` list (wire shape) from a per-session accumulator."""
+    clients = []
+    for skey, bucket in acc.items():
+        ident = identities.get(skey, {})
+
+        def _avg(name, _bucket=bucket):
+            count = _bucket[name + "_n"]
+            return (_bucket[name + "_sum"] / count) if count else None
+
+        clients.append({
+            "session": skey,
+            "run": ident.get("run"),
+            "userid": ident.get("userid"),
+            "id": ident.get("id"),
+            "slot": ident.get("slot"),
+            "steamid64": ident.get("steamid64") or "",
+            "authid": ident.get("authid") or "",
+            "name": ident.get("name") or "",
+            "ip": ident.get("ip") or "",
+            "port": ident.get("port"),
+            "conn_s": ident.get("conn_s"),
+            "fake": ident.get("fake"),
+            "proxy": ident.get("proxy"),
+            "first_t": ident.get("first_t"),
+            "last_t": ident.get("last_t"),
+            "samples": bucket["samples"],
+            "ping_avg": _avg("ping"),
+            "ping_max": bucket["ping_max"],
+            "loss_avg": _avg("loss"),
+            "loss_max": bucket["loss_max"],
+            "choke_avg": _avg("choke"),
+            "choke_max": bucket["choke_max"],
+            "rel_fill_max": bucket["rel_fill_max"],
+        })
+    clients.sort(key=lambda c: (
+        c.get("run") if c.get("run") is not None else 0,
+        c.get("slot") if c.get("slot") is not None else float("inf"),
+        c.get("id") if c.get("id") is not None else float("inf"),
+        c.get("session") or "",
+    ))
+    return clients
+
+
+class StreamAggregator:
+    """One-pass streaming aggregator for the coarse ``/api/analyze`` overview.
+
+    Memory is O(window)+O(players)+O(drops)+O(points), never O(records): the
+    full-day series are uniformly downsampled to ``max_points`` rows per row;
+    per-client identities/aggregates and the anomaly detectors keep only
+    per-session/per-client state. Raw records are never retained. ``add`` folds
+    one ``(record, run)``; :meth:`finish` returns neutral aggregates that the web
+    UI maps onto the wire contract (design §28.3 п.1 / INV-L2).
+    """
+
+    def __init__(self, *, server_fields=(), client_fields=_SERIES_KEYS,
+                 host_fields=(("t",) + HOST_FIELDS + ("present_mask",
+                                                      "caveat_mask")),
+                 max_points=SERIES_MAX_POINTS):
+        self._server_fields = tuple(server_fields)
+        self._client_fields = tuple(client_fields)
+        self._host_fields = tuple(host_fields)
+        self._max_points = int(max_points) if max_points else None
+
+        self._counts = Counter()
+        self._t_lo = None
+        self._t_hi = None
+        self._first_t = None
+        self._players = set()
+        self._drop_reasons = Counter()
+        self._drops = []
+        self._drop_times = []
+        self._hitch_times = []
+        self._hitch_lines = 0
+        self._lag_spikes = 0
+        self._identities = {}
+        self._client_acc = {}
+        self._server = _Decimator(self._server_fields, self._max_points)
+        self._client = {}
+        self._host = _Decimator(self._host_fields, self._max_points)
+        self._configs = []
+        self._config_count = 0
+        self._host_count = 0
+        self._host_latest = None
+        self._modnet_count = 0
+        self._modnet = {}
+        self._terminal = None
+        self._last_untimed = None
+        self._order = 0
+        self._mapchanges = []
+        self._fill = {}
+        self._loss = {}
+
+    # -- folding ------------------------------------------------------------
+    def add(self, rec, run):
+        """Fold one record (with its :func:`_attach_runs` index) into the state."""
+        rtype = rec.get("type")
+        self._counts[rtype] += 1
+        t = _record_ts(rec)
+        if t is not None:
+            if self._t_lo is None or t < self._t_lo:
+                self._t_lo = t
+            if self._t_hi is None or t > self._t_hi:
+                self._t_hi = t
+            if self._first_t is None or t < self._first_t:
+                self._first_t = t
+        cid = _num(rec.get("id"))
+        if cid is not None:
+            self._players.add(int(cid))
+
+        if rtype == "server":
+            self._server.add(
+                {name: server_series_value(rec, name)
+                 for name in self._server_fields})
+            hitch = rec.get("hitch")
+            if isinstance(hitch, dict):
+                gt100 = _num(hitch.get("gt100"))
+                if gt100 is not None and gt100 > 0:
+                    self._lag_spikes += 1
+        elif rtype == "client":
+            self._add_client(rec, run)
+        elif rtype == "drop":
+            self._drops.append((rec, run))
+            if t is not None:
+                self._drop_times.append(t)
+            reason = rec.get("reason")
+            self._drop_reasons[
+                str(reason) if reason not in (None, "") else "(unknown)"] += 1
+        elif rtype == "hitch":
+            self._hitch_lines += 1
+            if t is not None:
+                self._hitch_times.append(t)
+        elif rtype == "config":
+            self._configs.append(rec)
+            self._config_count += 1
+        elif rtype == "host":
+            self._host_count += 1
+            self._host_latest = rec
+            self._host.add({name: _num(rec.get(name))
+                            for name in self._host_fields})
+        elif rtype == "modnet":
+            self._modnet_count += 1
+            _modnet_summary_add(self._modnet, rec)
+        elif rtype == "mapchange":
+            if t is not None:
+                map_name = rec.get("map")
+                if not isinstance(map_name, str):
+                    map_name = "" if map_name is None else str(map_name)
+                self._mapchanges.append((t, map_name))
+        elif rtype in ("shutdown", "crash"):
+            self._order += 1
+            if t is None:
+                self._last_untimed = rtype
+            elif (self._terminal is None
+                  or (t, self._order) >= (self._terminal[0], self._terminal[1])):
+                self._terminal = (t, self._order, rtype)
+
+    def _add_client(self, rec, run):
+        skey = session_key(rec, run)
+        if skey is None:
+            return
+        _identity_add(self._identities, rec, run)
+        acc = self._client_acc.get(skey)
+        if acc is None:
+            acc = {"samples": 0,
+                   "ping_sum": 0.0, "ping_n": 0, "ping_max": None,
+                   "loss_sum": 0.0, "loss_n": 0, "loss_max": None,
+                   "choke_sum": 0.0, "choke_n": 0, "choke_max": None,
+                   "rel_fill_max": None}
+            self._client_acc[skey] = acc
+        acc["samples"] += 1
+        for name in ("ping", "loss", "choke"):
+            value = _num(rec.get(name))
+            if value is None:
+                continue
+            acc[name + "_sum"] += value
+            acc[name + "_n"] += 1
+            best = acc[name + "_max"]
+            if best is None or value > best:
+                acc[name + "_max"] = value
+        rf = _num(rec.get("rel_fill"))
+        if rf is not None:
+            best = acc["rel_fill_max"]
+            if best is None or rf > best:
+                acc["rel_fill_max"] = rf
+
+        dec = self._client.get(skey)
+        if dec is None:
+            dec = _Decimator(self._client_fields, self._max_points)
+            self._client[skey] = dec
+        dec.add({name: _num(rec.get(name)) for name in self._client_fields})
+
+        cid = _num(rec.get("id"))
+        if cid is None:
+            return
+        cid = int(cid)
+        t = _record_ts(rec)
+        if rf is not None:
+            state = self._fill.get(cid)
+            if state is None:
+                self._fill[cid] = {"min": rf, "min_t": t, "max": rf, "max_t": t}
+            else:
+                if rf < state["min"]:
+                    state["min"], state["min_t"] = rf, t
+                if rf > state["max"]:
+                    state["max"], state["max_t"] = rf, t
+        loss = _num(rec.get("loss"))
+        if loss is not None:
+            state = self._loss.get(cid)
+            if state is None:
+                self._loss[cid] = {"prev": loss, "prev_t": t, "peak": loss,
+                                   "peak_t": t, "spikes": []}
+            else:
+                prev = state["prev"]
+                if prev is not None and (loss - prev) >= LOSS_SPIKE_DELTA:
+                    state["spikes"].append((prev, state["prev_t"], loss, t))
+                if loss > state["peak"]:
+                    state["peak"], state["peak_t"] = loss, t
+                state["prev"], state["prev_t"] = loss, t
+
+    # -- results ------------------------------------------------------------
+    def terminal_event(self):
+        """Return the latest ``(t, kind)`` shutdown/crash event, or ``None``."""
+        if self._terminal is not None:
+            return (self._terminal[0], self._terminal[2])
+        if self._last_untimed is not None:
+            return (None, self._last_untimed)
+        return None
+
+    def _stream_findings(self):
+        findings = []
+        for start, end, count in _cluster_times(
+                self._drop_times, MASS_DROP_WINDOW_S, MASS_DROP_COUNT):
+            findings.append((
+                "mass drops: %d drops between %s and %s (window %.1fs)"
+                % (count, fmt_ts(start), fmt_ts(end), MASS_DROP_WINDOW_S),
+                [(start, end)]))
+        for start, end, count in _cluster_times(
+                self._hitch_times, HITCH_CLUSTER_WINDOW_S, HITCH_CLUSTER_COUNT):
+            findings.append((
+                "hitch cluster: %d hitches between %s and %s (window %.1fs)"
+                % (count, fmt_ts(start), fmt_ts(end), HITCH_CLUSTER_WINDOW_S),
+                [(start, end)]))
+        for cid in sorted(self._fill):
+            state = self._fill[cid]
+            lo, hi = state["min"], state["max"]
+            if hi >= REL_FILL_HIGH or (hi - lo) >= REL_FILL_GROWTH:
+                findings.append((
+                    "reliable-fill: client %d grew %s -> %s (max %s)"
+                    % (cid, _short(lo), _short(hi), _short(hi)),
+                    [state["min_t"], state["max_t"]]))
+        for cid in sorted(self._loss):
+            state = self._loss[cid]
+            for prev, prev_t, loss, t in state["spikes"]:
+                findings.append((
+                    "loss spike: client %d jumped %s -> %s"
+                    % (cid, _short(prev), _short(loss)), [prev_t, t]))
+            if state["peak"] is not None and state["peak"] >= LOSS_SPIKE_ABS:
+                peak_t = state["peak_t"]
+                findings.append((
+                    "loss spike: client %d peaked at %s"
+                    % (cid, _short(state["peak"])),
+                    [peak_t if peak_t is not None else 0.0]))
+        return findings
+
+    def finish(self):
+        """Return the neutral full-day aggregates (no raw records retained)."""
+        windows = _exclusion_windows_from(
+            self._first_t, self._mapchanges, self.terminal_event())
+        findings = self._stream_findings()
+        anomalies = []
+        excluded = []
+        for text, association in findings:
+            window = _covering_window(association, windows)
+            if window is None:
+                anomalies.append(text)
+            else:
+                excluded.append("%s: %s" % (window["kind"], text))
+
+        start, end = self._t_lo, self._t_hi
+        period_block = {
+            "start": start,
+            "end": end,
+            "duration_s": (end - start)
+            if (start is not None and end is not None) else None,
+        }
+        return {
+            "records": sum(self._counts.values()),
+            "counts_by_type": dict(self._counts),
+            "period": period_block,
+            "players": sorted(self._players),
+            "top_drop_reasons": [[k, v] for k, v in
+                                 _sorted_counts(self._drop_reasons)],
+            "hitch_lines": self._hitch_lines,
+            "lag_spikes": self._lag_spikes,
+            "drops_raw": self._drops,
+            "identities": self._identities,
+            "player_groups": player_groups_from_identities(self._identities),
+            "session_count": len(self._identities),
+            "clients": _clients_from_acc(self._client_acc, self._identities),
+            "series": self._server.finish(),
+            "client_series": {skey: dec.finish()
+                              for skey, dec in self._client.items()},
+            "host_series": self._host.finish(),
+            "config_series": config_series(self._configs),
+            "config_block": _config_digest_block_from(
+                self._configs[-1] if self._configs else None,
+                self._config_count),
+            "host_block": _host_digest_block_from(self._host_latest,
+                                                  self._host_count),
+            "modnet_block": _modnet_digest_block_from(self._modnet,
+                                                      self._modnet_count),
+            "log_end": _log_end_from_terminal(self.terminal_event()),
+            "exclusions": windows,
+            "anomalies": anomalies,
+            "anomalies_excluded": excluded,
+        }
 
 
 # ---------------------------------------------------------------------------

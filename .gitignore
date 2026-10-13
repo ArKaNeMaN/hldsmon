@@ -23,3 +23,6 @@ addons/metamod/hldsmon/logs/
 *.jsonl
 # ...but keep the analyzer's test fixtures
 !tools/analyzer/tests/fixtures/*.jsonl
+
+# web-UI disk spool (runtime; tmpfs fallback for the default --spool-dir)
+.hldsmon-spool/

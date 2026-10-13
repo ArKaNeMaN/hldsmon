@@ -28,11 +28,14 @@ Importable test surface (no socket required)::
 from __future__ import annotations
 
 import argparse
+import collections
+import csv
 import ftplib
 import io
 import json
 import os
 import secrets
+import shutil
 import ssl
 import sys
 import tempfile
@@ -49,11 +52,48 @@ import hldsmon
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Hard cap on the request body size (256 MiB).
-MAX_BODY_BYTES = 256 * 1024 * 1024
+#: Optional read valve in bytes (0 = unlimited). Off by default; overridable
+#: via ``--max-log-mb`` / ``HLDSMON_WEBUI_MAX_MB``. This is the *only* size
+#: guard, shared by the local request path and the FTP download path
+#: (stage ``large-logs``; growth is bounded by streaming, not a cap).
+_MAX_LOG_BYTES = 0
 
-#: Hard cap on a single FTP download (256 MiB), matching ``MAX_BODY_BYTES``.
-MAX_FTP_BYTES = 256 * 1024 * 1024
+#: Maximum number of concurrent body uploads/sessions; the excess gets HTTP
+#: 429 ``busy`` (a resource guard, not a log cap). Overridable via
+#: ``--max-uploads`` / ``HLDSMON_WEBUI_MAX_UPLOADS``.
+MAX_UPLOADS = 4
+
+#: Socket read timeout (seconds) for request bodies and FTP reads. A body that
+#: does not finish within it yields HTTP 408 ``request_timeout``. Overridable
+#: via ``--read-timeout`` / ``HLDSMON_WEBUI_READ_TIMEOUT``.
+READ_TIMEOUT_S = 30.0
+
+#: Per-session disk-spool budget (MiB) - a resource guard, *not* a log size cap.
+#: Exhaustion yields ``spool_full``. Overridable via ``--spool-session-mb``.
+SPOOL_SESSION_MB = 2048
+
+#: Process-wide disk-spool budget (MiB) - a resource guard, *not* a log cap.
+#: Overridable via ``--spool-total-mb``.
+SPOOL_TOTAL_MB = 8192
+
+#: Spool handle/segment time-to-live (seconds) for the age sweeper (plus a
+#: startup cleanup of orphans). Overridable via ``--spool-ttl-sec``.
+SPOOL_TTL_S = 3600
+
+#: Streaming chunk size (bytes) used while spooling a request body. Ingest
+#: memory is O(SPOOL_CHUNK), independent of the body size.
+SPOOL_CHUNK = 64 * 1024
+
+_MIB = 1024 * 1024
+
+#: UTF-8 byte-order mark, stripped exactly once at ingest (offset 0). Never
+#: handled in ``hldsmon.iter_records`` - its global CLI/library behaviour is
+#: left untouched.
+_BOM = b"\xef\xbb\xbf"
+
+#: Filesystem types treated as RAM-backed (rejected for the *default* spool
+#: directory; an explicit ``--spool-dir`` is always honoured).
+_TMPFS_FSTYPES = frozenset(("tmpfs", "ramfs", "devtmpfs", "hugetlbfs"))
 
 #: Initial / per-step time window (seconds) loaded from the tail of the FTP log.
 FTP_WINDOW_S = 1800.0
@@ -61,8 +101,22 @@ FTP_WINDOW_S = 1800.0
 #: Bytes fetched per backward (older) range read.
 FTP_BACK_CHUNK = 8 * 1024 * 1024
 
+#: Selectable FTP window sizes in seconds (REQ-L6/H3): 5m / 15m / 30m / 1h /
+#: 6h / 24h. ``FTP_WINDOW_S`` (30m) is the default offered by the UI; the
+#: window is a UX/performance knob, never a size cap (design §28.3 п.10).
+FTP_WINDOW_PRESETS = (300.0, 900.0, 1800.0, 3600.0, 21600.0, 86400.0)
+
 #: Default socket timeout (seconds) for FTP connections.
 DEFAULT_FTP_TIMEOUT = 30.0
+
+#: Default analysis window (seconds) applied by ``/api/analyze`` when no
+#: ``from``/``to`` is supplied: the last ``ANALYZE_DEFAULT_WINDOW_S`` seconds
+#: ending at the newest record. Separate entity from ``FTP_WINDOW_S`` even
+#: though the value coincides (plan LL-P2 window contract).
+ANALYZE_DEFAULT_WINDOW_S = 1800.0
+
+#: Maximum points per downsampled coarse series row (mirrors ``hldsmon``).
+SERIES_MAX_POINTS = hldsmon.SERIES_MAX_POINTS
 
 #: In-memory FTP tail sessions. Credentials live here only, are never returned
 #: to a client, never logged, and never written to disk. Guarded by ``_FTP_LOCK``.
@@ -76,6 +130,435 @@ _PROGRESS = {}
 _PROGRESS_LOCK = threading.Lock()
 _PROGRESS_TTL_S = 300.0
 _thread_progress = threading.local()
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration (flag/env overridable; see ``build_parser``/``main``)
+# ---------------------------------------------------------------------------
+
+class _Config:
+    """Process-wide runtime knobs resolved from flags/env at startup."""
+
+    def __init__(self):
+        self.max_log_bytes = _MAX_LOG_BYTES
+        self.spool_dir = None
+        self.allow_nonloopback_unlimited = False
+        self.max_uploads = MAX_UPLOADS
+        self.read_timeout = READ_TIMEOUT_S
+        self.spool_session_bytes = SPOOL_SESSION_MB * _MIB
+        self.spool_total_bytes = SPOOL_TOTAL_MB * _MIB
+        self.spool_ttl = SPOOL_TTL_S
+
+
+_CONFIG = _Config()
+
+
+class _HttpError(Exception):
+    """An HTTP-level failure carrying a JSON payload and status code."""
+
+    def __init__(self, status, payload, close=False):
+        super().__init__(payload.get("code") or payload.get("error") or status)
+        self.status = status
+        self.payload = payload
+        self.close = close
+
+
+class _IngestError(Exception):
+    """Base class for body-ingest failures mapped to an HTTP response."""
+
+    status = 400
+    code = "ingest_error"
+    close = False
+
+    def payload(self):
+        return {"ok": False, "code": self.code}
+
+
+class _RequestTimeout(_IngestError):
+    status = 408
+    code = "request_timeout"
+    close = True
+
+
+class _LogTooLarge(_IngestError):
+    status = 413
+    code = "log_too_large"
+
+    def __init__(self, limit_bytes):
+        super().__init__()
+        self.limit_bytes = int(limit_bytes)
+
+    def payload(self):
+        return {"ok": False, "code": self.code, "limit_bytes": self.limit_bytes}
+
+
+class _SpoolFull(_IngestError):
+    status = 507
+    code = "spool_full"
+
+
+# ---------------------------------------------------------------------------
+# Disk-spool: backing-directory choice, budget, handle registry
+# ---------------------------------------------------------------------------
+
+class _SpoolBudget:
+    """Thread-safe process-wide byte budget shared by all spool files."""
+
+    def __init__(self, total):
+        self._total = int(total)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def used(self):
+        with self._lock:
+            return self._used
+
+    def reserve(self, n):
+        n = int(n)
+        if n <= 0:
+            return True
+        with self._lock:
+            if self._total > 0 and self._used + n > self._total:
+                return False
+            self._used += n
+            return True
+
+    def release(self, n):
+        n = int(n)
+        if n <= 0:
+            return
+        with self._lock:
+            self._used = max(0, self._used - n)
+
+
+class SpoolHandle:
+    """A server-owned spool file and its lifecycle metadata."""
+
+    __slots__ = ("handle", "path", "created", "size")
+
+    def __init__(self, handle, path, created):
+        self.handle = handle
+        self.path = path
+        self.created = created
+        self.size = 0
+
+
+_SPOOL_BUDGET = _SpoolBudget(_CONFIG.spool_total_bytes)
+_SPOOL_LOCK = threading.Lock()
+_SPOOLS = {}
+
+_SPOOL_PREFIX = "hldsmon-spool-"
+_SPOOL_SUFFIX = ".jsonl"
+
+_UPLOAD_SEM = threading.BoundedSemaphore(max(1, int(_CONFIG.max_uploads)))
+
+
+def _read_proc_mounts():
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def spool_backing_kind(mounts_text, path):
+    """Classify the filesystem backing ``path`` from ``/proc/mounts`` text.
+
+    Returns ``"tmpfs"`` for RAM-backed mounts, ``"disk"`` for any other real
+    filesystem, or ``"unknown"`` when no mount entry matches. The longest
+    matching mount point wins. Pure and host-testable.
+    """
+    if not path:
+        return "unknown"
+    target = os.path.abspath(path)
+    best_len = -1
+    best_fstype = None
+    for line in (mounts_text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mountpoint = parts[1].replace("\\040", " ")
+        fstype = parts[2]
+        mp = mountpoint.rstrip("/") or "/"
+        if mp == "/" or target == mp or target.startswith(mp + "/"):
+            if len(mp) > best_len:
+                best_len = len(mp)
+                best_fstype = fstype
+    if best_fstype is None:
+        return "unknown"
+    return "tmpfs" if best_fstype in _TMPFS_FSTYPES else "disk"
+
+
+def choose_spool_dir(configured=None, mounts_text=None):
+    """Pick the disk-backed spool directory.
+
+    An explicit ``configured`` directory is always honoured. Otherwise the
+    default ``<tempdir>/hldsmon-spool`` is used, falling back to
+    ``<cwd>/.hldsmon-spool`` when the default resolves to a RAM-backed mount.
+    """
+    if configured:
+        return configured
+    default = os.path.join(tempfile.gettempdir(), "hldsmon-spool")
+    if mounts_text is None:
+        mounts_text = _read_proc_mounts()
+    if spool_backing_kind(mounts_text, default) == "tmpfs":
+        return os.path.join(os.getcwd(), ".hldsmon-spool")
+    return default
+
+
+def spool_free_bytes(path):
+    """Return free bytes on the filesystem holding ``path``, or ``None``.
+
+    Cross-platform: ``shutil.disk_usage`` (Windows and POSIX) first, then
+    ``os.statvfs`` where the platform provides it. Returns ``None`` when
+    neither is usable, so the caller skips the free-space pre-check instead of
+    crashing (``os.statvfs`` does not exist on Windows).
+    """
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        pass
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is not None:
+        try:
+            st = statvfs(path)
+            return st.f_bavail * st.f_frsize
+        except OSError:
+            return None
+    return None
+
+
+def _spool_dir():
+    base = choose_spool_dir(_CONFIG.spool_dir)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _spool_create():
+    handle = secrets.token_urlsafe(24)
+    path = os.path.join(_spool_dir(), _SPOOL_PREFIX + handle + _SPOOL_SUFFIX)
+    entry = SpoolHandle(handle, path, time.time())
+    with _SPOOL_LOCK:
+        _SPOOLS[handle] = entry
+    return entry
+
+
+def _spool_commit(entry, size):
+    with _SPOOL_LOCK:
+        entry.size = int(size)
+
+
+def _spool_remove(handle):
+    with _SPOOL_LOCK:
+        entry = _SPOOLS.pop(handle, None)
+    if entry is not None:
+        _SPOOL_BUDGET.release(entry.size)
+        _silent_remove(entry.path)
+    return entry
+
+
+def _spool_write(entry, data, append=False):
+    """Write ``data`` to a spool entry, reserving the process budget for it.
+
+    ``append`` extends the file (a refresh appending only new remote bytes).
+    Raises ``_SpoolFull`` when the process budget is exhausted. Memory is
+    O(data), never the whole spool.
+    """
+    n = len(data)
+    if n and not _SPOOL_BUDGET.reserve(n):
+        raise _SpoolFull()
+    try:
+        with open(entry.path, "ab" if append else "wb") as fh:
+            fh.write(data)
+    except OSError:
+        _SPOOL_BUDGET.release(n)
+        raise
+    _spool_commit(entry, entry.size + n)
+
+
+def spool_get(handle):
+    """Return a live handle, or ``None`` when unknown/expired (and reap it)."""
+    now = time.time()
+    entry = None
+    with _SPOOL_LOCK:
+        entry = _SPOOLS.get(handle)
+        if entry is not None and _CONFIG.spool_ttl \
+                and now - entry.created > _CONFIG.spool_ttl:
+            _SPOOLS.pop(handle, None)
+        else:
+            return entry
+    _SPOOL_BUDGET.release(entry.size)
+    _silent_remove(entry.path)
+    return None
+
+
+def spool_sweep(now=None):
+    """Reap handles older than the TTL; return the number removed."""
+    now = time.time() if now is None else float(now)
+    ttl = _CONFIG.spool_ttl
+    expired = []
+    with _SPOOL_LOCK:
+        for handle, entry in list(_SPOOLS.items()):
+            if ttl and now - entry.created > ttl:
+                expired.append(_SPOOLS.pop(handle))
+    for entry in expired:
+        _SPOOL_BUDGET.release(entry.size)
+        _silent_remove(entry.path)
+    return len(expired)
+
+
+def spool_startup_cleanup(spool_dir=None):
+    """Remove orphaned spool files from a previous (possibly crashed) run."""
+    directory = spool_dir or _spool_dir()
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith(_SPOOL_PREFIX) and name.endswith(_SPOOL_SUFFIX):
+            if _silent_remove(os.path.join(directory, name)):
+                removed += 1
+    with _SPOOL_LOCK:
+        _SPOOLS.clear()
+    return removed
+
+
+def _reset_upload_semaphore():
+    global _UPLOAD_SEM
+    _UPLOAD_SEM = threading.BoundedSemaphore(max(1, int(_CONFIG.max_uploads)))
+
+
+def _reset_spool_budget():
+    global _SPOOL_BUDGET
+    _SPOOL_BUDGET = _SpoolBudget(_CONFIG.spool_total_bytes)
+
+
+def _is_loopback(host):
+    """Return ``True`` when ``host`` denotes a loopback bind address."""
+    if host is None or not isinstance(host, str):
+        return True
+    h = host.strip().lower()
+    if h in ("", "localhost", "::1", "::ffff:127.0.0.1"):
+        return True
+    if h.startswith("127."):
+        return True
+    return False
+
+
+def _parse_content_length(raw):
+    """Return a positive declared length, or ``None`` when absent/malformed.
+
+    Per the deterministic ingest contract, a value that is not an integer
+    greater than zero is treated as "no usable length" (read to EOF).
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _strip_bom(data):
+    """Drop a single leading UTF-8 BOM from a byte string."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if data.startswith(_BOM):
+        return data[len(_BOM):]
+    return data
+
+
+def receive_body(rfile, dest_path, length, *, valve=0, session_limit=0,
+                 budget=None, chunk=SPOOL_CHUNK):
+    """Stream a request body from ``rfile`` into ``dest_path``.
+
+    ``length`` is the declared ``Content-Length`` (int > 0) or ``None`` to read
+    until EOF. A leading UTF-8 BOM is stripped once. Memory is O(chunk), never
+    O(body). Raises ``_LogTooLarge`` (valve), ``_SpoolFull`` (budget) or
+    ``_RequestTimeout`` (short/absent body, socket timeout).
+    """
+    written = 0
+    pending = b""
+    bom_checked = False
+
+    def _emit(data):
+        nonlocal written
+        if not data:
+            return
+        if valve and written + len(data) > valve:
+            raise _LogTooLarge(valve)
+        if session_limit and written + len(data) > session_limit:
+            raise _SpoolFull()
+        if budget is not None and not budget.reserve(len(data)):
+            raise _SpoolFull()
+        fh.write(data)
+        written += len(data)
+
+    def _feed(data):
+        nonlocal pending, bom_checked
+        if bom_checked:
+            _emit(data)
+            return
+        pending += data
+        if len(pending) < len(_BOM):
+            return
+        payload = pending[len(_BOM):] if pending.startswith(_BOM) else pending
+        pending = b""
+        bom_checked = True
+        _emit(payload)
+
+    fh = open(dest_path, "wb")
+    over = False
+    try:
+        try:
+            if length is None:
+                while True:
+                    try:
+                        block = rfile.read(chunk)
+                    except TimeoutError as exc:
+                        raise _RequestTimeout() from exc
+                    if not block:
+                        break
+                    if not over and valve and written + len(block) > valve:
+                        over = True
+                    if over:
+                        continue
+                    _feed(block)
+            else:
+                remaining = length
+                while remaining > 0:
+                    try:
+                        block = rfile.read(min(chunk, remaining))
+                    except TimeoutError as exc:
+                        raise _RequestTimeout() from exc
+                    if not block:
+                        if over:
+                            break
+                        raise _RequestTimeout()
+                    remaining -= len(block)
+                    if not over and valve and written + len(block) > valve:
+                        over = True
+                    if over:
+                        continue
+                    _feed(block)
+            if over:
+                raise _LogTooLarge(valve)
+            if pending:
+                _emit(pending)
+            return written
+        except BaseException:
+            if budget is not None:
+                budget.release(written)
+            raise
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 #: Path of the (separately authored) dashboard page, resolved from this file.
 def _resource_dir():
@@ -159,17 +642,18 @@ fetch("/api/health").then(function (r) { return r.json(); })
 def _silent_remove(path):
     try:
         os.remove(path)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _records_from_bytes(data):
     """Parse raw JSONL ``data`` via ``hldsmon`` using a temporary file.
 
-    The temporary file is always removed, even if parsing raises.
+    A leading UTF-8 BOM is stripped first (ingest-time contract). The temporary
+    file is always removed, even if parsing raises.
     """
-    if isinstance(data, str):
-        data = data.encode("utf-8")
+    data = _strip_bom(data)
     tmp = tempfile.NamedTemporaryFile(
         mode="wb", suffix=".jsonl", prefix="hldsmon-webui-", delete=False)
     path = tmp.name
@@ -179,13 +663,6 @@ def _records_from_bytes(data):
         return hldsmon.parse_records([path])
     finally:
         _silent_remove(path)
-
-
-def _frame_value(rec, key):
-    frame = rec.get("frame_ms")
-    if isinstance(frame, dict):
-        return hldsmon._num(frame.get(key))
-    return None
 
 
 def build_series(records):
@@ -198,18 +675,8 @@ def build_series(records):
     for rec in records:
         if rec.get("type") != "server":
             continue
-        series["t"].append(hldsmon._num(rec.get("t")))
-        series["frame_ms_min"].append(_frame_value(rec, "min"))
-        series["frame_ms_avg"].append(_frame_value(rec, "avg"))
-        series["frame_ms_max"].append(_frame_value(rec, "max"))
-        series["cpu_pct"].append(hldsmon._num(rec.get("cpu_pct")))
-        series["rss_kb"].append(hldsmon._num(rec.get("rss_kb")))
-        series["players"].append(hldsmon._num(rec.get("players")))
-        series["real_players"].append(hldsmon._num(rec.get("real")))
-        series["edicts"].append(hldsmon._num(rec.get("edicts")))
-        series["fps"].append(hldsmon._num(rec.get("fps")))
-        series["in_kbps"].append(hldsmon._num(rec.get("in_kbps")))
-        series["out_kbps"].append(hldsmon._num(rec.get("out_kbps")))
+        for name in _SERIES_FIELDS:
+            series[name].append(hldsmon.server_series_value(rec, name))
     return series
 
 
@@ -256,13 +723,41 @@ def _identity_fields(ident):
     return fields
 
 
+def _drop_entry(rec, run, identities):
+    """Build one wire drop entry, enriched with its session identity."""
+    t = hldsmon._num(rec.get("t"))
+    cid = hldsmon._num(rec.get("id"))
+    skey = hldsmon.session_key(rec, run)
+    ident = identities.get(skey) if skey is not None else None
+    entry = {
+        "t": t,
+        "iso": hldsmon.fmt_ts(t),
+        "id": cid,
+        "session": skey,
+        "reason": _as_str(rec.get("reason")),
+        "category": _as_str(rec.get("category")),
+        "crash": rec.get("crash"),
+        "observed_via": _as_str(rec.get("observed_via")),
+        "gen": hldsmon._num(rec.get("gen")),
+        "key": {
+            "run": int(run),
+            "t": t,
+            "userid": hldsmon._int_userid(rec.get("userid")),
+        },
+    }
+    entry.update(_identity_fields(ident))
+    return entry
+
+
 def build_drops(records, identities=None):
     """Extract ``drop`` records (file order) into the wire shape.
 
     Each entry carries its ``session`` key (so the UI can navigate to the right
     client) and is enriched with the matching session's identity fields (when a
     ``client_identities`` lookup is supplied or derivable); absent fields are
-    ``""`` (text) / ``None`` (numeric, boolean).
+    ``""`` (text) / ``None`` (numeric, boolean). Every entry also carries the
+    stable ``key`` ``{run, t, userid}`` used to address a drop for
+    ``/api/bundle``.
     """
     if identities is None:
         identities = hldsmon.client_identities(records)
@@ -270,53 +765,168 @@ def build_drops(records, identities=None):
     for rec, run in hldsmon._attach_runs(records):
         if rec.get("type") != "drop":
             continue
-        t = hldsmon._num(rec.get("t"))
-        cid = hldsmon._num(rec.get("id"))
-        skey = hldsmon.session_key(rec, run)
-        ident = identities.get(skey) if skey is not None else None
-        entry = {
-            "t": t,
-            "iso": hldsmon.fmt_ts(t),
-            "id": cid,
-            "session": skey,
-            "reason": _as_str(rec.get("reason")),
-            "category": _as_str(rec.get("category")),
-            "crash": rec.get("crash"),
-            "observed_via": _as_str(rec.get("observed_via")),
-            "gen": hldsmon._num(rec.get("gen")),
-        }
-        entry.update(_identity_fields(ident))
-        drops.append(entry)
+        drops.append(_drop_entry(rec, run, identities))
     return drops
 
 
-def analyze_records(records, files=None):
-    """Return the ``/api/analyze`` JSON payload for parsed ``records``."""
-    files_list = list(files) if files else []
-    identities = hldsmon.client_identities(records)
+def _iter_pairs(records):
+    """Yield ``(record, run_index)`` streaming, mirroring ``_attach_runs``."""
+    run = 0
+    for rec in records:
+        yield rec, run
+        if rec.get("type") in ("shutdown", "crash"):
+            run += 1
+
+
+def _parse_epoch(value):
+    """Return ``value`` as a float epoch second, or ``None`` when absent."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid epoch: %r" % (value,)) from exc
+
+
+def _parse_window(value):
+    """Return ``value`` as a positive window (seconds), or ``None``."""
+    if value in (None, ""):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid window: %r" % (value,)) from exc
+    if seconds <= 0:
+        raise ValueError("window must be positive")
+    return seconds
+
+
+def _payload_from_agg(result, files, focus, series, client_series,
+                      host_series, lo, hi, coarse, window_count):
+    """Assemble the ``/api/analyze`` coarse-overview contract payload."""
+    counts = result["counts_by_type"]
+    digest = {
+        "files": files,
+        "records": result["records"],
+        "counts_by_type": {k: counts.get(k, 0) for k in hldsmon.KNOWN_TYPES},
+        "period": result["period"],
+        "players": result["players"],
+        "sessions": result["session_count"],
+        "drop_count": counts.get("drop", 0),
+        "top_drop_reasons": result["top_drop_reasons"],
+        "hitch_lines": counts.get("hitch", 0),
+        "lag_spikes": result["lag_spikes"],
+        "modnet": result["modnet_block"],
+        "config": result["config_block"],
+        "host": result["host_block"],
+        "log_end": result["log_end"],
+        "exclusions": result["exclusions"],
+        "anomalies_excluded": len(result["anomalies_excluded"]),
+        "focus_point_count": len(focus),
+    }
+    identities = result["identities"]
+    drops = [_drop_entry(rec, run, identities)
+             for rec, run in result["drops_raw"]]
     return {
         "ok": True,
         "version": PROTOCOL_VERSION,
-        "files": files_list,
-        "digest": hldsmon.build_digest(records, files_list),
-        "series": build_series(records),
-        "clients": build_clients(records),
-        "sessions": hldsmon.player_groups(records),
-        "session_count": len(identities),
-        "drops": build_drops(records, identities),
-        "anomalies": hldsmon.find_anomalies(records),
-        "records_count": len(records),
-        "client_series": hldsmon.client_series(records),
+        "files": files,
+        "digest": digest,
+        "series": series,
+        "clients": result["clients"],
+        "sessions": result["player_groups"],
+        "session_count": result["session_count"],
+        "drops": drops,
+        "anomalies": result["anomalies"],
+        "records_count": result["records"],
+        "client_series": client_series,
         "client_identities": identities,
-        "events": hldsmon.exclusion_windows(records),
-        "log_end": hldsmon.log_end_state(records),
-        "anomalies_excluded": hldsmon.find_anomalies_detail(
-            records, exclude=True)["excluded"],
-        "focus_points": hldsmon.focus_points(records),
-        "host_series": hldsmon.host_series(records),
+        "events": result["exclusions"],
+        "log_end": result["log_end"],
+        "anomalies_excluded": result["anomalies_excluded"],
+        "focus_points": focus,
+        "host_series": host_series,
         "host_caveats": HOST_CAVEATS,
-        "config": hldsmon.config_series(records),
+        "config": result["config_series"],
+        "window": {"from": lo, "to": hi},
+        "coarse": coarse,
+        "window_count": window_count,
     }
+
+
+def _analyze_iter(pairs, files, from_ts, to_ts, window_s):
+    """One-pass streaming analysis of ``(record, run)`` pairs.
+
+    The whole spool is folded through a :class:`hldsmon.StreamAggregator` while
+    only the requested window (``[from, to]`` inclusive, or the default
+    ``ANALYZE_DEFAULT_WINDOW_S`` ending at the newest record) is materialized
+    for full-resolution series/``focus_points``. Raw records are never all
+    retained.
+    """
+    files_list = list(files) if files else []
+    size = window_s if (window_s and window_s > 0) else ANALYZE_DEFAULT_WINDOW_S
+    coarse = from_ts is None and to_ts is None
+    if not coarse and from_ts is None:
+        from_ts = float(to_ts) - size
+    if not coarse and to_ts is None:
+        to_ts = float(from_ts) + size
+
+    agg = hldsmon.StreamAggregator(
+        server_fields=_SERIES_FIELDS,
+        client_fields=hldsmon._SERIES_KEYS,
+        host_fields=("t",) + hldsmon.HOST_FIELDS + ("present_mask",
+                                                    "caveat_mask"),
+        max_points=SERIES_MAX_POINTS)
+
+    window_pairs = []
+    if coarse:
+        rolling = collections.deque()
+        t_hi = None
+        for rec, run in pairs:
+            agg.add(rec, run)
+            t = hldsmon._record_ts(rec)
+            if t is None:
+                continue
+            if t_hi is None or t > t_hi:
+                t_hi = t
+            cutoff = t_hi - size
+            while rolling and rolling[0][0] < cutoff:
+                rolling.popleft()
+            if t >= cutoff:
+                rolling.append((t, rec, run))
+        window_pairs = [(rec, run) for _, rec, run in rolling]
+        result = agg.finish()
+        end = result["period"]["end"]
+        lo = end - size if end is not None else None
+        hi = end
+    else:
+        lo, hi = float(from_ts), float(to_ts)
+        for rec, run in pairs:
+            agg.add(rec, run)
+            t = hldsmon._record_ts(rec)
+            if t is not None and lo <= t <= hi:
+                window_pairs.append((rec, run))
+        result = agg.finish()
+
+    window_records = [rec for rec, _ in window_pairs]
+    window_runs = [run for _, run in window_pairs]
+    focus = hldsmon.focus_points(window_records, runs=window_runs)
+    if coarse:
+        series = result["series"]
+        client_series = result["client_series"]
+        host_series = result["host_series"]
+    else:
+        series = build_series(window_records)
+        client_series = hldsmon.client_series(window_records, runs=window_runs)
+        host_series = hldsmon.host_series(window_records)
+    return _payload_from_agg(result, files_list, focus, series, client_series,
+                             host_series, lo, hi, coarse, len(window_pairs))
+
+
+def analyze_records(records, files=None, *, from_ts=None, to_ts=None,
+                    window_s=None):
+    """Return the ``/api/analyze`` payload for parsed ``records``."""
+    return _analyze_iter(_iter_pairs(records), files, from_ts, to_ts, window_s)
 
 
 def analyze_bytes(data, files=None):
@@ -325,21 +935,82 @@ def analyze_bytes(data, files=None):
     return analyze_records(records, files)
 
 
-def export_bytes(data, rtype=None):
-    """Return CSV text for raw JSONL ``data`` (optionally one record type).
+def _iter_spool_pairs(paths):
+    """Yield ``(record, run)`` across ordered spool ``paths``, runs continuous.
+
+    The run index keeps counting across segment boundaries (a ``shutdown`` or
+    ``crash`` in one segment advances the run for the next), so a windowed
+    analysis of a segmented spool matches a single-file reference.
+    """
+    if isinstance(paths, (str, bytes)):
+        paths = [paths]
+    run = 0
+    for path in paths:
+        for rec in hldsmon.iter_records(path):
+            yield rec, run
+            if rec.get("type") in ("shutdown", "crash"):
+                run += 1
+
+
+def _iter_spool_records(paths):
+    """Yield records in order across an ordered list of spool ``paths``."""
+    if isinstance(paths, (str, bytes)):
+        paths = [paths]
+    for path in paths:
+        for rec in hldsmon.iter_records(path):
+            yield rec
+
+
+def coarse_overview(path, files=None, *, from_ts=None, to_ts=None,
+                    window_s=None):
+    """Stream the spool at ``path`` and return the coarse-overview payload."""
+    return _analyze_iter(_iter_pairs(hldsmon.iter_records(path)), files,
+                         from_ts, to_ts, window_s)
+
+
+def coarse_overview_paths(paths, files=None, *, from_ts=None, to_ts=None,
+                          window_s=None):
+    """Coarse-overview payload across an ordered list of spool segments."""
+    return _analyze_iter(_iter_spool_pairs(paths), files,
+                         from_ts, to_ts, window_s)
+
+
+def window_records(path, from_ts, to_ts):
+    """Materialize ``[(record, run), ...]`` within ``[from, to]`` inclusive."""
+    lo = hldsmon._num(from_ts)
+    hi = hldsmon._num(to_ts)
+    out = []
+    for rec, run in _iter_pairs(hldsmon.iter_records(path)):
+        t = hldsmon._record_ts(rec)
+        if t is None:
+            continue
+        if lo is not None and t < lo:
+            continue
+        if hi is not None and t > hi:
+            continue
+        out.append((rec, run))
+    return out
+
+
+def export_records(records, rtype=None):
+    """Return CSV text for parsed ``records`` (optionally one record type).
 
     Raises ``ValueError`` for an unknown ``rtype``.
     """
     if rtype is not None and rtype not in hldsmon.KNOWN_TYPES:
         raise ValueError("unknown type: %r" % (rtype,))
-    records = _records_from_bytes(data)
     buf = io.StringIO()
     hldsmon.export_csv(records, rtype=rtype, stream=buf)
     return buf.getvalue()
 
 
-def bundle_bytes(data, drop_index, mins=2.0):
-    """Return the incident-bundle envelope for raw JSONL ``data``.
+def export_bytes(data, rtype=None):
+    """Return CSV text for raw JSONL ``data`` (optionally one record type)."""
+    return export_records(_records_from_bytes(data), rtype)
+
+
+def bundle_records(records, drop_index, mins=2.0):
+    """Return the incident-bundle envelope for parsed ``records``.
 
     ``drop_index`` is the 0-based position of the drop record in file order
     (the same order the ``drops`` payload uses). Raises ``ValueError`` when the
@@ -347,7 +1018,6 @@ def bundle_bytes(data, drop_index, mins=2.0):
     """
     if isinstance(drop_index, bool) or not isinstance(drop_index, int):
         raise ValueError("drop index must be an integer")
-    records = _records_from_bytes(data)
     drops = [r for r in records if r.get("type") == "drop"]
     if not drops:
         raise ValueError("no drop records in the log")
@@ -356,47 +1026,119 @@ def bundle_bytes(data, drop_index, mins=2.0):
     return hldsmon.incident_bundle(records, drops[drop_index], mins=mins)
 
 
+def bundle_bytes(data, drop_index, mins=2.0):
+    """Return the incident-bundle envelope for raw JSONL ``data``."""
+    return bundle_records(_records_from_bytes(data), drop_index, mins)
+
+
+def _same_userid(value, expected):
+    return hldsmon._int_userid(value) == expected
+
+
+def bundle_from_spool(paths, run, t, userid, mins=2.0):
+    """Build an incident bundle from the spool using the ``(run,t,userid)`` key.
+
+    ``paths`` may be one spool path or an ordered list of segments. Streams the
+    spool once, materializing only the ``[t-mins, t+mins]`` window (plus the
+    last config snapshot at or before the window, for the diff baseline).
+    Raises ``ValueError`` when the drop key matches no record.
+    """
+    try:
+        run = int(run)
+        center = float(t)
+        mins = float(mins)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid drop key") from exc
+    if mins < 0:
+        raise ValueError("mins must be non-negative")
+    low = center - mins * 60.0
+    high = center + mins * 60.0
+    baseline = None
+    window = []
+    drop_rec = None
+    for rec, rec_run in _iter_pairs(_iter_spool_records(paths)):
+        rtype = rec.get("type")
+        rt = hldsmon._record_ts(rec)
+        if rtype == "config" and rt is not None and rt <= low:
+            baseline = rec
+        if rt is not None and low <= rt <= high:
+            window.append(rec)
+        if (drop_rec is None and rtype == "drop" and rec_run == run
+                and rt is not None and abs(rt - center) < 1e-6
+                and _same_userid(rec.get("userid"), userid)):
+            drop_rec = rec
+    if drop_rec is None:
+        raise ValueError("drop not found for key run=%d t=%s userid=%s"
+                         % (run, t, userid))
+    records = list(window)
+    if baseline is not None and hldsmon._record_ts(baseline) < low:
+        records = [baseline] + records
+    return hldsmon.incident_bundle(records, drop_rec, mins=mins)
+
+
+def _window_matches(rec, lo, hi):
+    if lo is None and hi is None:
+        return True
+    t = hldsmon._record_ts(rec)
+    if t is None:
+        return False
+    if lo is not None and t < lo:
+        return False
+    if hi is not None and t > hi:
+        return False
+    return True
+
+
+def export_spool_chunks(paths, rtype=None, lo=None, hi=None, chunk_size=65536):
+    """Yield CSV byte chunks for the spool, filtered by type/window.
+
+    ``paths`` may be one spool path or an ordered list of segments. Two
+    streaming passes (field discovery, then rows); memory is O(fields) plus one
+    chunk, never O(records). Raises ``ValueError`` for an unknown ``rtype``.
+    """
+    if rtype is not None and rtype not in hldsmon.KNOWN_TYPES:
+        raise ValueError("unknown type: %r" % (rtype,))
+    fieldnames = ["type", "t"]
+    seen = {"type", "t"}
+    extra = set()
+    for rec in _iter_spool_records(paths):
+        if rtype is not None and rec.get("type") != rtype:
+            continue
+        if not _window_matches(rec, lo, hi):
+            continue
+        extra.update(rec.keys())
+    for key in sorted(extra):
+        if key not in seen:
+            fieldnames.append(key)
+            seen.add(key)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    pending = buf.getvalue().encode("utf-8")
+    buf.seek(0)
+    buf.truncate(0)
+    for rec in _iter_spool_records(paths):
+        if rtype is not None and rec.get("type") != rtype:
+            continue
+        if not _window_matches(rec, lo, hi):
+            continue
+        writer.writerow({k: hldsmon._csv_value(rec.get(k))
+                         for k in fieldnames})
+        if buf.tell() >= chunk_size:
+            pending += buf.getvalue().encode("utf-8")
+            buf.seek(0)
+            buf.truncate(0)
+            yield pending
+            pending = b""
+    pending += buf.getvalue().encode("utf-8")
+    if pending:
+        yield pending
+
+
 # ---------------------------------------------------------------------------
 # FTP live-tail (stdlib ftplib only; credentials in RAM only)
 # ---------------------------------------------------------------------------
-
-def _parse_line(raw):
-    """Parse one JSONL line (bytes/str) into a record object or ``None``.
-
-    Mirrors ``hldsmon.iter_records``: blank lines, invalid JSON, non-object
-    values, and records with a missing/unknown ``type`` are skipped.
-    """
-    if isinstance(raw, bytes):
-        try:
-            text = raw.decode("utf-8", "replace")
-        except Exception:
-            return None
-    else:
-        text = raw
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    rtype = obj.get("type")
-    if not isinstance(rtype, str) or rtype not in hldsmon.KNOWN_TYPES:
-        return None
-    return obj
-
-
-def _records_from_lines(lines):
-    """Parse an iterable of complete line bytes into records (tolerant)."""
-    out = []
-    for raw in lines:
-        rec = _parse_line(raw)
-        if rec is not None:
-            out.append(rec)
-    return out
-
 
 def split_tail(leftover, chunk):
     """Split appended bytes into complete lines plus the new incomplete tail.
@@ -440,8 +1182,8 @@ def _utc_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class _FtpTooLarge(Exception):
-    """Raised when a remote download would exceed ``MAX_FTP_BYTES``."""
+class _ValveHit(Exception):
+    """Internal signal: the optional read valve clipped an FTP stream."""
 
 
 def _ftp_open(cfg):
@@ -462,65 +1204,54 @@ def _ftp_open(cfg):
     return ftp
 
 
-def _retr_all(ftp, path, offset=None, on_bytes=None):
-    """Download remote ``path`` (binary), enforcing the size cap.
+def _retr_into_file(ftp, path, dest_path, offset=None, on_bytes=None,
+                    max_bytes=None):
+    """Stream a binary RETR into ``dest_path``; memory is O(chunk), not O(file).
 
-    ``offset`` (when given) is passed as the REST argument so only the appended
-    tail is transferred. ``on_bytes(n)`` is called after each block with the
-    running byte count (progress reporting).
+    ``offset`` (REST) skips to a remote byte offset. ``max_bytes`` clips the
+    transfer at the optional read valve and returns ``(written, cap_hit)`` so
+    an over-valve read is reported, never silently truncated.
     """
-    chunks = []
     total = [0]
+    hit = [False]
 
     def _sink(block):
+        room = None if max_bytes is None else max_bytes - total[0]
+        if room is not None and len(block) > room:
+            if room > 0:
+                fh.write(block[:room])
+                total[0] += room
+            hit[0] = True
+            raise _ValveHit()
+        fh.write(block)
         total[0] += len(block)
-        if total[0] > MAX_FTP_BYTES:
-            raise _FtpTooLarge("remote file exceeds %d bytes" % MAX_FTP_BYTES)
-        chunks.append(block)
         if on_bytes is not None:
             on_bytes(total[0])
 
-    if offset is None:
-        ftp.retrbinary("RETR " + path, _sink)
-    else:
-        ftp.retrbinary("RETR " + path, _sink, rest=offset)
-    return b"".join(chunks)
+    with open(dest_path, "wb") as fh:
+        try:
+            if offset is None:
+                ftp.retrbinary("RETR " + path, _sink)
+            else:
+                ftp.retrbinary("RETR " + path, _sink, rest=offset)
+        except _ValveHit:
+            pass
+    return total[0], hit[0]
 
 
-def _download(cfg, offset=0):
-    """Return ``(remote_size, data)`` for ``cfg['path']``.
+def _download(cfg, dest_path, offset=0, on_bytes=None, max_bytes=None):
+    """Stream remote ``cfg['path']`` (from ``offset``) into ``dest_path``.
 
-    ``data`` is the bytes from ``offset`` to EOF; the whole file is returned
-    when ``offset`` is falsy or the remote shrank to ``<= offset``. Opens and
-    always closes one connection. This is the network seam tests replace with
-    a fake.
+    Returns ``(written, cap_hit)``. This is the network seam tests replace; the
+    production path writes to disk so memory stays O(chunk), never O(file).
     """
     offset = int(offset or 0)
     ftp = _ftp_open(cfg)
     try:
-        path = cfg["path"]
-        try:
-            size = ftp.size(path)
-        except Exception:
-            size = None
-        if offset > 0 and size is not None and size > offset:
-            try:
-                return size, _retr_all(ftp, path, offset,
-                                       _progress_callback(size - offset))
-            except ftplib.all_errors:
-                pass  # REST unsupported -> fall through to a full download
-        data = _retr_all(ftp, path, None, _progress_callback(size))
-        if offset > 0 and offset < len(data):
-            return len(data), data[offset:]
-        return (size if size is not None else len(data)), data
+        return _retr_into_file(ftp, cfg["path"], dest_path,
+                               offset or None, on_bytes, max_bytes)
     finally:
-        try:
-            ftp.quit()
-        except Exception:
-            try:
-                ftp.close()
-            except Exception:
-                pass
+        _ftp_close(ftp)
 
 
 def _ftp_close(ftp):
@@ -548,14 +1279,16 @@ def _remote_size(cfg):
 def _download_range(cfg, start, length):
     """Return the bytes of ``cfg['path']`` in ``[start, start + length)``.
 
-    Uses an FTP REST range read; falls back to a full download + slice when the
-    server lacks REST. Tolerates a short/partial transfer (never raises for it).
+    Uses an FTP REST range read; when the server lacks REST/SIZE the full RETR
+    is streamed into a temporary spool file and the slice read from it, so a
+    large file is never held in memory. Tolerates a short transfer.
     """
     start = int(start)
     length = int(length)
     if length <= 0:
         return b""
     ftp = _ftp_open(cfg)
+    tmp_path = None
     try:
         path = cfg["path"]
         try:
@@ -592,47 +1325,24 @@ def _download_range(cfg, start, length):
             except Exception:
                 pass
             return bytes(buf)
-        data = _retr_all(ftp, path, None, None)
-        return data[start:stop]
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".spool", prefix="hldsmon-ftp-", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        _retr_into_file(ftp, path, tmp_path)
+        with open(tmp_path, "rb") as fh:
+            fh.seek(start)
+            return fh.read(stop - start)
     finally:
+        if tmp_path:
+            _silent_remove(tmp_path)
         _ftp_close(ftp)
 
 
-def _lines_in_range(chunk, drop_head, keep_tail_partial):
-    """Split a raw byte range into complete JSONL line bytes.
-
-    ``drop_head``: the range starts mid-line (X > 0) - drop the leading partial.
-    ``keep_tail_partial``: the range ends at EOF - return the trailing partial
-    line separately (a write still being appended). Returns
-    ``(line_bytes, leftover_bytes)``.
-    """
-    if isinstance(chunk, str):
-        chunk = chunk.encode("utf-8")
-    data = chunk or b""
-    if drop_head:
-        nl = data.find(b"\n")
-        if nl < 0:
-            return [], (data if keep_tail_partial else b"")
-        data = data[nl + 1:]
-    if not data:
-        return [], b""
-    leftover = b""
-    if keep_tail_partial and not data.endswith(b"\n"):
-        nl = data.rfind(b"\n")
-        if nl < 0:
-            return [], data
-        leftover = data[nl + 1:]
-        data = data[:nl + 1]
-    if data.endswith(b"\n"):
-        data = data[:-1]
-    lines = [ln for ln in data.split(b"\n") if ln] if data else []
-    return lines, leftover
-
-
-def _records_span(records):
-    """Return ``newest_t - oldest_t`` over ``records``, or ``None`` if unknown."""
+def _scan_t_range_file(path):
+    """Return ``(min_t, max_t)`` over a spool file, streamed (O(1) memory)."""
     lo = hi = None
-    for rec in records:
+    for rec in hldsmon.iter_records(path):
         t = hldsmon._num(rec.get("t"))
         if t is None:
             continue
@@ -640,84 +1350,164 @@ def _records_span(records):
             lo = t
         if hi is None or t > hi:
             hi = t
-    if lo is None:
-        return None
-    return hi - lo
+    return lo, hi
 
 
-def _read_backward_chunk(cfg, cursor, job, loaded_bytes, keep_tail_partial):
-    """Fetch one chunk ending at ``cursor``; return ``(aligned_start, records, leftover)``."""
+def _segment_make(data, start, end, remote_path):
+    """Spool ``data`` as a new segment covering remote ``[start, end)``."""
+    entry = _spool_create()
+    try:
+        _spool_write(entry, data)
+    except BaseException:
+        _spool_remove(entry.handle)
+        raise
+    return {"entry": entry, "path": entry.path, "size": len(data),
+            "start": int(start), "end": int(end), "remote_path": remote_path}
+
+
+def _remove_segments(segments):
+    """Release every segment's spool file and budget reservation."""
+    for seg in segments or []:
+        _spool_remove(seg["entry"].handle)
+
+
+def _read_backward_segment(cfg, cursor, job, loaded, keep_tail_partial,
+                           remaining=None, progress_total=None):
+    """Fetch one chunk ending at remote ``cursor`` into a spool segment.
+
+    Returns ``(aligned_start, segment, leftover, t_lo, t_hi, cap_hit)``. The
+    leading partial line is dropped, so concatenating segments oldest->newest
+    yields a gap-free, duplicate-free stream. Memory is O(chunk).
+    """
     fetch_start = max(0, cursor - FTP_BACK_CHUNK)
-    chunk = _download_range(cfg, fetch_start, cursor - fetch_start)
-    loaded_bytes[0] += len(chunk)
-    lines, leftover = _lines_in_range(
-        chunk, drop_head=(fetch_start > 0), keep_tail_partial=keep_tail_partial)
-    records = _records_from_lines(lines)
+    desired = cursor - fetch_start
+    want = desired
+    if remaining is not None:
+        want = min(desired, max(0, remaining - loaded[0]))
+    if want <= 0:
+        return cursor, None, b"", None, None, remaining is not None
+    clipped = remaining is not None and want < desired
+    chunk = _download_range(cfg, fetch_start, want)
+    loaded[0] += len(chunk)
     if fetch_start > 0:
         nl = chunk.find(b"\n")
         aligned_start = fetch_start + nl + 1 if nl >= 0 else fetch_start
     else:
         aligned_start = 0
-    _progress_set(job, loaded_bytes[0], None)
-    return aligned_start, records, leftover
+    payload = chunk[aligned_start - fetch_start:]
+    leftover = b""
+    if keep_tail_partial and payload and not payload.endswith(b"\n"):
+        nl = payload.rfind(b"\n")
+        leftover = payload[nl + 1:] if nl >= 0 else payload
+    seg = None
+    t_lo = t_hi = None
+    if payload:
+        seg = _segment_make(payload, aligned_start, cursor, cfg["path"])
+        t_lo, t_hi = _scan_t_range_file(seg["path"])
+    _progress_set(job, loaded[0], progress_total)
+    return aligned_start, seg, leftover, t_lo, t_hi, clipped
 
 
-def _load_tail(cfg, window_s, job):
-    """Load the newest ``window_s`` seconds (or the whole file).
+def _load_unsized(cfg, job, remaining=None):
+    """No remote SIZE: stream the whole RETR once into a single segment.
 
-    Returns ``(start, end, leftover, records)`` with records oldest->newest.
+    The tail window is then applied by the streaming analysis; ranges are
+    sliced locally, so a large remote file is never held in memory nor rejected
+    by size (REQ-L1/REQ-L2).
+    """
+    entry = _spool_create()
+    try:
+        written, cap = _download(cfg, entry.path, 0,
+                                 _progress_callback(None), remaining)
+    except BaseException:
+        _spool_remove(entry.handle)
+        raise
+    if written and not _SPOOL_BUDGET.reserve(written):
+        _spool_remove(entry.handle)
+        raise _SpoolFull()
+    _spool_commit(entry, written)
+    seg = {"entry": entry, "path": entry.path, "size": written,
+           "start": 0, "end": written, "remote_path": cfg["path"]}
+    t_lo, t_hi = _scan_t_range_file(entry.path)
+    _progress_set(job, written, written if written else None)
+    return [seg], b"", t_lo, t_hi, cap
+
+
+def _load_tail(cfg, window_s, job, remaining=None):
+    """Load the newest ``window_s`` seconds into ordered spool segments.
+
+    Returns ``(segments, leftover, t_lo, t_hi, cap_hit)`` with ``segments``
+    oldest->newest. Ingest memory is O(chunk); the analysis later applies the
+    window, so nothing is held proportional to the file.
     """
     size = _remote_size(cfg)
     if size is None or size <= 0:
-        _, data = _download(cfg, 0)
-        lines, leftover = split_tail(b"", data)
-        return 0, len(data), leftover, _records_from_lines(lines)
+        return _load_unsized(cfg, job, remaining)
     end = int(size)
     cursor = end
-    start = end
-    records = []
-    leftover = b""
     loaded = [0]
     first = True
+    leftover = b""
+    newest_first = []
+    t_lo = t_hi = None
+    cap_hit = False
     while True:
         prev_cursor = cursor
-        aligned_start, chunk_records, chunk_leftover = _read_backward_chunk(
-            cfg, cursor, job, loaded, keep_tail_partial=first)
-        if chunk_records:
-            records = chunk_records + records
+        aligned_start, seg, chunk_leftover, s_lo, s_hi, cap = \
+            _read_backward_segment(cfg, cursor, job, loaded,
+                                   keep_tail_partial=first,
+                                   remaining=remaining,
+                                   progress_total=size)
+        if seg is not None:
+            newest_first.append(seg)
+        if s_lo is not None and (t_lo is None or s_lo < t_lo):
+            t_lo = s_lo
+        if s_hi is not None and (t_hi is None or s_hi > t_hi):
+            t_hi = s_hi
         if first:
             leftover = chunk_leftover
             first = False
-        start = aligned_start
+        if cap:
+            cap_hit = True
         cursor = aligned_start
-        span = _records_span(records)
-        if span is not None and span >= window_s:
+        if t_lo is not None and t_hi is not None and (t_hi - t_lo) >= window_s:
             break
-        if start <= 0 or loaded[0] >= MAX_FTP_BYTES or cursor >= prev_cursor:
+        if cursor <= 0 or cursor >= prev_cursor or seg is None:
             break
-    return start, end, leftover, records
+    newest_first.reverse()
+    return newest_first, leftover, t_lo, t_hi, cap_hit
 
 
-def _ftp_meta(path, records, start, end, updated_at):
-    """Build the ``ftp`` block shared by connect / refresh / load-earlier."""
-    lo = hi = None
-    for rec in records:
-        t = hldsmon._num(rec.get("t"))
-        if t is None:
-            continue
-        if lo is None or t < lo:
-            lo = t
-        if hi is None or t > hi:
-            hi = t
-    return {
+def _ftp_meta(path, segments, t_lo, t_hi, records_count, updated_at,
+              cap_hit=False):
+    """Build the ``ftp`` block shared by connect / refresh / load-earlier.
+
+    ``bytes`` is the loaded **remote** byte range (a sum of segment spans, not
+    the spool size) and ``reached_start`` is true once the oldest loaded
+    segment starts at remote offset 0 (INV-L5). ``cap_hit``/``limit_bytes``
+    appear only when the optional read valve is on (QAS-L4).
+    """
+    start = segments[0]["start"] if segments else 0
+    end = segments[-1]["end"] if segments else 0
+    remote_bytes = sum(int(seg["size"]) for seg in segments)
+    meta = {
         "path": path,
-        "bytes": max(0, int(end) - int(start)),
-        "records": len(records),
+        "bytes": int(remote_bytes),
+        "records": int(records_count),
         "updated_at": updated_at,
-        "reached_start": int(start) <= 0,
-        "start_t": lo,
-        "end_t": hi,
+        "reached_start": bool(segments) and int(segments[0]["start"]) <= 0,
+        "start_t": t_lo,
+        "end_t": t_hi,
+        "start": int(start),
+        "end": int(end),
+        "segments": len(segments),
     }
+    if _CONFIG.max_log_bytes:
+        meta["cap_hit"] = bool(cap_hit)
+        meta["limit_bytes"] = int(_CONFIG.max_log_bytes)
+        if cap_hit:
+            meta["truncated"] = True
+    return meta
 
 
 def _session_put(session_id, session):
@@ -728,13 +1518,6 @@ def _session_put(session_id, session):
 def _session_peek(session_id):
     with _FTP_LOCK:
         return _FTP_SESSIONS.get(session_id)
-
-
-def _session_update(session_id, session, **fields):
-    with _FTP_LOCK:
-        current = _FTP_SESSIONS.get(session_id)
-        if current is session:
-            current.update(fields)
 
 
 def _progress_callback(total):
@@ -822,6 +1605,52 @@ def progress_get(job):
         return dict((k, v) for k, v in entry.items() if not k.startswith("_"))
 
 
+def _ftp_valve_remaining(session):
+    """Bytes still allowed by the optional read valve, or ``None`` when off."""
+    valve = _CONFIG.max_log_bytes
+    if not valve:
+        return None
+    return max(0, int(valve) - int(session.get("spool_bytes", 0)))
+
+
+def _ftp_analyze(session):
+    """Run the LL-P2 streaming/windowed analysis over the session's segments.
+
+    The whole segment spool is streamed through the coarse aggregator, but only
+    the FTP window is materialized, so memory stays O(window) even after
+    ``load-earlier`` reaches remote offset 0 (INV-L1, no O(n^2) re-analysis).
+    """
+    paths = [seg["path"] for seg in session.get("segments", [])]
+    files = [session["current_path"]] if session.get("current_path") else []
+    payload = coarse_overview_paths(paths, files,
+                                    window_s=session.get("window_s"))
+    payload["handle"] = session["id"]
+    payload["session"] = session["id"]
+    return payload
+
+
+def _ftp_seal(session, payload):
+    """Record analysis-derived span/records/reached_start on the session."""
+    period = (payload.get("digest") or {}).get("period") or {}
+    session["t_lo"] = period.get("start")
+    session["t_hi"] = period.get("end")
+    session["records_count"] = int(payload.get("records_count") or 0)
+    session["spool_bytes"] = sum(int(seg["size"]) for seg in session["segments"])
+    session["reached_start"] = bool(session["segments"]) and \
+        int(session["segments"][0]["start"]) <= 0
+
+
+def _ftp_meta_for(session, cap_hit=None):
+    meta = _ftp_meta(
+        session.get("current_path"), session["segments"],
+        session["t_lo"], session["t_hi"], session["records_count"],
+        session.get("updated_at"),
+        session.get("cap_hit") if cap_hit is None else cap_hit)
+    meta["window_s"] = session.get("window_s")
+    meta["window_presets"] = list(FTP_WINDOW_PRESETS)
+    return meta
+
+
 def ftp_connect(spec):
     """Open an FTP tail session and return the first analysis payload."""
     host = str(spec.get("host") or "").strip()
@@ -842,31 +1671,43 @@ def ftp_connect(spec):
     }
     window_s = float(spec.get("window_s") or FTP_WINDOW_S)
     job = str(spec.get("job") or "").strip() or secrets.token_urlsafe(12)
+    session_id = secrets.token_urlsafe(24)
+    session = {
+        "id": session_id,
+        "cfg": cfg,
+        "path_token": path_token,
+        "current_path": resolved,
+        "window_s": window_s,
+        "segments": [],
+        "spool_bytes": 0,
+        "records_count": 0,
+        "t_lo": None,
+        "t_hi": None,
+        "reached_start": False,
+        "cap_hit": False,
+        "updated_at": _utc_iso(),
+    }
     _progress_set(job, 0, None)
+    remaining = _CONFIG.max_log_bytes or None
     try:
-        start, end, leftover, records = _load_tail(cfg, window_s, job)
+        segments, _leftover, _t_lo, _t_hi, cap = _load_tail(
+            cfg, window_s, job, remaining)
     except BaseException as exc:
         _progress_finish(job, ok=False, error=str(exc))
         raise
+    session["segments"] = segments
+    session["cap_hit"] = cap
     _progress_phase(job, "parse")
     try:
-        session_id = secrets.token_urlsafe(24)
-        updated_at = _utc_iso()
-        _session_put(session_id, {
-            "cfg": cfg,
-            "path_token": path_token,
-            "window_s": window_s,
-            "start": start,
-            "end": end,
-            "leftover": leftover,
-            "records": records,
-            "updated_at": updated_at,
-        })
-        payload = analyze_records(records, files=[resolved])
-        payload["session"] = session_id
+        _session_put(session_id, session)
+        payload = _ftp_analyze(session)
+        _ftp_seal(session, payload)
         payload["job"] = job
-        payload["ftp"] = _ftp_meta(resolved, records, start, end, updated_at)
+        payload["ftp"] = _ftp_meta_for(session)
     except BaseException as exc:
+        _remove_segments(segments)
+        with _FTP_LOCK:
+            _FTP_SESSIONS.pop(session_id, None)
         _progress_finish(job, ok=False, error=str(exc))
         raise
     _progress_finish(job, ok=True)
@@ -874,52 +1715,62 @@ def ftp_connect(spec):
 
 
 def ftp_refresh(session_id):
-    """Append only the newly written bytes and return the recomputed payload."""
+    """Append only newly written bytes (or rotate to a new day) then re-analyze."""
     session = _session_peek(session_id)
     if session is None:
         raise KeyError("unknown session")
     resolved = resolve_path(session["path_token"], _utc_date())
     cfg = dict(session["cfg"])
     cfg["path"] = resolved
-    rotated = resolved != session["cfg"]["path"]
-    end = int(session["end"])
-    start = int(session["start"])
     window_s = float(session.get("window_s") or FTP_WINDOW_S)
-
+    remaining = _ftp_valve_remaining(session)
+    rotated = resolved != session.get("current_path")
+    prev_records = int(session.get("records_count") or 0)
     _progress_set(session_id, 0, None)
+    new_bytes = 0
     try:
-        size = _remote_size(cfg)
-        if rotated or size is None or size < end:
-            start, end, leftover, records = _load_tail(cfg, window_s, session_id)
-            new_bytes = end - start
-            new_records = len(records)
-        elif size == end:
-            leftover = session["leftover"]
-            records = list(session["records"])
-            new_bytes = 0
-            new_records = 0
+        if rotated:
+            segments, _lo, _l, _hi, cap = _load_tail(
+                cfg, window_s, session_id, remaining)
+            session["segments"].extend(segments)
+            session["current_path"] = resolved
+            session["cap_hit"] = session.get("cap_hit") or cap
+            new_bytes = sum(int(seg["size"]) for seg in segments)
         else:
-            delta = _download_range(cfg, end, size - end)
-            lines, leftover = split_tail(session["leftover"], delta)
-            appended = _records_from_lines(lines)
-            records = list(session["records"]) + appended
-            end = end + len(delta)
-            new_bytes = len(delta)
-            new_records = len(appended)
+            size = _remote_size(cfg)
+            end = int(session["segments"][-1]["end"]) if session["segments"] else 0
+            if size is None or size < end:
+                _remove_segments(session["segments"])
+                segments, _lo, _l, _hi, cap = _load_tail(
+                    cfg, window_s, session_id, remaining)
+                session["segments"] = segments
+                session["current_path"] = resolved
+                session["cap_hit"] = cap
+                new_bytes = sum(int(seg["size"]) for seg in segments)
+            elif size > end:
+                want = size - end
+                if remaining is not None:
+                    want = min(want, remaining)
+                data = _download_range(cfg, end, want)
+                if data:
+                    tail_seg = session["segments"][-1]
+                    _spool_write(tail_seg["entry"], data, append=True)
+                    tail_seg["size"] += len(data)
+                    tail_seg["end"] = end + len(data)
+                new_bytes = len(data)
+                if _CONFIG.max_log_bytes and len(data) < (size - end):
+                    session["cap_hit"] = True
     except BaseException as exc:
         _progress_finish(session_id, ok=False, error=str(exc))
         raise
     _progress_phase(session_id, "parse")
     try:
-        updated_at = _utc_iso()
-        _session_update(session_id, session, cfg=cfg, window_s=window_s,
-                        start=start, end=end, leftover=leftover,
-                        records=records, updated_at=updated_at)
-        payload = analyze_records(records, files=[resolved])
-        payload["session"] = session_id
-        meta = _ftp_meta(resolved, records, start, end, updated_at)
-        meta["new_bytes"] = new_bytes
-        meta["new_records"] = new_records
+        payload = _ftp_analyze(session)
+        _ftp_seal(session, payload)
+        session["updated_at"] = _utc_iso()
+        meta = _ftp_meta_for(session)
+        meta["new_bytes"] = int(new_bytes)
+        meta["new_records"] = int(session["records_count"]) - prev_records
         payload["ftp"] = meta
     except BaseException as exc:
         _progress_finish(session_id, ok=False, error=str(exc))
@@ -929,72 +1780,85 @@ def ftp_refresh(session_id):
 
 
 def ftp_load_earlier(session_id, window_s=None):
-    """Prepend an older time window (default ``FTP_WINDOW_S``) from the FTP log."""
+    """Prepend an older window of segments until remote offset 0 is reached."""
     session = _session_peek(session_id)
     if session is None:
         raise KeyError("unknown session")
-    resolved = resolve_path(session["path_token"], _utc_date())
-    cfg = dict(session["cfg"])
-    cfg["path"] = resolved
-    start = int(session["start"])
-    end = int(session["end"])
-    records = list(session["records"])
-    step = float(window_s if window_s is not None else (session.get("window_s") or FTP_WINDOW_S))
-
-    older_bytes = 0
-    older_records = 0
-    if start > 0:
-        span_before = _records_span(records) or 0.0
-        loaded = [0]
-        _progress_set(session_id, 0, None)
-        try:
-            while True:
-                prev_start = start
-                aligned_start, chunk_records, _ = _read_backward_chunk(
-                    cfg, start, session_id, loaded, keep_tail_partial=False)
-                if chunk_records:
-                    records = chunk_records + records
-                    older_records += len(chunk_records)
-                start = aligned_start
-                span = _records_span(records)
-                if span is not None and (span - span_before) >= step:
-                    break
-                if start <= 0 or loaded[0] >= MAX_FTP_BYTES or start >= prev_start:
-                    break
-            older_bytes = loaded[0]
-        except BaseException as exc:
-            _progress_finish(session_id, ok=False, error=str(exc))
-            raise
-        _progress_phase(session_id, "parse")
-        try:
-            updated_at = _utc_iso()
-            _session_update(session_id, session, start=start, records=records,
-                            updated_at=updated_at)
-            payload = analyze_records(records, files=[resolved])
-            payload["session"] = session_id
-            meta = _ftp_meta(resolved, records, start, end, updated_at)
-            meta["older_bytes"] = older_bytes
-            meta["older_records"] = older_records
-            payload["ftp"] = meta
-        except BaseException as exc:
-            _progress_finish(session_id, ok=False, error=str(exc))
-            raise
-        _progress_finish(session_id, ok=True)
+    segments = session.get("segments") or []
+    oldest = segments[0] if segments else None
+    if oldest is None or int(oldest["start"]) <= 0:
+        payload = _ftp_analyze(session)
+        _ftp_seal(session, payload)
+        meta = _ftp_meta_for(session)
+        meta["older_bytes"] = 0
+        meta["older_records"] = 0
+        payload["ftp"] = meta
         return payload
 
-    payload = analyze_records(records, files=[resolved])
-    payload["session"] = session_id
-    meta = _ftp_meta(resolved, records, start, end, _utc_iso())
-    meta["older_bytes"] = 0
-    meta["older_records"] = 0
-    payload["ftp"] = meta
+    cfg = dict(session["cfg"])
+    cfg["path"] = oldest["remote_path"]
+    step = float(window_s if window_s is not None
+                 else (session.get("window_s") or FTP_WINDOW_S))
+    remaining = _ftp_valve_remaining(session)
+    cursor = int(oldest["start"])
+    loaded = [0]
+    older = []
+    o_lo = o_hi = None
+    cap_hit = False
+    prev_records = int(session.get("records_count") or 0)
+    _progress_set(session_id, 0, None)
+    try:
+        while True:
+            prev_cursor = cursor
+            aligned_start, seg, _leftover, s_lo, s_hi, cap = \
+                _read_backward_segment(cfg, cursor, session_id, loaded,
+                                       keep_tail_partial=False,
+                                       remaining=remaining,
+                                       progress_total=cursor or None)
+            if seg is not None:
+                older.append(seg)
+            if s_lo is not None and (o_lo is None or s_lo < o_lo):
+                o_lo = s_lo
+            if s_hi is not None and (o_hi is None or s_hi > o_hi):
+                o_hi = s_hi
+            if cap:
+                cap_hit = True
+            cursor = aligned_start
+            if o_lo is not None and o_hi is not None and (o_hi - o_lo) >= step:
+                break
+            if cursor <= 0 or cursor >= prev_cursor or seg is None:
+                break
+        older.reverse()
+        session["segments"] = older + segments
+        session["cap_hit"] = session.get("cap_hit") or cap_hit
+    except BaseException as exc:
+        _remove_segments(older)
+        _progress_finish(session_id, ok=False, error=str(exc))
+        raise
+    _progress_phase(session_id, "parse")
+    try:
+        payload = _ftp_analyze(session)
+        _ftp_seal(session, payload)
+        session["updated_at"] = _utc_iso()
+        meta = _ftp_meta_for(session)
+        meta["older_bytes"] = sum(int(seg["size"]) for seg in older)
+        meta["older_records"] = int(session["records_count"]) - prev_records
+        payload["ftp"] = meta
+    except BaseException as exc:
+        _progress_finish(session_id, ok=False, error=str(exc))
+        raise
+    _progress_finish(session_id, ok=True)
     return payload
 
 
 def ftp_close(session_id):
-    """Drop an FTP session; returns ``True`` when it existed."""
+    """Drop an FTP session and its segment spool files; returns ``True`` if it existed."""
     with _FTP_LOCK:
-        return _FTP_SESSIONS.pop(session_id, None) is not None
+        session = _FTP_SESSIONS.pop(session_id, None)
+    if session is None:
+        return False
+    _remove_segments(session.get("segments"))
+    return True
 
 
 def parse_json_body(data):
@@ -1046,28 +1910,113 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
 
+    def _unlimited_allowed(self):
+        """Whether an unlimited (valve-off) ingest is currently permitted."""
+        if _CONFIG.max_log_bytes > 0:
+            return True
+        if _CONFIG.allow_nonloopback_unlimited:
+            return True
+        try:
+            host = self.server.server_address[0]
+        except (AttributeError, IndexError, TypeError):
+            host = None
+        return _is_loopback(host)
+
+    def _drain_body(self, length):
+        """Consume an unprocessed body so the client can read our response."""
+        try:
+            if length is None:
+                while self.rfile.read(SPOOL_CHUNK):
+                    pass
+            else:
+                remaining = length
+                while remaining > 0:
+                    block = self.rfile.read(min(SPOOL_CHUNK, remaining))
+                    if not block:
+                        break
+                    remaining -= len(block)
+        except (OSError, TimeoutError):
+            pass
+
     def _read_body(self):
-        """Read the request body; ``None`` means it exceeds the cap."""
+        """Stream the request body into a disk spool; return its handle.
+
+        Framing (deterministic): absent ``Content-Length`` -> 411; a
+        present-but-malformed length -> stream to EOF (408 on timeout); a valid
+        positive length -> exactly that many bytes (408 on shortfall). Ingest
+        memory is O(SPOOL_CHUNK). Raises ``_HttpError`` on any failure.
+        """
+        if not _UPLOAD_SEM.acquire(blocking=False):
+            raise _HttpError(429, {"ok": False, "code": "busy"}, close=True)
+        try:
+            return self._read_body_locked()
+        finally:
+            try:
+                _UPLOAD_SEM.release()
+            except ValueError:
+                pass
+
+    def _read_body_locked(self):
         raw = self.headers.get("Content-Length")
         if raw is None:
-            return b""
+            raise _HttpError(411, {"ok": False, "code": "length_required"},
+                             close=True)
+        length = _parse_content_length(raw)
+        malformed = length is None
+
+        if not self._unlimited_allowed():
+            try:
+                self.connection.settimeout(_CONFIG.read_timeout)
+            except OSError:
+                pass
+            self._drain_body(length)
+            raise _HttpError(
+                403, {"ok": False, "code": "unlimited_nonloopback_disabled"},
+                close=True)
+
+        free = spool_free_bytes(_spool_dir())
+        if free is not None and free < SPOOL_CHUNK:
+            raise _HttpError(507, {"ok": False, "code": "spool_full"})
+
+        entry = _spool_create()
         try:
-            length = int(raw)
-        except (TypeError, ValueError):
-            return b""
-        if length <= 0:
-            return b""
-        if length > MAX_BODY_BYTES:
-            return None
-        chunks = []
-        remaining = length
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+            self.connection.settimeout(_CONFIG.read_timeout)
+        except OSError:
+            pass
+        try:
+            written = receive_body(
+                self.rfile, entry.path, length,
+                valve=_CONFIG.max_log_bytes,
+                session_limit=_CONFIG.spool_session_bytes,
+                budget=_SPOOL_BUDGET)
+        except _IngestError as exc:
+            _spool_remove(entry.handle)
+            raise _HttpError(exc.status, exc.payload(), close=exc.close) from exc
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            _spool_remove(entry.handle)
+            raise _HttpError(400, {"ok": False, "error": "connection closed"},
+                             close=True) from exc
+        except OSError as exc:
+            _spool_remove(entry.handle)
+            raise _HttpError(400, {"ok": False, "error": "read failed"},
+                             close=True) from exc
+        except BaseException:
+            _spool_remove(entry.handle)
+            raise
+        finally:
+            try:
+                self.connection.settimeout(None)
+            except OSError:
+                pass
+        if malformed:
+            self.close_connection = True
+        _spool_commit(entry, written)
+        return entry
+
+    def _respond_error(self, exc):
+        if exc.close:
+            self.close_connection = True
+        self._send_json(exc.status, exc.payload)
 
     @staticmethod
     def _first(query, name, default=None):
@@ -1138,79 +2087,186 @@ class _Handler(BaseHTTPRequestHandler):
             html = FALLBACK_HTML
         self._send(200, html, "text/html; charset=utf-8")
 
+    def _read_spool_records(self, entry):
+        return hldsmon.parse_records([entry.path])
+
     def _handle_analyze(self, query):
-        data = self._read_body()
-        if data is None:
-            self.close_connection = True
-            self._send_json(413, {"ok": False, "error": "payload too large"})
+        try:
+            entry = self._read_body()
+        except _HttpError as exc:
+            self._respond_error(exc)
             return
         files = self._query_files(query)
         try:
-            payload = analyze_bytes(data, files)
+            from_ts = _parse_epoch(self._first(query, "from", None))
+            to_ts = _parse_epoch(self._first(query, "to", None))
+            window_s = _parse_window(self._first(query, "window", None))
+            payload = coarse_overview(entry.path, files, from_ts=from_ts,
+                                      to_ts=to_ts, window_s=window_s)
         except Exception as exc:  # noqa: BLE001 - surface any analyzer error
+            _spool_remove(entry.handle)
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
+        payload["handle"] = entry.handle
         self._send_json(200, payload)
 
-    def _handle_export(self, query):
-        data = self._read_body()
-        if data is None:
-            self.close_connection = True
-            self._send_json(413, {"ok": False, "error": "payload too large"})
+    def _expired(self):
+        self._send_json(410, {"ok": False, "code": "session_expired"})
+
+    @staticmethod
+    def _source_paths(handle):
+        """Resolve a handle to spool path(s): local spool handle or FTP session."""
+        entry = spool_get(handle)
+        if entry is not None:
+            return [entry.path]
+        session = _session_peek(handle)
+        if session is not None:
+            paths = [seg["path"] for seg in session.get("segments", [])]
+            return paths or None
+        return None
+
+    def _send_chunked(self, content_type, chunks):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        if self.command == "HEAD":
             return
+        try:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                self.wfile.write(b"%x\r\n" % len(chunk))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _resolve_type(self, query):
         rtype = self._first(query, "type", None)
         if rtype == "":
-            rtype = None
+            return None, None
         if rtype is not None and rtype not in hldsmon.KNOWN_TYPES:
-            self._send_json(400, {
-                "ok": False,
-                "error": "unknown type: %r" % (rtype,),
-            })
+            return None, "unknown type: %r" % (rtype,)
+        return rtype, None
+
+    def _handle_export(self, query):
+        handle = self._first(query, "handle", None)
+        if handle:
+            paths = self._source_paths(handle)
+            if paths is None:
+                self._expired()
+                return
+            rtype, err = self._resolve_type(query)
+            if err:
+                self._send_json(400, {"ok": False, "error": err})
+                return
+            try:
+                lo = _parse_epoch(self._first(query, "from", None))
+                hi = _parse_epoch(self._first(query, "to", None))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            try:
+                chunks = export_spool_chunks(paths, rtype, lo, hi)
+                self._send_chunked("text/csv; charset=utf-8", chunks)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(400, {"ok": False, "error": str(exc)})
             return
         try:
-            csv_text = export_bytes(data, rtype)
+            entry = self._read_body()
+        except _HttpError as exc:
+            self._respond_error(exc)
+            return
+        try:
+            rtype, err = self._resolve_type(query)
+            if err:
+                self._send_json(400, {"ok": False, "error": err})
+                return
+            records = self._read_spool_records(entry)
+            csv_text = export_records(records, rtype)
+            self._send(200, csv_text, "text/csv; charset=utf-8")
         except Exception as exc:  # noqa: BLE001
             self._send_json(400, {"ok": False, "error": str(exc)})
-            return
-        self._send(200, csv_text, "text/csv; charset=utf-8")
+        finally:
+            _spool_remove(entry.handle)
 
     def _handle_bundle(self, query):
-        data = self._read_body()
-        if data is None:
-            self.close_connection = True
-            self._send_json(413, {"ok": False, "error": "payload too large"})
-            return
-        raw_drop = self._first(query, "drop", None)
-        try:
-            drop_index = int(raw_drop)
-        except (TypeError, ValueError):
-            self._send_json(400, {
-                "ok": False,
-                "error": "drop index required (0-based position in file order)",
-            })
-            return
-        raw_mins = self._first(query, "mins", None)
-        mins = 2.0
-        if raw_mins not in (None, ""):
-            try:
-                mins = float(raw_mins)
-            except (TypeError, ValueError):
-                self._send_json(400, {"ok": False, "error": "invalid mins"})
+        handle = self._first(query, "handle", None)
+        if handle:
+            paths = self._source_paths(handle)
+            if paths is None:
+                self._expired()
                 return
+            try:
+                run = int(self._first(query, "run", ""))
+                t = float(self._first(query, "t", ""))
+                raw_userid = self._first(query, "userid", "")
+                userid = int(raw_userid) if raw_userid not in (None, "") else None
+                mins = self._parse_mins(query)
+                payload = bundle_from_spool(paths, run, t, userid, mins)
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, payload)
+            return
         try:
-            payload = bundle_bytes(data, drop_index, mins)
+            entry = self._read_body()
+        except _HttpError as exc:
+            self._respond_error(exc)
+            return
+        try:
+            raw_drop = self._first(query, "drop", None)
+            try:
+                drop_index = int(raw_drop)
+            except (TypeError, ValueError):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "drop index required (0-based position in file order)",
+                })
+                return
+            mins = self._parse_mins(query)
+            records = self._read_spool_records(entry)
+            payload = bundle_records(records, drop_index, mins)
+            self._send_json(200, payload)
         except Exception as exc:  # noqa: BLE001 - surface any analyzer error
             self._send_json(400, {"ok": False, "error": str(exc)})
-            return
-        self._send_json(200, payload)
+        finally:
+            _spool_remove(entry.handle)
+
+    def _parse_mins(self, query):
+        raw_mins = self._first(query, "mins", None)
+        if raw_mins in (None, ""):
+            return 2.0
+        try:
+            mins = float(raw_mins)
+        except (TypeError, ValueError):
+            raise ValueError("invalid mins")
+        if mins < 0:
+            raise ValueError("invalid mins")
+        return mins
 
     def _body_or_error(self):
-        """Return the raw body, sending a 413/400 and ``None`` on failure."""
-        data = self._read_body()
-        if data is None:
-            self.close_connection = True
-            self._send_json(413, {"ok": False, "error": "payload too large"})
-        return data
+        """Return raw body bytes, or send an error response and ``None``.
+
+        The body is spooled to disk (streamed, framing-checked) and released
+        right away: the small JSON FTP specs do not become server handles.
+        """
+        try:
+            entry = self._read_body()
+        except _HttpError as exc:
+            self._respond_error(exc)
+            return None
+        try:
+            with open(entry.path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            self._send_json(400, {"ok": False, "error": "cannot read body"})
+            return None
+        finally:
+            _spool_remove(entry.handle)
 
     def _handle_ftp(self, worker):
         data = self._body_or_error()
@@ -1223,6 +2279,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = worker(spec)
+        except _IngestError as exc:
+            self._send_json(exc.status, exc.payload())
+            return
         except Exception as exc:  # noqa: BLE001 - never crash the server
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -1246,6 +2305,9 @@ class _Handler(BaseHTTPRequestHandler):
         except KeyError:
             self._send_json(400, {"ok": False, "error": "unknown session"})
             return
+        except _IngestError as exc:
+            self._send_json(exc.status, exc.payload())
+            return
         except Exception as exc:  # noqa: BLE001 - never crash the server
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -1268,6 +2330,9 @@ class _Handler(BaseHTTPRequestHandler):
             payload = ftp_load_earlier(session_id, spec.get("window_s"))
         except KeyError:
             self._send_json(400, {"ok": False, "error": "unknown session"})
+            return
+        except _IngestError as exc:
+            self._send_json(exc.status, exc.payload())
             return
         except Exception as exc:  # noqa: BLE001 - never crash the server
             self._send_json(400, {"ok": False, "error": str(exc)})
@@ -1308,6 +2373,26 @@ def make_server(host, port):
     return server
 
 
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="webui",
@@ -1316,6 +2401,45 @@ def build_parser():
                         help="bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765,
                         help="TCP port; 0 picks a free port (default: 8765)")
+    parser.add_argument("--max-log-mb", type=float,
+                        default=_env_float("HLDSMON_WEBUI_MAX_MB", 0.0),
+                        help="optional read valve in MiB; 0 = unlimited "
+                             "(default). When >0, oversized input is rejected "
+                             "with code log_too_large.")
+    parser.add_argument("--spool-dir",
+                        default=os.environ.get("HLDSMON_SPOOL_DIR") or None,
+                        help="disk-backed spool directory (default: "
+                             "<tempdir>/hldsmon-spool, tmpfs fallback "
+                             "<cwd>/.hldsmon-spool)")
+    parser.add_argument("--max-uploads", type=int,
+                        default=_env_int("HLDSMON_WEBUI_MAX_UPLOADS",
+                                         MAX_UPLOADS),
+                        help="max concurrent uploads/sessions (default: %d)"
+                             % MAX_UPLOADS)
+    parser.add_argument("--read-timeout", type=float,
+                        default=_env_float("HLDSMON_WEBUI_READ_TIMEOUT",
+                                           READ_TIMEOUT_S),
+                        help="socket/body read timeout in seconds "
+                             "(default: %g)" % READ_TIMEOUT_S)
+    parser.add_argument("--spool-session-mb", type=float,
+                        default=_env_float("HLDSMON_WEBUI_SPOOL_SESSION_MB",
+                                           SPOOL_SESSION_MB),
+                        help="per-session spool budget in MiB (default: %d)"
+                             % SPOOL_SESSION_MB)
+    parser.add_argument("--spool-total-mb", type=float,
+                        default=_env_float("HLDSMON_WEBUI_SPOOL_TOTAL_MB",
+                                           SPOOL_TOTAL_MB),
+                        help="process-wide spool budget in MiB (default: %d)"
+                             % SPOOL_TOTAL_MB)
+    parser.add_argument("--spool-ttl-sec", type=float,
+                        default=_env_float("HLDSMON_WEBUI_SPOOL_TTL_SEC",
+                                           SPOOL_TTL_S),
+                        help="spool handle TTL in seconds (default: %g)"
+                             % SPOOL_TTL_S)
+    parser.add_argument("--allow-nonloopback-unlimited",
+                        action="store_true",
+                        help="permit unlimited ingest on a non-loopback bind "
+                             "(otherwise rejected with 403)")
     parser.add_argument("--open", action="store_true", dest="open_browser",
                         help=argparse.SUPPRESS)
     parser.add_argument("--no-open", action="store_false", dest="open_browser",
@@ -1324,8 +2448,44 @@ def build_parser():
     return parser
 
 
+def configure(args):
+    """Apply parsed CLI/env knobs to the process-wide runtime config."""
+    mb = float(args.max_log_mb or 0.0)
+    _CONFIG.max_log_bytes = int(mb * _MIB) if mb > 0 else 0
+    _CONFIG.spool_dir = args.spool_dir
+    _CONFIG.allow_nonloopback_unlimited = bool(args.allow_nonloopback_unlimited)
+    _CONFIG.max_uploads = max(1, int(args.max_uploads or MAX_UPLOADS))
+    _CONFIG.read_timeout = float(args.read_timeout or READ_TIMEOUT_S)
+    _CONFIG.spool_session_bytes = max(
+        1, int((args.spool_session_mb or SPOOL_SESSION_MB) * _MIB))
+    _CONFIG.spool_total_bytes = max(
+        1, int((args.spool_total_mb or SPOOL_TOTAL_MB) * _MIB))
+    _CONFIG.spool_ttl = float(args.spool_ttl_sec or SPOOL_TTL_S)
+    _reset_upload_semaphore()
+    _reset_spool_budget()
+
+
+def warn_unlimited_nonloopback(host):
+    """Warn (once) when a non-loopback bind serves unlimited ingest."""
+    if _is_loopback(host):
+        return False
+    if _CONFIG.max_log_bytes > 0 or _CONFIG.allow_nonloopback_unlimited:
+        return False
+    sys.stderr.write(
+        "WARNING: non-loopback bind %r with unlimited ingest disabled: "
+        "uploads will be rejected (403 unlimited_nonloopback_disabled) until "
+        "--max-log-mb > 0 or --allow-nonloopback-unlimited is set.\n" % (host,))
+    return True
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    configure(args)
+    try:
+        spool_startup_cleanup()
+    except OSError:
+        pass
+    warn_unlimited_nonloopback(args.host)
     server = make_server(args.host, args.port)
     port = server.server_address[1]
     url = "http://%s:%d/" % (args.host, port)

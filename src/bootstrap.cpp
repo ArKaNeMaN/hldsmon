@@ -52,7 +52,7 @@ char s_val_client_ring[] = "300";
 char s_val_server_ring[] = "3600";
 char s_val_drop_window[] = "60";
 char s_val_dir[]         = "addons/hldsmon/logs";
-char s_val_max_mb[]      = "512";
+char s_val_max_mb[]      = "0";
 char s_val_ip_table[]    = "4096";
 char s_val_retention_days[] = "3";
 char s_val_modnet[]           = "0";
@@ -305,7 +305,7 @@ bool open_log() noexcept {
     }
     // Route the log file's raw fd to the crash handler before the first open.
     set_log_fd_observer(&platform_set_crash_log_fd);
-    c.log->set_max_mb(static_cast<uint64_t>(cvar_f(c.cvars.max_mb, 512.0f)));
+    c.log->set_max_mb(static_cast<uint64_t>(cvar_f(c.cvars.max_mb, 0.0f)));
     c.log->set_retention_days(static_cast<int>(cvar_f(c.cvars.retention_days, 3.0f)));
 
     const char* dir = "addons/hldsmon/logs";

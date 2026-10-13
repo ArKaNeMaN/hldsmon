@@ -565,6 +565,60 @@
     .panel-body { padding: var(--sp-4); }
     .brand-sub { display: none; }
   }
+
+  /* ------------------------------------------------------------------ */
+  /*  Stage 12 «large-logs» — compact «Период» (L7) + sticky toggle (L8)  */
+  /*  The whole sticky block must stay <= PERIOD_MAX_HEIGHT_PX (96px):     */
+  /*  one compact row = mini-timeline + from/to + presets + follow + the   */
+  /*  one global client picker + the sticky toggle.                        */
+  /* ------------------------------------------------------------------ */
+  .period-panel .panel-head { padding: 3px 12px; }
+  .period-panel .panel-head h2 { font-size: 13.5px; }
+  .period-panel .panel-body { padding: 6px 12px; }
+  .period-row {
+    display: flex; align-items: center; gap: var(--sp-2);
+    flex-wrap: nowrap; overflow-x: auto; overflow-y: visible;
+    /* L7: a visible horizontal scrollbar on a narrow viewport adds ~15px and
+       breaks the <= PERIOD_MAX_HEIGHT_PX (96px) budget. Keep the scroll (wheel/
+       trackpad/touch) but hide the bar so the block height stays constant. */
+    scrollbar-width: none; -ms-overflow-style: none;
+  }
+  .period-row::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  .period-row .field { flex: 0 0 auto; }
+  .period-row .field label { display: none; }
+  .period-row .period-tl { flex: 1 1 200px; min-width: 150px; }
+  .period-row .period-tl .period-timeline { margin-bottom: 0; }
+  .period-row .period-brush { height: 26px; }
+  .period-row .period-timeline-label { margin-top: 1px; font-size: 10.5px; line-height: 1.15; white-space: nowrap; }
+  .period-row .period-timeline-empty { padding: 0; font-size: 11px; }
+  .period-row .period-input {
+    min-width: 0; width: 148px; padding: 4px 7px; font-size: 12px; font-family: var(--mono);
+  }
+  .period-row select { min-width: 0; padding: 4px 7px; font-size: 12px; }
+  .period-row .period-preset, .period-row .period-follow { flex: 0 0 auto; }
+  .period-sticky-toggle {
+    display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+    font-size: 11.5px; color: var(--text-mut); cursor: pointer; user-select: none;
+  }
+  .period-sticky-toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
+  /* REQ-L8: the user can turn pinning off; applied without a reload */
+  .panel-sticky.no-sticky { position: static; }
+
+  /* FTP window bar (REQ-L6): window size + loaded-range/time + reached_start + cap_hit */
+  .ftp-window-bar { display: flex; align-items: center; gap: var(--sp-2) var(--sp-3); flex-wrap: wrap; margin-top: var(--sp-3); }
+  .ftp-window-bar select {
+    font: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--border-2);
+    border-radius: var(--r-sm); padding: 4px 7px;
+  }
+  .ftp-window-bar select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .ftp-range {
+    font-family: var(--mono); font-size: 12px; color: var(--text-mut);
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: 3px 9px; font-variant-numeric: tabular-nums;
+  }
+  .ftp-reached { font-size: 12px; color: var(--ok); }
+  .ftp-cap { font-size: 12px; color: var(--warn); }
 </style>
 </head>
 <body>
@@ -674,8 +728,8 @@
       </div>
       <div class="ftp-actions">
         <button class="btn primary" id="ftpConnect" type="button">Подключить</button>
-        <button class="btn" id="ftpRefresh" type="button" disabled>Обновить сейчас</button>
-        <button class="btn ghost" id="ftpLoadEarlier" type="button" disabled title="Подгрузить более старую часть файла">← загрузить раньше</button>
+        <button class="btn" id="ftpRefresh" type="button" disabled title="Загрузить новые данные (подтянуть хвост файла)">позже →</button>
+        <button class="btn ghost" id="ftpLoadEarlier" type="button" disabled title="Подгрузить более старую часть файла (предыдущее окно)">← раньше</button>
         <button class="btn ghost" id="ftpClose" type="button" disabled>Отключить</button>
         <label class="evt-toggle" title="Сохранять хост, логин, пароль и путь в localStorage браузера (локальный инструмент)"><input type="checkbox" id="ftpRemember" checked> сохранять креды</label>
         <div class="ftp-auto">
@@ -684,8 +738,23 @@
           <input type="number" id="ftpInterval" value="5" min="1" max="3600">
         </div>
       </div>
+      <div class="ftp-window-bar">
+        <label class="evt-toggle" title="Сколько данных загружать за одно окно (при подключении и на каждый шаг «раньше»)">размер окна
+          <select id="ftpWindowSize" aria-label="Размер окна загрузки">
+            <option value="300">5 мин</option>
+            <option value="900">15 мин</option>
+            <option value="1800" selected>30 мин</option>
+            <option value="3600">1 ч</option>
+            <option value="21600">6 ч</option>
+            <option value="86400">24 ч</option>
+          </select>
+        </label>
+        <span class="ftp-range" id="ftpRange" hidden></span>
+        <span class="ftp-reached" id="ftpReached" hidden></span>
+        <span class="ftp-cap" id="ftpCap" hidden></span>
+      </div>
       <div class="ftp-progress" id="ftpProgress" hidden>
-        <div class="ftp-progress-track"><div class="ftp-progress-fill" id="ftpProgressFill"></div></div>
+        <div class="ftp-progress-track" id="ftpProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Прогресс загрузки" aria-valuetext="ожидание"><div class="ftp-progress-fill" id="ftpProgressFill"></div></div>
         <div class="ftp-progress-label" id="ftpProgressLabel"></div>
       </div>
       <div id="ftpStatus" class="status info" role="status" aria-live="polite"></div>
@@ -785,7 +854,14 @@ function humanBytes(n) {
 const DEFAULT_COLLAPSED = { "p:Отключения (drops)": true, "p:Аномалии": true };
 const state = {
   files: [],        // File objects
-  body: null,       // raw concatenated JSONL text used for the last analyze
+  source: null,     // "local" | "ftp" | "demo" — where the current result came from
+  handle: null,     // server-side spool handle (windows / export / bundle source)
+  fileBlob: null,   // composite Blob of the selected files (direct upload, no JS string)
+  coarse: false,    // last /api/analyze response was a coarse whole-day overview
+  window: null,     // materialized window {from,to} echoed by the server
+  fullRange: null,  // whole-log {start,end}; survives window requests (brush domain)
+  sticky: true,     // REQ-L8: period panel pinned to the top (persisted)
+  analyzing: false, // an /api/analyze request is in flight
   result: null,     // last rendered result object
   view: null,       // period-filtered view derived from result
   demo: false,
@@ -1005,9 +1081,13 @@ function computeView(result) {
     start: sRange.start != null ? sRange.start : (active && isNum(from) ? from : null),
     end: sRange.end != null ? sRange.end : (active && isNum(to) ? to : null),
   };
-  // fullRange = the WHOLE log range from the unfiltered server series (brush domain).
+  // fullRange = the WHOLE-log range (brush domain). With the server-side
+  // period a windowed response only carries the window's series, so prefer the
+  // whole-range captured from the coarse overview (state.fullRange).
   const fullS = rangeOf(rawSeries.t || []);
-  const fullRange = { start: fullS.start, end: fullS.end };
+  const fullRange = (state.fullRange && isNum(state.fullRange.start))
+    ? state.fullRange
+    : { start: fullS.start, end: fullS.end };
   let clientSamples = 0;
   Object.keys(clientSeries).forEach(id => { clientSamples += (clientSeries[id].t || []).length; });
 
@@ -1115,12 +1195,14 @@ function addFiles(fileList) {
   }
   if (accepted.length) {
     state.files = state.files.concat(accepted);
+    state.fileBlob = null;   // file set changed -> rebuild the composite upload Blob
     renderFileList();
     setStatus("Выбрано файлов: " + state.files.length + ". Нажмите «Анализ».", "info");
   }
 }
 function removeFile(idx) {
   state.files.splice(idx, 1);
+  state.fileBlob = null;
   renderFileList();
   setStatus(state.files.length ? "Выбрано файлов: " + state.files.length + "." : "Файлы не выбраны.", "info");
 }
@@ -1150,61 +1232,117 @@ function renderFileList() {
 /* =====================================================================
    API calls
    ===================================================================== */
-async function readAllFiles(files) {
-  const texts = [];
-  for (const f of files) texts.push(await f.text());
-  // concat with a trailing "\n" between files
-  return texts.map(t => t.replace(/\r\n/g, "\n").replace(/\n+$/, "")).join("\n") + "\n";
+/* Build the composite upload body straight from the selected File objects.
+   No whole-file JS string is ever built: the browser streams the Blob to the
+   server, which spools it to disk. Order is preserved and matches the `files=`
+   query order exactly. BOM and CRLF are handled on the ingest/server side
+   (hldsmon.iter_records strips), so no client-side normalisation is needed. */
+function buildUploadBlob(files) {
+  return new Blob(files, { type: "text/plain;charset=utf-8" });
 }
 
-async function fetchAnalyze() {
+/* Map an error response (JSON `{code,limit_bytes}` or bare HTTP status) to an
+   actionable Russian message. `log_too_large` only ever arrives when the reader
+   valve is on — by default the server has no size cap. */
+function httpErrorText(status, data) {
+  const code = data && data.code;
+  const limit = data && isNum(data.limit_bytes) ? data.limit_bytes : null;
+  if (code === "log_too_large") return "Файл превышает лимит клапана чтения" + (limit != null ? " (" + humanBytes(limit) + ")" : "") + ".";
+  if (code === "session_expired") return "Сессия истекла — загрузите файл заново.";
+  if (code === "unlimited_nonloopback_disabled") return "Безлимитный приём запрещён на не-loopback — запустите сервер с --allow-nonloopback-unlimited.";
+  if (code === "request_timeout") return "Таймаут чтения запроса (408).";
+  if (code === "busy") return "Сервер занят (лимит одновременных загрузок) — повторите позже (429).";
+  if (code === "spool_full") return "На сервере закончилось место под spool (507).";
+  if (code === "length_required") return "Серверу нужен заголовок Content-Length (411).";
+  if (status === 413) return "Файл слишком большой (413)" + (limit != null ? ": лимит " + humanBytes(limit) : "") + ".";
+  if (status === 411) return "Серверу нужен Content-Length (411).";
+  if (status === 403) return "Доступ запрещён (403).";
+  if (status === 408) return "Таймаут запроса (408).";
+  if (status === 429) return "Слишком много запросов (429).";
+  if (status === 507) return "Недостаточно места на сервере (507).";
+  if (status === 410) return "Сессия истекла (410).";
+  if (data && data.error) return data.error;
+  return "HTTP " + status;
+}
+async function readJsonOrThrow(res) {
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (res.ok && data && data.ok === true) return data;
+  throw new Error(httpErrorText(res.status, data));
+}
+
+/* fetchAnalyze: direct Blob upload + SERVER-SIDE period (stage 12).
+   - no from/to -> coarse whole-day overview + handle (downsampled series)
+   - from/to   -> materialized full-resolution window (coarse=false)
+   The period is chosen BEFORE the request; local results are never filtered
+   from a full-resolution payload client-side. `reset` starts a fresh upload. */
+async function fetchAnalyze(opts) {
+  opts = opts || {};
   if (!state.files.length) { setStatus("Сначала выберите файлы.", "error"); return; }
+  if (state.analyzing) return;
+  if (opts.reset) { state.period = { from: null, to: null }; }
+  const from = (opts.from !== undefined) ? opts.from : state.period.from;
+  const to = (opts.to !== undefined) ? opts.to : state.period.to;
+  state.analyzing = true;
   setLoading(true);
-  setStatus("Чтение файлов и анализ…", "info");
+  setStatus((isNum(from) || isNum(to)) ? "Запрос окна…" : "Загрузка и анализ (обзор дня)…", "info");
   try {
-    const body = await readAllFiles(state.files);
+    const blob = state.fileBlob || buildUploadBlob(state.files);
+    state.fileBlob = blob;
     const names = state.files.map(f => f.name);
-    const url = "/api/analyze?files=" + names.map(encodeURIComponent).join(",");
-    const res = await fetch(url, {
+    const q = new URLSearchParams();
+    q.set("files", names.join(","));
+    if (isNum(from)) q.set("from", String(from));
+    if (isNum(to)) q.set("to", String(to));
+    const res = await fetch("/api/analyze?" + q.toString(), {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: body,
+      body: blob,
     });
-    let data;
-    try { data = await res.json(); }
-    catch (e) { throw new Error("Некорректный ответ сервера (не JSON)."); }
-    if (!res.ok || !data || data.ok !== true) {
-      throw new Error((data && data.error) ? data.error : ("HTTP " + res.status));
-    }
+    const data = await readJsonOrThrow(res);
     revokeUrls();
-    state.body = body;
+    state.source = "local";
     state.demo = false;
-    state.period = { from: null, to: null };
-    state.selectedClient = null;
+    state.handle = data.handle || null;
+    state.coarse = data.coarse === true;
+    state.window = data.window || null;
+    state.period = { from: isNum(from) ? from : null, to: isNum(to) ? to : null };
+    const p = data.digest && data.digest.period;
+    if (p && isNum(p.start)) state.fullRange = { start: p.start, end: isNum(p.end) ? p.end : null };
+    if (opts.reset) state.selectedClient = null;
     render(data);
-    setStatus("Готово: " + fmtInt(data.records_count) + " записей из " + names.length + " файл(ов).", "ok");
+    const mode = state.coarse
+      ? "обзор дня"
+      : ("окно " + fmtInt(data.window_count) + " записей");
+    setStatus("Готово: " + fmtInt(data.records_count) + " записей из " + names.length + " файл(ов) · " + mode + ".", "ok");
   } catch (err) {
-    setStatus("Ошибка анализа: " + (err && err.message ? err.message : String(err)), "error");
-    toast("Ошибка анализа: " + (err && err.message ? err.message : String(err)), "error");
+    const msg = (err && err.message ? err.message : String(err));
+    setStatus("Ошибка анализа: " + msg, "error");
+    toast("Ошибка анализа: " + msg, "error");
   } finally {
+    state.analyzing = false;
     setLoading(false);
   }
 }
 
 async function downloadCsv(type) {
-  if (state.demo || !state.body) {
+  if (state.demo || !state.handle) {
     toast("Экспорт CSV доступен только при работе с сервером.", "error");
     return;
   }
   const label = type ? type : "все";
   try {
-    const url = "/api/export" + (type ? ("?type=" + encodeURIComponent(type)) : "");
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: state.body,
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    const q = new URLSearchParams();
+    q.set("handle", state.handle);
+    if (type) q.set("type", type);
+    if (isNum(state.period.from)) q.set("from", String(state.period.from));
+    if (isNum(state.period.to)) q.set("to", String(state.period.to));
+    const res = await fetch("/api/export?" + q.toString(), { method: "POST" });
+    if (!res.ok) {
+      let data = null; try { data = await res.json(); } catch (e) { data = null; }
+      if (data && data.code === "session_expired") { state.handle = null; setExportEnabled(false); }
+      throw new Error(httpErrorText(res.status, data));
+    }
     const blob = await res.blob();
     const objUrl = URL.createObjectURL(blob);
     state.urls.push(objUrl);
@@ -1221,34 +1359,40 @@ async function downloadCsv(type) {
   }
 }
 
-/* Download the incident JSON envelope for one drop (server-side /api/bundle). */
+/* Download the incident JSON envelope for one drop (server-side /api/bundle).
+   Addressed by the stable drop key {run,t,userid} + the spool handle (no body). */
 async function downloadBundle(drop, mins) {
-  if (state.demo || !state.body) {
+  if (state.demo || !state.handle) {
     toast("Bundle доступен только при работе с сервером.", "error");
     return;
   }
-  const all = (state.result && Array.isArray(state.result.drops)) ? state.result.drops : [];
-  const idx = drop ? all.indexOf(drop) : -1;
-  if (idx < 0) { toast("Drop не найден в полном списке.", "error"); return; }
+  if (!drop) { toast("Drop не найден.", "error"); return; }
+  const key = drop.key || {};
+  const run = isNum(key.run) ? key.run : (isNum(drop.run) ? drop.run : null);
+  const t = isNum(key.t) ? key.t : (isNum(drop.t) ? drop.t : null);
+  const userid = isNum(key.userid) ? key.userid : (isNum(drop.userid) ? drop.userid : null);
+  if (run == null || t == null) {
+    toast("У drop нет стабильного ключа (run,t) для адресации — bundle недоступен.", "error");
+    return;
+  }
   const m = (typeof mins === "number" && isFinite(mins) && mins >= 0) ? mins : 2;
   try {
-    const url = "/api/bundle?drop=" + idx + "&mins=" + encodeURIComponent(m);
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: state.body,
-    });
+    const q = new URLSearchParams();
+    q.set("handle", state.handle);
+    q.set("run", String(run));
+    q.set("t", String(t));
+    if (userid != null) q.set("userid", String(userid));
+    q.set("mins", String(m));
+    const res = await fetch("/api/bundle?" + q.toString(), { method: "POST" });
     if (!res.ok) {
-      let msg = "HTTP " + res.status;
-      try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) { /* not JSON */ }
-      throw new Error(msg);
+      let data = null; try { data = await res.json(); } catch (e) { data = null; }
+      if (data && data.code === "session_expired") { state.handle = null; setExportEnabled(false); }
+      throw new Error(httpErrorText(res.status, data));
     }
     const blob = await res.blob();
     const objUrl = URL.createObjectURL(blob);
     state.urls.push(objUrl);
-    const stamp = (drop && isNum(drop.t))
-      ? new Date(drop.t * 1000).toISOString().replace(/[:.]/g, "-")
-      : String(idx);
+    const stamp = new Date(t * 1000).toISOString().replace(/[:.]/g, "-");
     const a = el("a");
     a.href = objUrl;
     a.download = "hldsmon_bundle_" + stamp + ".json";
@@ -1256,7 +1400,7 @@ async function downloadBundle(drop, mins) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
-    toast("Bundle drop #" + idx + " скачан", "ok");
+    toast("Bundle (run=" + run + ", t=" + fmtClock(t) + ") скачан", "ok");
   } catch (err) {
     toast("Ошибка bundle: " + (err && err.message ? err.message : String(err)), "error");
   }
@@ -1302,13 +1446,20 @@ function ftpProgressLabel(text) {
 function ftpSetProgress(pct, done, total) {
   const box = $("#ftpProgress");
   const fill = $("#ftpProgressFill");
+  const track = $("#ftpProgressTrack");
   if (!box || !fill) return;
   if (pct == null || !isFinite(pct)) {
     box.classList.add("indeterminate");
+    if (track) { track.removeAttribute("aria-valuenow"); track.setAttribute("aria-valuetext", "идёт загрузка"); }
     return;
   }
   box.classList.remove("indeterminate", "analyzing");
-  fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  const clamped = Math.max(0, Math.min(100, pct));
+  fill.style.width = clamped + "%";
+  if (track) {
+    track.setAttribute("aria-valuenow", String(Math.round(clamped)));
+    track.setAttribute("aria-valuetext", Math.round(clamped) + "%");
+  }
   if (done != null && total != null && total > 0) {
     ftpProgressLabel("Загрузка: " + pct.toFixed(0) + "% · " + humanBytes(done) + " / " + humanBytes(total));
   } else if (done != null) {
@@ -1319,6 +1470,8 @@ function ftpSetProgress(pct, done, total) {
 function ftpProgressAnalyzing() {
   const box = $("#ftpProgress");
   if (box) { box.hidden = false; box.classList.add("indeterminate", "analyzing"); }
+  const track = $("#ftpProgressTrack");
+  if (track) { track.removeAttribute("aria-valuenow"); track.setAttribute("aria-valuetext", "разбор данных"); }
   ftpProgressLabel("Разбор данных…");
 }
 
@@ -1355,6 +1508,7 @@ function ftpFormSpec() {
     password: $("#ftpPassword").value,
     path: $("#ftpPath").value.trim(),
     tls: $("#ftpTls").checked,
+    window_s: selectedFtpWindow(),
   };
 }
 
@@ -1372,6 +1526,51 @@ function ftpWindowSuffix(f) {
   }
   if (f.reached_start) s += " (достигнуто начало файла)";
   return s;
+}
+
+/* FTP loaded-range indicator (REQ-L6): time range + remote byte range,
+   `reached_start`, and `cap_hit` (only ever set when the reader valve is on). */
+function ftpUpdateRange(f) {
+  f = f || {};
+  const range = $("#ftpRange");
+  if (range) {
+    if (isNum(f.start_t) && isNum(f.end_t)) {
+      let txt = fmtIso(f.start_t) + " → " + fmtIso(f.end_t);
+      if (isNum(f.start) && isNum(f.end)) txt += " · байты [" + fmtInt(f.start) + ", " + fmtInt(f.end) + "]";
+      else if (isNum(f.bytes)) txt += " · " + humanBytes(f.bytes);
+      range.hidden = false;
+      range.textContent = txt;
+      range.title = "Загруженный диапазон удалённого файла";
+    } else {
+      range.hidden = true;
+    }
+  }
+  const reached = $("#ftpReached");
+  if (reached) {
+    if (f.reached_start) { reached.hidden = false; reached.textContent = "✓ достигнуто начало файла"; }
+    else reached.hidden = true;
+  }
+  const cap = $("#ftpCap");
+  if (cap) {
+    if (f.cap_hit) {
+      cap.hidden = false;
+      cap.textContent = "⚠ упор в клапан" + (isNum(f.limit_bytes) ? " (" + humanBytes(f.limit_bytes) + ")" : "");
+      cap.title = "Клапан чтения включён — загружена только часть файла (без тихой обрезки)";
+    } else {
+      cap.hidden = true;
+    }
+  }
+}
+
+function ftpHideRange() {
+  ["#ftpRange", "#ftpReached", "#ftpCap"].forEach(sel => { const n = $(sel); if (n) n.hidden = true; });
+}
+
+/* The explicit FTP window size (REQ-L6 presets; default 30 min). */
+function selectedFtpWindow() {
+  const s = $("#ftpWindowSize");
+  const v = s ? parseInt(s.value, 10) : NaN;
+  return (isNum(v) && v > 0) ? v : 1800;
 }
 
 const FTP_PREFS_KEY = "hldsmon.ftp.v1";
@@ -1474,6 +1673,35 @@ function datasetsSave() {
   } catch (e) { /* storage may be unavailable */ }
 }
 
+/* ---------- sticky «Период» persistence (REQ-L8; survives reload) ---------- */
+const STICKY_KEY = "hldsmon.ui.sticky.v1";
+/* compact «Период» target height in px (QAS-L17; asserted by the page selfTest) */
+const PERIOD_MAX_HEIGHT_PX = 96;
+
+function stickyLoad() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  let v = null;
+  try { v = store.getItem(STICKY_KEY); } catch (e) { v = null; }
+  if (v === "0") state.sticky = false;
+  else if (v === "1") state.sticky = true;
+}
+
+function stickySave() {
+  const store = ftpPrefsStore();
+  if (!store) return;
+  try { store.setItem(STICKY_KEY, state.sticky ? "1" : "0"); }
+  catch (e) { /* storage may be unavailable */ }
+}
+
+/* applySticky: flip the pinning immediately (no reload) and persist the choice. */
+function applySticky(on) {
+  state.sticky = !!on;
+  const p = $("#periodPanel") || document.querySelector(".panel-sticky");
+  if (p) p.classList.toggle("no-sticky", !state.sticky);
+  stickySave();
+}
+
 async function ftpPost(url, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -1525,9 +1753,14 @@ async function ftpConnect() {
     if (!$("#ftpRemember") || !$("#ftpRemember").checked) $("#ftpPassword").value = "";
     ftpSavePrefs();
     state.demo = false;
-    state.body = null;
+    state.source = "ftp";
+    state.handle = data.handle || null;   // FTP export/bundle becomes available via the handle
+    state.coarse = false;
+    state.window = null;
+    state.fullRange = null;
     state.period = { from: null, to: null };
     state.selectedClient = null;
+    ftpUpdateRange(data.ftp);
     render(data);
     setFtpStatus("Подключено: " + ftp.path + " · " + fmtInt(data.ftp.records) +
       " записей (" + humanBytes(data.ftp.bytes) + ")" + ftpLogEndSuffix() +
@@ -1562,9 +1795,12 @@ async function ftpRefresh(manual) {
   try {
     const data = await ftpPost("/api/ftp/refresh", { session: ftp.session });
     ftp.lastError = null;
+    state.source = "ftp";
+    if (data.handle) state.handle = data.handle;
     render(data);
     const f = data.ftp || {};
     ftp.reachedStart = !!(f && f.reached_start);
+    ftpUpdateRange(f);
     const now = new Date().toISOString().slice(11, 19);
     setFtpStatus("Обновлено " + now + " UTC · +" + humanBytes(f.new_bytes) +
       " / +" + fmtInt(f.new_records) + " записей · всего " + fmtInt(f.records) +
@@ -1595,11 +1831,14 @@ async function ftpLoadEarlier() {
   setFtpControls();
   ftpProgressStart(ftp.session, "Загрузка старее…");
   try {
-    const data = await ftpPost("/api/ftp/load-earlier", { session: ftp.session });
+    const data = await ftpPost("/api/ftp/load-earlier", { session: ftp.session, window_s: selectedFtpWindow() });
     ftp.lastError = null;
+    state.source = "ftp";
+    if (data.handle) state.handle = data.handle;
     render(data);
     const f = data.ftp || {};
     ftp.reachedStart = !!f.reached_start;
+    ftpUpdateRange(f);
     setFtpStatus("Догружено старее: +" + fmtInt(f.older_records) + " записей (" +
       humanBytes(f.older_bytes) + ") · с " + fmtIso(f.start_t) + ftpWindowSuffix(f), "ok");
   } catch (err) {
@@ -1633,6 +1872,7 @@ function ftpDisconnect() {
   ftp.session = null;
   ftp.reachedStart = false;
   $("#ftpPassword").value = "";
+  ftpHideRange();
   setFtpControls();
   setFtpStatus("FTP-источник отключён.", "info");
   if (sid) ftpSendClose(sid);
@@ -1795,31 +2035,34 @@ function buildGlobalClientPicker(view) {
   return picker;
 }
 
-/* ----- period selector ----- */
+/* ----- period selector (compact single row; target <= PERIOD_MAX_HEIGHT_PX) ----- */
 function buildPeriodPanel(result) {
   const view = state.view || computeView(result);
-  const d = (result && result.digest) || {};
-  const p = d.period || {};
-  const controls = el("div", "controls");
 
-  const fromField = el("div", "field");
-  fromField.appendChild(el("label", null, "С (ISO или epoch)"));
-  const fromInput = el("input");
+  const fromInput = el("input", "period-input");
   fromInput.type = "text"; fromInput.id = "periodFrom";
-  fromInput.placeholder = "2024-04-05 06:07:58 / 1712297278";
+  fromInput.setAttribute("aria-label", "Начало периода (ISO или epoch)");
+  fromInput.placeholder = "от: ISO / epoch";
   fromInput.value = state.period.from != null ? fmtIso(state.period.from) : "";
-  fromField.appendChild(fromInput);
 
-  const toField = el("div", "field");
-  toField.appendChild(el("label", null, "По (ISO или epoch)"));
-  const toInput = el("input");
+  const toInput = el("input", "period-input");
   toInput.type = "text"; toInput.id = "periodTo";
-  toInput.placeholder = "2024-04-05 06:08:58 / 1712297338";
+  toInput.setAttribute("aria-label", "Конец периода (ISO или epoch)");
+  toInput.placeholder = "по: ISO / epoch";
   toInput.value = state.period.to != null ? fmtIso(state.period.to) : "";
-  toField.appendChild(toInput);
 
-  controls.appendChild(fromField);
-  controls.appendChild(toField);
+  const row = el("div", "controls period-row");
+
+  // draggable mini-timeline (compact) — still the primary period control
+  const tl = el("div", "period-tl");
+  tl.appendChild(buildPeriodTimeline(view, {
+    onLive: (from, to) => { fromInput.value = fmtIso(from); toInput.value = fmtIso(to); },
+    onCommit: (from, to) => applyPeriodValues(from, to),
+  }));
+  row.appendChild(tl);
+
+  row.appendChild(fromInput);
+  row.appendChild(toInput);
 
   const applyBtn = el("button", "btn primary sm", "Применить");
   applyBtn.type = "button";
@@ -1827,78 +2070,70 @@ function buildPeriodPanel(result) {
   resetBtn.type = "button";
   applyBtn.addEventListener("click", () => applyPeriod(fromInput.value, toInput.value));
   resetBtn.addEventListener("click", () => applyPeriodValues(null, null));
-  controls.appendChild(applyBtn);
-  controls.appendChild(resetBtn);
-  controls.appendChild(buildPeriodPresets(view));
-  controls.appendChild(buildPeriodFollow(view));
+  row.appendChild(applyBtn);
+  row.appendChild(resetBtn);
+  row.appendChild(buildPeriodPresets(view));
+  row.appendChild(buildPeriodFollow(view));
 
-  // the ONE global client selector, grouped with the timeline/presets and kept visible
+  // the ONE global client selector, kept visible in the sticky row
   const clientField = el("div", "field");
   clientField.appendChild(el("label", null, "Клиент"));
   clientField.appendChild(buildGlobalClientPicker(view));
-  controls.appendChild(clientField);
+  row.appendChild(clientField);
 
-  const frag = document.createDocumentFragment();
+  // REQ-L8: user-controlled pinning, persisted in localStorage, applied live
+  const stickyLabel = el("label", "period-sticky-toggle");
+  stickyLabel.title = "Закрепить блок «Период» при прокрутке (состояние сохраняется)";
+  const stickyCb = el("input");
+  stickyCb.type = "checkbox"; stickyCb.id = "periodSticky";
+  stickyCb.checked = state.sticky;
+  stickyCb.setAttribute("aria-label", "Закрепить блок периода");
+  stickyCb.addEventListener("change", () => applySticky(stickyCb.checked));
+  stickyLabel.appendChild(stickyCb);
+  stickyLabel.appendChild(el("span", null, "закрепить"));
+  row.appendChild(stickyLabel);
 
-  // draggable mini-timeline above the manual inputs
-  frag.appendChild(buildPeriodTimeline(view, {
-    onLive: (from, to) => { fromInput.value = fmtIso(from); toInput.value = fmtIso(to); },
-    onCommit: (from, to) => applyPeriodValues(from, to),
-  }));
-  frag.appendChild(controls);
-
-  const hint = el("div", "period-hint" + (state.period.from != null || state.period.to != null ? " active" : ""));
-  if (state.period.from != null || state.period.to != null) {
-    hint.textContent = "Активен фильтр по периоду: " +
-      (state.period.from != null ? fmtIso(state.period.from) : "начало") + " → " +
-      (state.period.to != null ? fmtIso(state.period.to) : "конец");
-  } else if (isNum(p.start) && isNum(p.end)) {
-    hint.textContent = "Полный диапазон данных: " + fmtIso(p.start) + " → " + fmtIso(p.end) +
-      "  ·  пустые поля = без фильтра";
-  } else {
-    hint.textContent = "Введите границы (ISO или epoch) и нажмите «Применить». Пустые поля = без фильтра.";
-  }
-  frag.appendChild(hint);
-
-  const panelEl = panel("Период", state.period.from != null || state.period.to != null ? "фильтр активен" : "полный диапазон", frag);
-  panelEl.classList.add("panel-sticky");
+  const pill = (state.period.from != null || state.period.to != null) ? "фильтр активен" : "полный диапазон";
+  const panelEl = panel("Период", pill, row);
+  panelEl.id = "periodPanel";
+  panelEl.classList.add("panel-sticky", "period-panel");
+  if (!state.sticky) panelEl.classList.add("no-sticky");
   return panelEl;
 }
 
-/* buildPeriodPresets: quick period buttons next to the inputs (disabled when the log is shorter). */
+/* buildPeriodPresets: compact preset menu (REQ-L7 «пресеты одной линией/меню»).
+   An option shorter than the log picks `[fullEnd-secs, end]` (follow); an empty
+   value resets to the whole log (server-side coarse overview for local files). */
 function buildPeriodPresets(view) {
-  const wrap = el("div", "period-presets");
-  wrap.appendChild(el("span", "period-presets-label", "Быстро:"));
+  const sel = el("select", "period-preset");
+  sel.id = "periodPreset";
+  sel.title = "Быстрый выбор периода";
+  sel.setAttribute("aria-label", "Быстрый выбор периода");
+  sel.appendChild(new Option("Период ▾", ""));
   const fr = (view && view.fullRange) || {};
   const fullStart = isNum(fr.start) ? fr.start : null;
   const fullEnd = isNum(fr.end) ? fr.end : null;
   const dur = (fullStart != null && fullEnd != null) ? (fullEnd - fullStart) : null;
   const defs = [
-    { label: "Весь лог", secs: null },
-    { label: "5 мин", secs: 300 },
-    { label: "30 мин", secs: 1800 },
-    { label: "1 ч", secs: 3600 },
+    { label: "+5 мин", secs: 300 },
+    { label: "+30 мин", secs: 1800 },
+    { label: "+1 ч", secs: 3600 },
+    { label: "+6 ч", secs: 21600 },
+    { label: "+24 ч", secs: 86400 },
   ];
   for (const def of defs) {
-    const b = el("button", "btn ghost sm", def.label);
-    b.type = "button";
-    let from = null, to = null, ok = true;
-    if (def.secs == null) {
-      if (dur == null || dur <= 0) ok = false;   // no data -> whole-log preset is a no-op
-    } else if (dur == null || dur < def.secs) {
-      ok = false;                                // log shorter than the preset window
-    } else {
-      from = fullEnd - def.secs; to = null;      // follow: the end rolls with new data
-    }
-    if (!ok) {
-      b.disabled = true;
-      b.title = "Лог короче, чем " + def.label;
-    } else {
-      b.addEventListener("click", () => applyPeriodValues(from, to));
-    }
-    wrap.appendChild(b);
+    const o = new Option(def.label, String(def.secs));
+    if (dur == null || dur < def.secs) { o.disabled = true; o.text = def.label + " (лог короче)"; }
+    sel.appendChild(o);
   }
-  return wrap;
+  sel.value = "";
+  sel.addEventListener("change", () => {
+    const secs = parseInt(sel.value, 10);
+    if (!sel.value || !isNum(secs)) applyPeriodValues(null, null);
+    else if (fullEnd != null) applyPeriodValues(fullEnd - secs, null);
+    sel.value = "";
+  });
+  return sel;
 }
 
 /* buildPeriodFollow: «Слежение» — pin the right edge to the newest sample.
@@ -2103,9 +2338,13 @@ function applyPeriod(fromStr, toStr) {
   applyPeriodValues(from, to);
 }
 
-/* applyPeriodValues: the single funnel used by «Применить», the presets and the brush. */
+/* applyPeriodValues: the single funnel used by «Применить», the presets and the brush.
+   For local uploads the period is SERVER-side: re-request the window (the file is
+   streamed again as a Blob, never re-read into a JS string). FTP/demo keep
+   client-side filtering of the already-loaded data. */
 function applyPeriodValues(from, to) {
   state.period = { from: from, to: to };
+  if (state.source === "local") { fetchAnalyze({ from: from, to: to, reset: false }); return; }
   render(state.result);
 }
 
@@ -2227,16 +2466,22 @@ function focusOnPoint(fp) {
   if (fp.player) state.selectedClient = "player:" + fp.player;
   else if (fp.session != null) state.selectedClient = String(fp.session);
   else state.selectedClient = null;
-  state.period = {
-    from: isNum(fp.start_t) ? fp.start_t - 10 : null,
-    to: isNum(fp.end_t) ? fp.end_t + 10 : null,
-  };
-  render(state.result);
-  const panelEl = $("#allDatasetsPanel");
-  if (panelEl) {
+  const from = isNum(fp.start_t) ? fp.start_t - 10 : null;
+  const to = isNum(fp.end_t) ? fp.end_t + 10 : null;
+  state.period = { from: from, to: to };
+  const flash = () => {
+    const panelEl = $("#allDatasetsPanel");
+    if (!panelEl) return;
     if (panelEl.scrollIntoView) panelEl.scrollIntoView({ behavior: "smooth", block: "start" });
     panelEl.classList.add("flash");
     setTimeout(() => panelEl.classList.remove("flash"), 1600);
+  };
+  if (state.source === "local") {
+    // server-side period: materialize the ±10s window, then flash the chart
+    fetchAnalyze({ from: from, to: to, reset: false }).then(flash, flash);
+  } else {
+    render(state.result);
+    flash();
   }
 }
 function buildFocusPanel(view, result) {
@@ -3689,7 +3934,7 @@ function render(result) {
   const bundleBtn = el("button", "btn sm ghost", "bundle");
   bundleBtn.type = "button";
   bundleBtn.title = "Скачать JSON-конверт инцидента (окно ±N мин) для последнего drop в периоде";
-  bundleBtn.disabled = state.demo || !state.body;
+  bundleBtn.disabled = state.demo || !state.handle;
   bundleBtn.addEventListener("click", () => {
     const drops = (view && Array.isArray(view.drops)) ? view.drops : [];
     if (!drops.length) { toast("Нет drop в выбранном периоде.", "error"); return; }
@@ -3705,7 +3950,7 @@ function render(result) {
   results.appendChild(panel("Аномалии", null, buildAnomalies(result.anomalies)));
 
   setModeBadge(!!state.demo);
-  setExportEnabled(!state.demo && !!state.body);
+  setExportEnabled(!state.demo && !!state.handle);
   $("#btnClear").hidden = false;
   syncTopbarHeight();
 
@@ -4016,6 +4261,8 @@ function init() {
   state.collapsed = Object.assign({}, DEFAULT_COLLAPSED, collapsedLoad() || {});
   // Restore persisted combined-panel dataset settings (selection / normalize / events / per-player metrics).
   datasetsLoad();
+  // Restore the sticky «Период» choice (REQ-L8) before the first render.
+  stickyLoad();
 
   renderFileList();
 
@@ -4047,10 +4294,15 @@ function init() {
     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
   });
 
-  $("#btnAnalyze").addEventListener("click", fetchAnalyze);
+  $("#btnAnalyze").addEventListener("click", () => fetchAnalyze({ reset: true }));
   $("#btnDemo").addEventListener("click", () => {
     revokeUrls();
-    state.body = null;
+    state.source = "demo";
+    state.handle = null;
+    state.fileBlob = null;
+    state.coarse = false;
+    state.window = null;
+    state.fullRange = null;
     state.demo = true;
     state.period = { from: null, to: null };
     state.selectedClient = null;
@@ -4059,7 +4311,9 @@ function init() {
   });
   $("#btnClear").addEventListener("click", () => {
     revokeUrls();
-    state.result = null; state.body = null; state.demo = false;
+    state.result = null; state.source = null; state.handle = null; state.fileBlob = null;
+    state.coarse = false; state.window = null; state.fullRange = null;
+    state.demo = false;
     state.view = null; state.period = { from: null, to: null };
     state.selectedClient = null;
     refreshAllPanelUI = null;
@@ -4173,6 +4427,64 @@ function selfTest() {
     ["focus-panel", () => buildFocusPanel(view, demo)],
     ["clients", () => buildClientsTable(view.clients)],
     ["ftp-panel", () => { const p = $("#ftpPanel"); if (!p) throw new Error("нет #ftpPanel"); return p; }],
+    /* ---- Stage 12 UI QAS (L16/L17/L18) — browser-only, outside `make test` ---- */
+    ["L16-ftp-window-controls", () => {
+      const size = $("#ftpWindowSize");
+      if (!size) throw new Error("нет #ftpWindowSize");
+      const vals = Array.from(size.options).map(o => o.value);
+      for (const v of ["300", "900", "1800", "3600", "21600", "86400"]) {
+        if (vals.indexOf(v) === -1) throw new Error("нет пресета окна " + v + " с");
+      }
+      const track = document.querySelector("#ftpProgressTrack");
+      if (!track || track.getAttribute("role") !== "progressbar") throw new Error("нет роли progressbar у прогресс-бара");
+      for (const id of ["ftpRange", "ftpReached", "ftpCap", "ftpLoadEarlier", "ftpRefresh"]) {
+        if (!document.getElementById(id)) throw new Error("нет #" + id);
+      }
+      return size;
+    }],
+    ["L17-period-compact", () => {
+      const node = buildPeriodPanel(demo);
+      const holder = el("div");
+      holder.style.position = "absolute";
+      holder.style.left = "-10000px";
+      holder.style.top = "0";
+      holder.style.width = "1220px";
+      holder.style.visibility = "hidden";
+      holder.appendChild(node);
+      document.body.appendChild(holder);
+      const h = node.offsetHeight;
+      holder.remove();
+      if (!(h > 0 && h <= PERIOD_MAX_HEIGHT_PX)) {
+        throw new Error("высота блока «Период» " + h + "px > " + PERIOD_MAX_HEIGHT_PX + "px");
+      }
+      return node;
+    }],
+    ["L18-sticky-persist", () => {
+      const store = ftpPrefsStore();
+      if (!store) throw new Error("localStorage недоступен");
+      if (typeof STICKY_KEY !== "string" || STICKY_KEY.indexOf("hldsmon.ui.") !== 0) {
+        throw new Error("неверный ключ sticky: " + STICKY_KEY);
+      }
+      const raw = store.getItem(STICKY_KEY);
+      const prev = state.sticky;
+      try {
+        store.setItem(STICKY_KEY, "0"); state.sticky = true; stickyLoad();
+        if (state.sticky !== false) throw new Error("sticky=false не восстановлен из localStorage");
+        store.setItem(STICKY_KEY, "1"); state.sticky = false; stickyLoad();
+        if (state.sticky !== true) throw new Error("sticky=true не восстановлен из localStorage");
+      } finally {
+        if (raw == null) store.removeItem(STICKY_KEY); else store.setItem(STICKY_KEY, raw);
+      }
+      // the built panel reflects the off state and carries the toggle
+      state.sticky = false;
+      const node = buildPeriodPanel(demo);
+      const cb = node.querySelector("#periodSticky");
+      const ok = node.classList.contains("no-sticky") && !!cb && cb.checked === false;
+      state.sticky = prev;
+      if (raw == null) store.removeItem(STICKY_KEY); else store.setItem(STICKY_KEY, raw);
+      if (!ok) throw new Error("блок «Период» не отражает sticky-выключение");
+      return node;
+    }],
   ];
   const resultsList = [];
   let failed = 0;
@@ -4195,7 +4507,7 @@ function selfTest() {
 
 document.addEventListener("DOMContentLoaded", init);
 // expose for manual console verification
-window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime };
+window.__hldsmon = { makeDemo, render, buildCharts, buildClientCharts, computeView, selectClient, selfTest, state, ftp, buildDropsChart, buildAllChart, buildAllPanel, buildConfigPanel, buildPlayerGroups, buildFocusPanel, focusOnPoint, selectedPlayer, syncClientPickers, downloadBundle, alignHostToServerTime, fetchAnalyze, buildUploadBlob, buildPeriodPanel, buildPeriodPresets, applySticky, ftpUpdateRange, STICKY_KEY, PERIOD_MAX_HEIGHT_PX };
 </script>
 </body>
 </html>

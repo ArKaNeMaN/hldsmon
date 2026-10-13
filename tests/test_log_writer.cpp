@@ -206,6 +206,40 @@ void test_size_cap()
     check(w.error_count() == 0, "no spurious errors on clean cap");
 }
 
+// REQ-L4 / design §28.3 п.9: set_max_mb(0)=unlimited. The producer must keep
+// writing past the old 1 MiB cap and never report size_capped(); the non-zero
+// valve is still enforced by test_size_cap().
+void test_size_unlimited()
+{
+    std::printf("[size unlimited]\n");
+    char dir[256];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        check(false, "mkdtemp for size unlimited");
+        return;
+    }
+
+    hldsmon::LogWriter w;
+    check(w.open(dir, kDay1), "open for size unlimited");
+    w.set_max_mb(0);
+
+    char line[256];
+    std::memset(line, 'x', sizeof(line));
+    line[sizeof(line) - 1] = '\0';
+    const size_t len = std::strlen(line); // 255
+
+    // 5200 * (255 + '\n') = 1,331,200 bytes > 1 MiB (the old cap size).
+    const unsigned writes = 5200;
+    for (unsigned i = 0; i < writes; ++i) {
+        w.write(std::span<const char>(line, len));
+    }
+
+    check(!w.size_capped(), "set_max_mb(0): never size capped");
+    check(w.enabled(), "set_max_mb(0): stays enabled past 1 MiB");
+    check(w.bytes_today() == static_cast<uint64_t>(writes) * (len + 1),
+          "bytes_today accumulates without cap");
+    check(w.error_count() == 0, "no errors on unlimited writes");
+}
+
 void test_prune_basic()
 {
     std::printf("[prune basic]\n");
@@ -411,6 +445,7 @@ int main()
     test_permissions();
     test_unavailable_dir();
     test_size_cap();
+    test_size_unlimited();
     test_prune_basic();
     test_prune_rotation();
     test_prune_symlink();

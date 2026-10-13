@@ -1432,3 +1432,313 @@ INV-1..6; гейт `plugin_enabled()`; `LogWriter` — sink (pull).
 ## Раздел ревью плана (momus) — стадия `analyzer-ui`
 **Ревьюер:** `momus`. **Вердикт: OKAY (PASS); гейт ОТКРЫТ.** Сложены F1..F4: политика дедупа `drop`/`records`; карта field→caveat-source в `hldsmon.py`; набор `config_diff` (`CONFIG_FIELDS`+`map`/`maxclients`/`rehlds_*`, `set`/`cleared`); QA достаточно.
 **Fine:** только `tools/analyzer`; реюз `host_series`/`iter_records`/`cmd_window`/`_config_digest_block`; три состояния host-точки (`None`≠0); точка интеграции «Все датасеты».
+
+---
+
+# Стадия 12 — `large-logs` — план реализации (rev 2 — plan-review пройден; plan-gate ЗАКРЫТ; **стадия исполнена и верифицирована — 2026-10-13**)
+
+> Полный дневной лог (~700 МБ) сквозь веб-UI (локальная загрузка + FTP-live) без обрыва на 256 МиБ / 30-мин хвосте. Дизайн — §28 (rev 12; B1/B2/M1–M7/m1–m5 сложены; R2/R3 — PASS, design-gate закрыт). **Plan-review:** `momus` (PASS-WITH-REVISIONS — H1–H3/M1–M4/L1–L2 сложены, см. раздел ревью ниже). **Scope:** `tools/analyzer` (`webui.py`, `webui/index.html`, `hldsmon.py`, `tools/analyzer/tests/`) **+ плагинный дефолт продюсера** (`hldsmon_max_mb` → `0`). **JSONL-схема P1 / `KNOWN_TYPES` не меняются.**
+
+## Заголовок стадии (bindings)
+- **Design:** `docs/design.md` §28 (rev 12). **Design-review:** `oracle` (R1 PASS-WITH-REVISIONS; R2 PASS-WITH-REVISIONS; **R3 PASS — design-gate ЗАКРЫТ**, §28.11). **Plan-review:** `momus`. **Design doc:** `docs/design.md`; **Plan:** `docs/plan.md` (этот раздел); **Journal:** `docs/journal.md`; **Открытые вопросы:** `docs/design.md` §16.
+- **Язык документации:** русский; идентификаторы/код — английский.
+- **Решения владельца (закрыто 2026-10-13):** §16 O4–O9 закрыты; §28.9. Кратко: `large-logs` — **чтение и запись без лимита по умолчанию** (лимит — опциональный клапан, выключен); память ограничена **стримингом** (диск-spool + оконный анализ), а не размерным cap; **window/период — UX**, не потолок; серверный период/window + coarse-overview — обязательный scope; FTP-окно UX удобное/очевидное (REQ-L6); компактный «Период» (REQ-L7); опциональный sticky-тоггл с персистом (REQ-L8).
+- **Верификация (точно как в `AGENTS.md`):** `make` (сборка 32-бит); `make test` (хостовые C++ unit + Python-тесты анализатора); для точечного прогона Python-тестов — `cd tools/analyzer && python3 -m unittest discover -s tests -v`. **Линтер — компилятор `-Wall -Wextra`** (отдельного нет).
+- **Коммит:** только по **явной** просьбе владельца, один связный коммит на стадию (код + тесты + доки + запись журнала). Без авто-коммитов.
+- **Интеграционная проверка:** FTP-путь требует реального FTP-хоста (вне CI); локальный путь и анализ дня покрываются хостовыми Python-тестами. UI-QAS-L16/L17/L18 — **вне `make test`** (метод — §28.8: ручной QA + page-`selfTest` `webui/index.html:4144`).
+
+## Глобальные инварианты стадии `large-logs`
+Дизайн §28.5. Действуют на всех фазах; проверяются картой QAS ниже.
+- **INV-L1** — память приёма **O(чанк)**; память анализа **O(window)**; сервер **всегда** применяет окно (подставляет default-окно при пустых `from`/`to`); сегментный spool сам по себе O(n²) **не** снимает.
+- **INV-L2** — **нет размерного лимита по умолчанию**; память ограничена стримингом (диск-spool + coarse-агрегатор без полного списка записей); клапан `>0` — только явно и с машиночитаемым отказом.
+- **INV-L3** — ни один путь не даёт **молча 0 записей / тихую обрезку**.
+- **INV-L4** — spool на **диске**, process/session-бюджет + crash-safe cleanup.
+- **INV-L5** — **stdlib-only**; схема P1/`KNOWN_TYPES` без изменений; `ftp.bytes`/`reached_start` — семантика **удалённого** файла.
+- **INV-5/INV-6 (сквозные):** формат JSONL P1 не меняется; границы (без БД/внешнего агента/Windows) сохраняются. `hldsmon.iter_records` (`hldsmon.py:163-187`) **не трогается** (BOM снимается при приёме на сервере).
+
+## Новые флаги/ENV стадии (cvar плагина — см. LL-P5)
+Все ручки **переопределяемы флагом/env**; значения ниже — **зафиксированные дефолты** (H1).
+| Ручка | Где | Default | Семантика |
+|---|---|---|---|
+| `--max-log-mb` (+ env `HLDSMON_WEBUI_MAX_MB`) | `webui.py` `build_parser:1311` | **`0` = unlimited** | Опциональный клапан чтения (REQ-L3). `>0` — единый отказ `{"code":"log_too_large","limit_bytes":N}`; для local — на запрос, для FTP — **кумулятивно на сессию**. |
+| `--spool-dir` (+ env `HLDSMON_SPOOL_DIR`) | `webui.py` `build_parser:1311`/`main` | `<tempdir>/hldsmon-spool` → при tmpfs-fallback `<cwd>/.hldsmon-spool` | Диск-backed каталог spool (INV-L4). fstype-проверка + fallback; free-space pre-check. |
+| `--max-uploads` (+ env `HLDSMON_WEBUI_MAX_UPLOADS`) | `build_parser:1311`/`main` | **`4`** (константа `MAX_UPLOADS = 4`) | Семафор (`threading.BoundedSemaphore`) одновременных загрузок/сессий; превышение → HTTP **429** `{"ok":false,"code":"busy"}` (не неограниченные потоки). |
+| `--read-timeout` (+ env `HLDSMON_WEBUI_READ_TIMEOUT`) | `build_parser:1311`/`main` | **`30.0` с** (константа `READ_TIMEOUT_S = 30.0`) | socket/read-timeout тела и FTP-чтения; недобор тела к EOF за таймаут → HTTP **408** `{"ok":false,"code":"request_timeout"}`. |
+| `--spool-session-mb` (+ env `HLDSMON_WEBUI_SPOOL_SESSION_MB`) | `build_parser:1311`/`main` | **`2048` МиБ** (константа `SPOOL_SESSION_MB = 2048`) | Per-session бюджет spool (ресурсный предохранитель, **не** size-cap лога); исчерпание → `spool_full`. |
+| `--spool-total-mb` (+ env `HLDSMON_WEBUI_SPOOL_TOTAL_MB`) | `build_parser:1311`/`main` | **`8192` МиБ** (константа `SPOOL_TOTAL_MB = 8192`) | Process-wide бюджет spool; исчерпание → `spool_full`. |
+| `--spool-ttl-sec` (+ env `HLDSMON_WEBUI_SPOOL_TTL_SEC`) | `build_parser:1311`/`main` | **`3600` с** (константа `SPOOL_TTL_S = 3600`) | TTL age-sweeper'а: handle/сегменты старше TTL удаляются; плюс startup-cleanup на старте. |
+| `--allow-nonloopback-unlimited` | `build_parser:1311` | **off** | Opt-in для безлимита на **не-loopback** bind — точная семантика (M4) ниже. |
+| `hldsmon_max_mb` (плагин) | `src/bootstrap.cpp:55` / `:308` | **`0` = unlimited** | Продюсер без лимита записи (REQ-L4). Регистрация `:124` без изменений; `src/log_writer.cpp` **не трогается** (`:184`/`:225` уже `0`=unlimited). |
+
+**Loopback/безлимит (M4, §28.3 п.14/п.7).** При bind на **не-loopback**: без `--allow-nonloopback-unlimited` сервер стартует (в лог — предупреждение), но при `--max-log-mb == 0` **любой** приём отклоняется HTTP **403** `{"ok":false,"code":"unlimited_nonloopback_disabled"}`; при `--max-log-mb > 0` приём работает. С `--allow-nonloopback-unlimited` — безлимит разрешён. На **loopback** безлимит разрешён всегда. QAS-L7 проверяет обе ветки.
+
+## Не-цели стадии (границы)
+- JSONL-схема P1, `KNOWN_TYPES`, `exports.whitelist`, Makefile, ABI/хуки — не трогаются. Плагинное изменение ограничено дефолтом `hldsmon_max_mb`.
+- Аутентификация/многопользовательская модель; внешние зависимости (остаёмся stdlib-only); resumable/chunked-upload; Windows.
+- Realtime-дашборд и кэш повторных окон/инкрементальный агрегатор **сверх** (ii-a)+(ii-b). Пред-агрегация coarse (ii-b) — **в scope**, не исключается.
+- `hldsmon_retention_days` — не трогаем.
+
+## Маппинг QAS-L1..L20 → фаза/метод (design §28.8)
+| QAS-L (design §28.8) | Фаза | Метод проверки |
+|---|---|---|
+| **QAS-L1** (local >256 МиБ, RSS ∝ не файлу, без JS-строки) | LL-P1 (+P2/P4) | Python-тест (subprocess): приём 200; **удвоение входа (300→600 МиБ) ⇒ рост пика `ru_maxrss` ≤ `RSS_SLOPE_MAX_MIB = 64` МиБ** (не пропорционально) |
+| **QAS-L2** (no cap по умолчанию; valve `>0` ⇒ 413 `log_too_large`; missing `Content-Length` ≠ 0) | LL-P1 | Python-тест (HTTP) |
+| **QAS-L3** (FTP хвост → offset 0; RSS ~O(окно)) | LL-P3 (+P2) | Python-тест FTP-сегментов; **пик `ru_maxrss` ≤ `RSS_ANALYSIS_MAX_MIB = 256` МиБ и ≤ `RSS_WINDOW_SENS_MIB = 32` МиБ** над прогоном 5-мин окна |
+| **QAS-L4** (`cap_hit`+`limit_bytes` при клапане; иначе не выставляется) | LL-P3 | Python-тест |
+| **QAS-L5** (FTP без `SIZE`/`REST` → RETR→spool; без `_FtpTooLarge`) | LL-P3 | Python-тест (fake-FTP) |
+| **QAS-L6** (export/bundle через handle local **и** FTP; ключ `(run,t,userid)`; `session_expired`; малый body-путь) | LL-P2 (+P3/P4) | Python-тест |
+| **QAS-L7** (не-loopback ⇒ предупреждение; безлимит требует opt-in) | LL-P1 | Python-тест: non-loopback + безлимит без флага ⇒ **403 `unlimited_nonloopback_disabled`**; с флагом ⇒ 200; loopback ⇒ 200 |
+| **QAS-L8** (spool на диске; free-space; бюджет; `spool_full`) | LL-P1 | Python-тест (fstype-resolver + budget) |
+| **QAS-L9** (cleanup: startup + sweeper + `finally`/BrokenPipe) | LL-P1 | Python-тест |
+| **QAS-L10** (память анализа дня: окно ≤ записей окна; coarse без полного списка) | LL-P2 | Python-тест: ответ без `records`; **пик `ru_maxrss` ≤ `RSS_ANALYSIS_MAX_MIB = 256` МиБ и ≤ `RSS_WINDOW_SENS_MIB = 32` МиБ** (30-мин vs 5-мин окно) |
+| **QAS-L11** (BOM → первая строка не теряется; CRLF + порядок `Blob`↔`files=`) | LL-P1 (BOM) + LL-P4 (CRLF/порядок) | Python-тест + ручной QA |
+| **QAS-L12** (лимит одновременных загрузок/сессий + read-timeout) | LL-P1 | Python-тест |
+| **QAS-L13** (окно `from`/`to` включительно == эталонная клиентская фильтрация) | LL-P2 | Python-тест (эталон) |
+| **QAS-L14** (смена суток в FTP: без потерь/дублей) | LL-P3 | Python-тест |
+| **QAS-L15** (stdlib-only; схема P1 без изменений; старые Python-тесты + новые зелёные) | LL-P6 (сквозь P1–P4) | `make test` |
+| **QAS-L16** (FTP-окно UX) | LL-P4 (+P3) | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-L17** (компактный «Период») | LL-P4 | **ручной QA/`selfTest`** (вне `make test`): высота sticky-блока **≤ `PERIOD_MAX_HEIGHT_PX = 96` px** |
+| **QAS-L18** (sticky-тоггл персист в `localStorage`) | LL-P4 | **ручной QA/`selfTest`** (вне `make test`) |
+| **QAS-L19** (продюсер `hldsmon_max_mb=0`=unlimited + клапан; `test_log_writer`) | LL-P5 | C++ unit (`set_max_mb(0)`) + **статическая проверка default-строки `bootstrap.cpp` + ручной `hldsmon_status`** (см. LL-P5) |
+| **QAS-L20** (чтение без лимита по размеру; память не O(файл)) | LL-P1 (local) + LL-P3 (FTP) | Python-тест: приём произвольного размера; пик `ru_maxrss` ≤ `RSS_SLOPE_MAX_MIB = 64` МиБ при удвоении входа |
+
+**Покрытие REQ-L:** REQ-L1 → P1(local)/P3(FTP); REQ-L2 → P1+P2; REQ-L3 → P1; REQ-L4 → P5; REQ-L5 → P2; REQ-L6 → P3(механика)+P4(UX); REQ-L7 → P4; REQ-L8 → P4.
+
+---
+
+## LL-P1 — Analyzer core: spool-приём, handle-реестр, единый over-cap-контракт, клапан
+**Цель.** Оба пути приёма (local и — каркас — сессия) кладут байты в диск-spool, не в память; server-side handle с lifecycle/TTL/cleanup; опциональный клапан (`--max-log-mb` default `0`); loopback-guard; лимит параллелизма + read-timeout; BOM снимается при приёме.
+
+**Файлы.**
+- `tools/analyzer/webui.py`:
+  - `_read_body:1049-1070` → **стрим в spool-файл** со счётчиком байт (не в `chunks`); убрать отклонение по `MAX_BODY_BYTES` **по умолчанию**. **Framing (M3, детерминированно):** (i) `Content-Length` **отсутствует** → HTTP **411 Length Required** `{"ok":false,"code":"length_required"}`; (ii) `Content-Length` **присутствует, но невалиден** (не целое >0) → **стрим до EOF** (`Connection: close`, `close_connection=True`), ограниченный read-timeout → **408** `{"code":"request_timeout"}`; (iii) `Content-Length` валиден >0 → стрим **ровно N байт**; недобор к EOF → **408**. Никогда тихий `b""` → 0 записей. BOM (`utf-8-sig`) снимается здесь, в одном месте.
+  - Константы `MAX_BODY_BYTES:53`/`MAX_FTP_BYTES:56` → источник клапана (`--max-log-mb`); переименовать в `_MAX_LOG_BYTES` (0 = unlimited).
+  - `_handle_analyze:1141`, `_handle_export:1155`, `_handle_bundle:1177` → при клапане `>0` единый **читаемый JSON** `{"ok":false,"code":"log_too_large","limit_bytes":N}` (без `close_connection`/«Failed to fetch»).
+  - Новое: **реестр spool-handle** (dict + lock), handle-адресация, lifecycle/TTL, **startup-cleanup + age-sweeper + `finally`/`BrokenPipe`**-cleanup; вытеснение → `{"code":"session_expired"}`.
+  - fstype-resolver `spool_backing_kind(mounts_text, path)` (**host-testable**, чистый; читает `/proc/mounts`) + выбор disk-backed каталога и fallback из tmpfs; free-space pre-check (`os.statvfs`); **per-session (`SPOOL_SESSION_MB`) и process-wide (`SPOOL_TOTAL_MB`) бюджеты** → `spool_full`.
+  - `build_parser:1311`/`main` → флаги/константы из таблицы выше + loopback-guard (M4: non-loopback + unlimited без флага ⇒ 403 на приём) + семафор (`MAX_UPLOADS`) + `READ_TIMEOUT_S`.
+  - `_records_from_bytes:166-181` → temp-файл из spool (crash-safe), `finally`-удаление.
+  - Новые константы (overridable flag/env — таблица выше): `MAX_UPLOADS = 4`, `READ_TIMEOUT_S = 30.0`, `SPOOL_SESSION_MB = 2048`, `SPOOL_TOTAL_MB = 8192`, `SPOOL_TTL_S = 3600`.
+- `tools/analyzer/tests/test_webui.py` (+ `fixtures/`): тесты приёма/клапана/handle/бюджета/cleanup/BOM.
+
+**Границы (не-цели фазы).** Оконный анализ — LL-P2; FTP-логика — LL-P3; UI — LL-P4; продюсер — LL-P5. Chunked-upload нет. Схема P1/`KNOWN_TYPES`/`hldsmon.iter_records` не трогаются.
+
+**Инварианты.** INV-L2 (каркас), INV-L3, INV-L4, INV-6.
+
+**Acceptance (QAS-L1, QAS-L2, QAS-L7, QAS-L8, QAS-L9, QAS-L11-BOM, QAS-L12, QAS-L20):**
+- [ ] Локальный файл >256 МиБ → HTTP 200; при удвоении входа (300→600 МиБ) пик `ru_maxrss` растёт **≤ `RSS_SLOPE_MAX_MIB = 64` МиБ** (subprocess; не пропорционально).
+- [ ] По умолчанию **нет отклоняющего cap**; при `--max-log-mb >0` → 413 + `log_too_large` + `limit_bytes` (читаемый JSON).
+- [ ] Framing (M3): отсутствие `Content-Length` → **411 `length_required`**; present-but-malformed → **стрим до EOF/408**; valid >0 → ровно N байт; никогда тихий 0.
+- [ ] Loopback-guard (M4): non-loopback + `--max-log-mb=0` без `--allow-nonloopback-unlimited` ⇒ **403 `unlimited_nonloopback_disabled`**; с флагом или при `>0` ⇒ 200; loopback ⇒ 200.
+- [ ] spool-каталог disk-backed (fstype-resolver); tmpfs → fallback; free-space pre-check; бюджеты `SPOOL_SESSION_MB=2048`/`SPOOL_TOTAL_MB=8192` → `spool_full`.
+- [ ] Cleanup: startup-cleanup + age-sweeper (TTL `SPOOL_TTL_S=3600`) + `finally`/BrokenPipe; после закрытия/TTL spool-файлов нет.
+- [ ] Лимит `MAX_UPLOADS=4` (5-я одновременная загрузка → **429 `busy`**) + `READ_TIMEOUT_S=30.0` (недобор → 408); не неограниченные потоки.
+- [ ] BOM-файл → первая строка не теряется.
+
+**Риски.** Флейки измерения RSS — фиксированные пороги (`RSS_SLOPE_MAX_MIB=64`) и subprocess-прогон; `/proc/mounts` недоступен → skip/fallback (не падать); крупные фикстуры — **генерировать синтетически**, не коммитить.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; затем `make test`.
+
+**DoD фазы.** Все пункты acceptance зелёные; `INV-L2/L3/L4` покрыты; существующие Python-тесты не красные (`test_hldsmon`/`test_webui`).
+
+---
+
+## LL-P2 — Оконный анализ + coarse стриминг-агрегатор + export/bundle через handle
+**Цель.** `/api/analyze` принимает `from`/`to`/`window`, **всегда применяет окно** (default-окно при пустых входах); ответ = **coarse overview дня** (однопроходный агрегатор без полного списка записей) + handle; окна дозапрашиваются по требованию; export/bundle — по handle (+окно); стабильный ключ drop `(run,t,userid)`.
+
+**Файлы.**
+- `tools/analyzer/webui.py`:
+  - `analyze_records:293-319` → разделить на **стриминг-агрегатор** (`coarse_overview(handle, ...)`: `digest.counts_by_type`, суммы по типам, `top drop reasons`, `player_groups`/`client_identities`, полный `drops` O(drops), `log_end`, счётчики `anomalies`; **без** полного `records`) и **материализатор окна** (`window_records(handle, from, to)` через `iter_records`).
+  - `build_series:191-213` — переиспользовать для full-resolution окна + даунсэмпл-ряды coarse (память **O(window)**/O(точек даунсэмпла)); даунсэмпл ограничен **`SERIES_MAX_POINTS = 2000`** точек/ряд.
+  - `_handle_analyze:1141-1154` → парсинг `from`/`to`/`window`; **всегда** default-окно; ответ coarse + handle.
+  - `_handle_export:1155`/`_handle_bundle:1177` → источник — spool по **handle** (+окно); адресация drop — ключ `(run,t,userid)`; вытеснённый handle → `session_expired`; малый body-путь сохранён.
+- `tools/analyzer/hldsmon.py`: стабильный ключ drop `(run,t,userid)` (реюз `_attach_runs:286`); оконная фильтрация на парсинге (без изменения `iter_records`).
+- `tools/analyzer/tests/test_webui.py` + `fixtures/`.
+
+**Контракт окна (decision-complete).** `from`/`to` — epoch-секунды, **включительно**; `window` — размер окна в секундах. Правила выбора диапазона: **(a)** заданы `from` и `to` → материализуется ровно `[from, to]`; **(b)** задан один конец → второй = ±`ANALYZE_DEFAULT_WINDOW_S`; **(c)** оба пусты → окно = последние `ANALYZE_DEFAULT_WINDOW_S` секунд, оканчивающееся на `t` последней записи spool. Новая константа **`ANALYZE_DEFAULT_WINDOW_S = 1800.0`** (отдельная от `FTP_WINDOW_S:59`; значение совпадает как реюз, сущность — нет). **Coarse overview строится всегда по всему spool**, независимо от окна. В ответе возвращается `handle`; «весь файл одним окном» — частный случай, когда диапазон покрывает весь spool (малый файл).
+
+**Контракт coarse-ответа `/api/analyze` (M1, ключи зафиксированы).** Ответ — **всегда** объект с ключами (имена **одинаковы** на бэке LL-P2 и фронте LL-P4); `records` (сырой полный список) **не возвращается никогда**:
+- `ok` (`true`), `version` (`PROTOCOL_VERSION`), `files` (список имён).
+- **`handle`** (строка) — server-side spool-handle для последующих export/bundle/оконных запросов.
+- **`window`** (`{"from": <epoch-sec|null>, "to": <epoch-sec|null>}`) — фактически материализованное full-resolution окно (`null` = открытый край).
+- **`coarse`** (`true` для overview-запроса; `false`, когда запрошено конкретное окно) и **`window_count`** (int — число записей в окне).
+- **Полнодневные агрегаты** (память O(players)+O(drops)+O(1); present в обоих режимах): `digest`, `clients`, `sessions`, `session_count`, `client_identities`, `drops`, `anomalies`, `anomalies_excluded`, `events`, `log_end`, `config`, `records_count` (всего записей в spool), `host_caveats`. Каждый drop несёт **`"key": {"run": <int>, "t": <float>, "userid": <int>}`** — адрес для `/api/bundle`.
+- **Ряды** `series` (server), `client_series`, `host_series`: при `coarse=true` — **даунсэмпл** (≤ `SERIES_MAX_POINTS = 2000` точек на ряд); при `coarse=false` (окно) — **полное разрешение окна**.
+- **`focus_points`** — окно-scoped (память O(событий окна)).
+- **Отсутствует всегда:** `records`.
+
+**Границы.** FTP-специфика — LL-P3; UI — LL-P4; новых полей записи нет; кэш повторных окон/инкрементальный агрегатор — не делаем (только ii-a+ii-b).
+
+**Инварианты.** INV-L1 (всегда окно), INV-L2, INV-L3.
+
+**Acceptance (QAS-L6, QAS-L10, QAS-L13):**
+- [ ] Запрос окна материализует **≤ записей окна** (не всего файла); coarse дня строится **без полного списка**; пик `ru_maxrss` **≤ `RSS_ANALYSIS_MAX_MIB = 256` МиБ** и **≤ `RSS_WINDOW_SENS_MIB = 32` МиБ** над прогоном 5-мин окна (L10).
+- [ ] `from`/`to` включительно дают **то же множество** записей, что эталонная клиентская фильтрация по полному набору (L13).
+- [ ] Export/bundle по handle (+окно) для local; адрес drop — стабильный `key {run,t,userid}`; вытеснённый handle → `session_expired`; малый файл → весь файл одним окном (L6).
+- [ ] Coarse-контракт **не содержит** `records`; ряды `series`/`client_series`/`host_series` присутствуют и при `coarse=true` ограничены **≤ `SERIES_MAX_POINTS = 2000`** точками.
+
+**Риски.** Случайная материализация списка в агрегаторе (регресс памяти) — покрыть структурным тестом (ответ без `records`) + RSS-тестом; default-окно зафиксировано контрактом выше (`ANALYZE_DEFAULT_WINDOW_S = 1800.0`) и проверяется тестом.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; `make test`.
+
+**DoD фазы.** Acceptance зелёные; INV-L1/L2/L3 покрыты; прежний контракт приёма тела не сломан.
+
+---
+
+## LL-P3 — FTP: сегментный spool, без cap по умолчанию, REST-less fallback, суточная ротация, механика окна
+**Цель.** Сессия хранит **упорядоченный список сегментных spool-файлов** (`[older…, current]`) + `t_lo/t_hi`/`spool_bytes`; `load-earlier` **добавляет** сегмент старше и доходит до offset 0; без cap по умолчанию; fallback без `REST`/`SIZE` стримит `RETR` в spool; смена суток — раздельные сегменты; механика окна (индикатор диапазона/`reached_start`/прогресс-поля).
+
+**Файлы.**
+- `tools/analyzer/webui.py`:
+  - `ftp_connect:825`, `ftp_refresh:876`, `ftp_close:994` → модель сессии: сегментные spool-файлы + `t_lo/t_hi`/`spool_bytes` + handle; убрать остановку по `MAX_FTP_BYTES`.
+  - `_load_tail:665-698`, `ftp_load_earlier:931-991` → добавление сегментов старше; **до offset 0** ⇒ `reached_start=true`; анализ — через оконный путь LL-P2 (снимает B2/O(n²)).
+  - `_download:490`/`_download_range:548`/`_retr_all:465` → fallback стримит полный `RETR` **в spool-файл** (не в память); диапазоны нарезаются из файла.
+  - `_ftp_meta:701-720` → `cap_hit`/`limit_bytes`/опц. `truncated` (только при клапане); `bytes` = байты **удалённого** диапазона (не спула); `reached_start` = offset 0 **удалённого** файла; поля индикатора диапазона (REQ-L6).
+  - `ftp_refresh:876` суточная ротация (`:881-884`, `resolve_path` с `{date}`) → сегменты разных дней раздельно, без потерь/дублей на границе.
+  - Константы `FTP_WINDOW_S:59` = **1800 с (дефолт окна)** / `FTP_BACK_CHUNK:62` = 8 МиБ — сохранить; **набор пресетов окна (H3): {300, 900, 1800, 3600, 21600, 86400} с**; прогресс — детерминированный бар (скачано/всего байт при известном `SIZE`, иначе индетерминированный) + фазовая подпись («Скачивание…»/«Разбор данных…»).
+- `tools/analyzer/tests/test_webui.py` (+ fake-FTP фикстуры).
+
+**Границы.** UI-рендер FTP-окна — LL-P4; auth нет; продюсер — LL-P5.
+
+**Инварианты.** INV-L1, INV-L3, INV-L5 (`ftp.bytes`/`reached_start` — семантика удалённого файла).
+
+**Acceptance (QAS-L3, QAS-L4, QAS-L5, QAS-L14; +QAS-L20-FTP):**
+- [ ] Connect грузит хвост-окно (**1800 с** по умолчанию); `load-earlier` доходит до offset 0 ⇒ `reached_start=true`, весь файл в сегментном spool; приём/анализ — O(окно), не O(файл): пик `ru_maxrss` ≤ `RSS_ANALYSIS_MAX_MIB = 256` МиБ и ≤ `RSS_WINDOW_SENS_MIB = 32` МиБ.
+- [ ] Упор в **включённый** клапан ⇒ `cap_hit=true` + `limit_bytes`; без тихой обрезки. При выключенном клапане `cap_hit` **не** выставляется.
+- [ ] FTP без `SIZE`/`REST` → полный `RETR` стримится в spool; большой файл не даёт `_FtpTooLarge`; диапазоны нарезаются из файла.
+- [ ] Смена суток: сегменты разных дней без потерь/дублей на границе.
+- [ ] FTP-путь больше **не** отключает export/bundle (стык с LL-P2).
+
+**Риски.** Разрастание числа сегментов (уборка по TTL/бюджету из LL-P1); fake-FTP фикстуры должны эмулировать отсутствие `SIZE`/`REST` и большой поток; граница суток по UTC.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v`; `make test`. Реальный FTP — вне CI (ручной прогон).
+
+**DoD фазы.** Acceptance зелёные; INV-L1/L3/L5 покрыты; `reached_start`/`bytes` семантика подтверждена тестом.
+
+---
+
+## LL-P4 — Frontend (`webui/index.html`): Blob-upload, серверный период + coarse + окна, FTP-UX, компактный «Период», sticky-тоггл
+**Цель.** Прямой `Blob`-upload без `f.text()`; BOM/CRLF/мультифайл; период — **до/через** запрос (серверная нарезка), coarse + дозапрос окон; export/bundle через handle; FTP-окно UX (REQ-L6); компактный «Период» (REQ-L7); опциональный sticky-тоггл + `localStorage` (REQ-L8); обработка `log_too_large` (только при клапане).
+
+**Файлы.** `tools/analyzer/webui/index.html`:
+- `readAllFiles:1153-1158` → собрать **композитный `Blob`** из `File` (без `f.text()`); нормализация CRLF — **только** для line-splitting Blob-пути; **сохранить порядок `Blob`↔`files=`**.
+- `fetchAnalyze:1160-1192` → `fetch(url,{body:blob})`; параметры `from`/`to`/`window`; вместо `state.body` (строка) — **handle**; читает ключи coarse-ответа (M1): **`data.handle`**, **`data.window`** (`{from,to}`), **`data.coarse`**, **`data.window_count`**, `data.series`/`data.client_series`/`data.host_series`, `data.digest`, `data.drops[].key`; `state.body`-реюз для `/api/export` (`:1205`)/`/api/bundle` (`:1239`) → handle.
+- FTP: `state.body = null` (`:1528`) и отключение export/bundle (`:3692`,`:3708`) → export/bundle **включены** через handle.
+- `buildPeriodPanel:1799` + `.panel-sticky`: **CSS-определение** `index.html:177` (`.panel-sticky { position: sticky; …`), **место применения** `:1863-1864`. **Компактный layout (H3): целевая высота sticky-блока ≤ `PERIOD_MAX_HEIGHT_PX = 96` px** (компактные от/до; пресеты одной линией/меню; глобальный выбор клиента — подстрокой), без потери функций.
+- **Sticky-тоггл (REQ-L8):** новый ключ персиста по конвенции репозитория (`hldsmon.ui.*`, рядом с `COLLAPSED_KEY:1422`/`DATASETS_KEY:1443`, helper `:1380`); применяется без reload.
+- **FTP-окно UX (REQ-L6):** явный размер окна — **пресеты {5 мин, 15 мин, 30 мин, 1 ч, 6 ч, 24 ч}** (= {300, 900, 1800, 3600, 21600, 86400} с; дефолт 30 мин), индикатор загруженного диапазона (время + `[start,end]`), очевидные «← раньше»/«позже →», **детерминированный прогресс-бар** (байты/проценты при известном `SIZE`, иначе индетерминированный; `role="progressbar"`), `reachedStart` (чтение `ftp.reached_start` `:1499`,`:1524`,`:1567`,`:1602`), видимый `cap_hit`; без скрытой тихой остановки.
+- **Обработка `log_too_large`/413** (только при включённом клапане) — явное сообщение причины.
+- `selfTest:4144` — добавить кейсы: компактный «Период», sticky-тоггл-персист, индикаторы FTP-окна.
+
+**Границы.** Серверные контракты — LL-P1/P2/P3; продюсер — LL-P5; схема не трогается.
+
+**Инварианты.** INV-L5 (UI-часть), INV-6; сервер остаётся stdlib-only.
+
+**Acceptance (QAS-L16, QAS-L17, QAS-L18 — **вне `make test`**; QAS-L11-CRLF/порядок; QAS-L6-FTP):**
+- [ ] **L16 (REQ-L6):** явный размер окна (пресеты {5 мин, 15 мин, 30 мин, 1 ч, 6 ч, 24 ч}; дефолт 30 мин); индикатор диапазона (время + `[start,end]`); кнопки «раньше/позже»; **детерминированный прогресс-бар**; `reached_start`; нет скрытой тихой остановки.
+- [ ] **L17 (REQ-L7):** высота sticky-блока **≤ `PERIOD_MAX_HEIGHT_PX = 96` px** (компактный layout), функции (от/до, пресеты, выбор клиента) сохранены; `selfTest` измеряет `offsetHeight` контейнера.
+- [ ] **L18 (REQ-L8):** закрепление можно выключить; состояние персистится в `localStorage` и восстанавливается после reload.
+- [ ] **L11 (CRLF/порядок):** CRLF-нормализация + порядок мультифайлового `Blob` ↔ `files=` сохранены.
+- [ ] Export/bundle доступны для FTP-пути (через handle).
+- [ ] Обработка 413/`log_too_large` — только при включённом клапане; видимая причина.
+
+**Метод проверки UI-QAS (обязателен, §28.8/M2).** QAS-L16/L17/L18 **не покрываются `make test`** (там C++ host-тесты + Python `unittest`; **JS-рендер `index.html` не покрыт — в `test_webui.py` есть лишь doctype smoke-test `test_get_index_html`, остальные ~58 тестов — JSON-API**). Механизм: **ручной QA-чеклист** (фиксируется в `docs/journal.md`) **и/или** прогон page-`selfTest` (`webui/index.html:4144`) с новыми кейсами (компактный период с проверкой `offsetHeight ≤ 96` px, sticky-тоггл-персист, индикаторы FTP-окна). Python-статическая проверка допустима только для реально проверяемого (напр. наличие ключа тоггла в HTML/JS) — добавляется в `test_webui.py`.
+
+**Риски.** Расхождение серверного/клиентского периодов (эталон — серверная нарезка); регресс экспорта для FTP (проверить handle); порог высоты `PERIOD_MAX_HEIGHT_PX=96` измерим (`selfTest`), фиксируется в QA-чеклисте.
+
+**Верификация.** `cd tools/analyzer && python3 -m unittest discover -s tests -v` (Python + sanity `test_webui`); `make test`; **ручной QA-чеклист** + прогон `selfTest` в браузере (для L16/L17/L18).
+
+**DoD фазы.** L16/L17/L18 подтверждены ручным QA/`selfTest` (запись в журнале); L11/L6 зелёные; JS-строка на 700 МБ не строится (приём — `Blob`).
+
+---
+
+## LL-P5 — Продюсер: `hldsmon_max_mb` default `0`=unlimited
+**Цель.** Снять размерный cap записи по умолчанию (опциональный клапан), синхронизировать `README`/design; `log_writer.cpp` **не трогается** (`0` уже =unlimited).
+
+**Файлы.**
+- `src/bootstrap.cpp`: default-строка `s_val_max_mb[]` `"512"`→`"0"` (**`:55`**); рантайм-fallback `cvar_f(c.cvars.max_mb, 512.0f)`→`0.0f` (**`:308`**). Регистрация cvar (**`:124`**) — **без изменений**.
+- `README.md`: cvar-таблица — `hldsmon_max_mb` default **`0`** (unlimited), диапазон «`0` — без лимита»; риск disk-fill отмечен.
+- `tests/test_log_writer.cpp`: тест семантики **`0` = unlimited** (запись не останавливается по размеру).
+- **Верификация default-строки (M2):** `bootstrap.cpp` не компилируется host-целями (`make test`), поэтому дефолт проверяется **вне** `test_log_writer`: **(a)** статическая проверка исходника — `grep -Eq 's_val_max_mb\[\][[:space:]]*=[[:space:]]*"0"' src/bootstrap.cpp` **и** `grep -q 'c.cvars.max_mb, 0.0f' src/bootstrap.cpp`; **(b)** **ручной** прогон на тестовом ReHLDS-сервере: на свежем `FCVAR_ARCHIVE`-профиле `hldsmon_max_mb` = `0` (консоль/`hldsmon_status`), запись не останавливается по размеру. Оба результата — в `docs/journal.md`.
+- `src/log_writer.cpp` — **НЕ трогается** (`:184` гейт только при `max_bytes_ != 0`; `:225` `0`=unlimited).
+- `docs/design.md` §7/§12 — **проверить** (уже обновлены в §28); правок по возможности нет.
+
+**Границы.** Никакого другого плагинного кода; `hldsmon_retention_days` не трогать; схема P1/ABI неизменны.
+
+**Инварианты.** INV-2/INV-5 не затронуты; семантика продюсера — REQ-L4.
+
+**Acceptance (QAS-L19):**
+- [ ] `hldsmon_max_mb=0` (default) ⇒ запись **не** останавливается по размеру; non-zero клапан по-прежнему ограничивает.
+- [ ] **Default покрыт (M2):** `test_log_writer.cpp` проверяет `set_max_mb(0)`=unlimited **и** статическая проверка `bootstrap.cpp` (default-строка `"0"` + fallback `0.0f`) проходит; ручной `hldsmon_status` на тестовом сервере зафиксирован в `docs/journal.md`.
+- [ ] `README.md` cvar-таблица отражает `0`=unlimited; `docs/design.md §7/§12` согласованы.
+- [ ] `static_assert`/размеры структур не менялись.
+
+**Риски.** disk-fill при выключенном клапане — **осознанное решение владельца** (REQ-L4/§28.3 п.9), задокументировано; митигация — опциональный клапан.
+
+**Верификация.** `make`; `make test` (в т.ч. `test_log_writer`); статическая проверка `bootstrap.cpp` (grep, M2); ручной `hldsmon_status` (запись в journal).
+
+**DoD фазы.** `make`/`make test` зелёные; cvar-таблица и design §7/§12 согласованы; `log_writer.cpp` не изменён.
+
+---
+
+## LL-P6 — Верификация, документация, журнал
+**Цель.** Финальная сквозная верификация стадии; запись журнала; журнал/индексы; фиксация UI-QA.
+
+**Файлы.** `docs/journal.md` (запись стадии `large-logs`: что сделано, UI-QA-результат, коммит-статус); `README.md` (раздел анализатора/веб-UI — обновить описание безлимитного приёма/окон, если нужно); сверка `docs/design.md §7/§12`; индексы (`AGENTS.md` — уже указывает на `docs/plan.md`).
+
+**Acceptance (QAS-L15):**
+- [ ] **stdlib-only** сохранён; схема P1/`KNOWN_TYPES` **без изменений**; `exports.whitelist` без изменений.
+- [ ] Все существующие Python-тесты зелёные + новые; `make`/`make test` зелёные.
+- [ ] Каждый QAS-L1..L20 прослеживается к тесту/методу (карта выше); L16/L17/L18 — ручной QA/`selfTest` записан.
+- [ ] `docs/journal.md` заполнен. **Коммит** — только по явной просьбе владельца.
+
+**Верификация.** `make`; `make test`; `cd tools/analyzer && python3 -m unittest discover -s tests -v`.
+
+**DoD фазы.** Все артефакты стадии на месте; журнал закрыт.
+
+---
+
+## Definition of Done (стадия `large-logs`)
+- [ ] **REQ-L1** (чтение без лимита по умолчанию, local+FTP) — LL-P1/P3, QAS-L2/L20.
+- [ ] **REQ-L2** (память ограничена стримингом) — LL-P1/P2, QAS-L1/L10.
+- [ ] **REQ-L3** (опц. клапан `--max-log-mb` default 0) — LL-P1, QAS-L2.
+- [ ] **REQ-L4** (продюсер `hldsmon_max_mb=0`) — LL-P5, QAS-L19.
+- [ ] **REQ-L5** (window — UX, не потолок) — LL-P2, QAS-L13.
+- [ ] **REQ-L6** (FTP-окно UX) — LL-P3/P4, QAS-L16 (ручной QA/`selfTest`).
+- [ ] **REQ-L7** (компактный «Период») — LL-P4, QAS-L17 (ручной QA/`selfTest`).
+- [ ] **REQ-L8** (sticky-тоггл + `localStorage`) — LL-P4, QAS-L18 (ручной QA/`selfTest`).
+- [ ] **INV-L1..L5** покрыты (карта выше); INV-5/INV-6 сохранены; `iter_records`/`log_writer.cpp` не тронуты.
+- [ ] QAS-L1..L20: каждая прослеживается к фазе/методу; **L16/L17/L18 вне `make test`** — подтверждены ручным QA-чеклистом + `selfTest` (`index.html:4144`), запись в журнале.
+- [ ] `make` и `make test` зелёные; `cd tools/analyzer && python3 -m unittest discover -s tests -v` зелёный.
+- [ ] JSONL-схема P1/`KNOWN_TYPES`/`exports.whitelist`/Makefile не изменены; stdlib-only.
+- [ ] `docs/journal.md` заполнен; `README.md` cvar-таблица и раздел веб-UI согласованы.
+- [ ] Коммит — только по явной просьбе владельца (один связный коммит стадии).
+
+## Риски и откат (стадия)
+| Риск | Митигация | Откат |
+|---|---|---|
+| **Disk-fill** при выключенном клапане (spool и лог) | Осознанное решение владельца (REQ-L4/§28.3 п.9); spool per-session/process-бюджет + free-space pre-check + `spool_full`; loopback-дефолт; опц. клапаны `--max-log-mb`/`hldsmon_max_mb` | Вернуть `hldsmon_max_mb` default `512` (`bootstrap.cpp:55`/`:308`); задать `--max-log-mb >0` |
+| **spool на tmpfs (=RAM)** | fstype-resolver `spool_backing_kind` + fallback на disk-backed каталог; QAS-L8 | `--spool-dir` явно на диск |
+| **Производительность оконного анализа** (случайная материализация → O(records)) | Стриминг-агрегатор (ii-b) без полного `records`; структурный тест ответа + RSS-тест (QAS-L10); окно ≤ записей окна (QAS-L13) | Уменьшить default-окно; откатить P2 |
+| **UI-верификация** (L16/L17/L18 вне `make test`) | Ручной QA-чеклист + `selfTest` (`index.html:4144`); Python-статика только по реально проверяемому (наличие ключа тоггла) | Ручной QA-проход перед приёмкой |
+| **FTP-путь** (нет `SIZE`/`REST`; смена суток) | Fallback `RETR`→spool; сегменты по дням (QAS-L5/L14); fake-FTP тесты | Ручной прогон на реальном FTP |
+| **Совместимость контрактов** | Аддитивность: малый файл → одно окно; body-путь сохранён; `session_expired` при вытеснении (QAS-L6) | Откат фронта (P4) к прежнему upload-потоку |
+
+## Раздел ревью плана (momus) — стадия `large-logs`
+**Ревьюер:** `momus`. **Вердикт: PASS-WITH-REVISIONS — блокеров нет; plan-gate ЗАКРЫТ после сложения H1–H3/M1–M4 (L1/L2 — опциональные, сложены); implementation-gate ОТКРЫТ.**
+
+| ID | Severity | Замечание | Disposition |
+|---|---|---|---|
+| H1 | High | Числовые дефолты resource-guard LL-P1 не заданы | **Внесено** — таблица флагов/ENV + LL-P1: `MAX_UPLOADS=4` (429 `busy`), `READ_TIMEOUT_S=30.0` (408 `request_timeout`), `SPOOL_SESSION_MB=2048`, `SPOOL_TOTAL_MB=8192`, `SPOOL_TTL_S=3600`; все overridable flag/env; ссылки в acceptance LL-P1. |
+| H2 | High | Пороги RSS — placeholder | **Внесено** — измеримые критерии: `RSS_SLOPE_MAX_MIB=64` (QAS-L1/L20, удвоение входа), `RSS_ANALYSIS_MAX_MIB=256` + `RSS_WINDOW_SENS_MIB=32` (QAS-L3/L10, 30-мин vs 5-мин окно); в карте QAS и acceptance фаз. |
+| H3 | High | UX-пороги делегированы плану (design §28.9(7)), но не заданы | **Внесено** — sticky «Период» ≤ `PERIOD_MAX_HEIGHT_PX=96` px (проверяется `selfTest` через `offsetHeight`); FTP-окно: дефолт 30 мин, пресеты {5м,15м,30м,1ч,6ч,24ч} = {300,900,1800,3600,21600,86400} с; прогресс — детерминированный бар (`role="progressbar"`, байты при известном `SIZE`, иначе индетерминированный). QAS-L16/L17 чек-листы привязаны к числам. |
+| M1 | Med | Ключи coarse-ответа `/api/analyze` не зафиксированы | **Внесено** — «Контракт coarse-ответа (M1)» в LL-P2: `handle`, `window{from,to}`, `coarse`, `window_count`, агрегаты (`digest`/`clients`/`sessions`/`session_count`/`client_identities`/`drops` c `key {run,t,userid}`/`anomalies`/`anomalies_excluded`/`events`/`log_end`/`config`/`records_count`/`host_caveats`), даунсэмпл-ряды `series`/`client_series`/`host_series` (≤ `SERIES_MAX_POINTS=2000`), `focus_points`; `records` никогда. LL-P4 ссылается на те же ключи. |
+| M2 | Med | QAS-L19 «default» не покрыт (`test_log_writer` покрывает лишь `set_max_mb(0)`) | **Внесено** — LL-P5: статическая проверка `bootstrap.cpp` (grep default-строки `"0"` + fallback `0.0f`) + ручной `hldsmon_status` на тестовом сервере; оба — в journal. |
+| M3 | Med | «стрим до EOF или 411» оставлено исполнителю | **Внесено** — детерминированная семантика LL-P1: отсутствие `Content-Length` → **411** `length_required`; present-but-malformed → **стрим до EOF** (`Connection: close`, read-timeout → 408); valid >0 → ровно N байт (недобор → 408). |
+| M4 | Med | Семантика `--allow-nonloopback-unlimited` неоднозначна | **Внесено** — LL-P1/таблица флагов: non-loopback + `--max-log-mb=0` без флага ⇒ **403** `unlimited_nonloopback_disabled` (startup-warning); с флагом или при `>0` ⇒ 200; loopback ⇒ всегда 200. QAS-L7 тестирует обе ветки. |
+| L1 | Low | Anchor `.panel-sticky (:1863-1864)` — место применения; определение в `:177` | **Внесено** — LL-P4 цитирует **и** CSS-определение `index.html:177`, **и** место применения `:1863-1864`. |
+| L2 | Low | Фраза про `test_webui.py` неточна | **Внесено** — «JS-рендер `index.html` не покрыт; есть лишь doctype smoke-test `test_get_index_html`, остальные ~58 тестов — JSON-API». |
+
+**Fine (не менять):** scope `tools/analyzer` + плагинный дефолт `hldsmon_max_mb`; схема P1/`KNOWN_TYPES`/`exports.whitelist` без изменений; stdlib-only; `iter_records`/`log_writer.cpp` не трогаются; фазовая декомпозиция и карта REQ-L/QAS-L/INV-L.
+
+**Гейт:** plan-review пройден (PASS-WITH-REVISIONS; все H/M и опциональные L1/L2 сложены) — **plan-gate ЗАКРЫТ; implementation-gate ОТКРЫТ**. Коммит — только по явной просьбе владельца.
