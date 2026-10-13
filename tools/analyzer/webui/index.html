@@ -2099,7 +2099,7 @@ function buildSummary(result, view) {
 
 /* buildGlobalClientPicker: the ONE global client selector. It lives in the sticky
    «Период» panel so it stays visible while scrolling. One <optgroup> per player with a
-   «весь игрок (N сессий)» option plus one <option> per session; sessions with no player
+   «<ник> (весь)» option plus one <option> per session; sessions with no player
    group fall under «Прочие сессии». Sets state.selectedClient (defaulting to the first
    player, else the first session) and keeps the dependent UI in sync on change. */
 function buildGlobalClientPicker(view) {
@@ -2112,7 +2112,9 @@ function buildGlobalClientPicker(view) {
     const og = document.createElement("optgroup");
     const auth = p.steamid64 || p.authid || p.player || "—";
     og.label = (p.name || "без имени") + " (" + auth + ")";
-    og.appendChild(new Option("весь игрок (" + p.sessions.length + " сессий)", "player:" + p.player));
+    const wholeOpt = new Option((p.name || "без имени") + " (весь)", "player:" + p.player);
+    wholeOpt.title = p.sessions.length + " сессий";
+    og.appendChild(wholeOpt);
     for (const s of p.sessions.slice().sort(byUserId)) {
       covered[String(s.session)] = true;
       og.appendChild(new Option(sessionOptionLabel(s), String(s.session)));
