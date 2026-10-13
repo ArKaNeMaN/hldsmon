@@ -37,6 +37,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import ssl
 import sys
 import tempfile
@@ -622,7 +623,7 @@ def receive_body(rfile, dest_path, length, *, valve=0, session_limit=0,
                 while True:
                     try:
                         block = rfile.read(chunk)
-                    except TimeoutError as exc:
+                    except (TimeoutError, socket.timeout) as exc:
                         raise _RequestTimeout() from exc
                     if not block:
                         break
@@ -636,7 +637,7 @@ def receive_body(rfile, dest_path, length, *, valve=0, session_limit=0,
                 while remaining > 0:
                     try:
                         block = rfile.read(min(chunk, remaining))
-                    except TimeoutError as exc:
+                    except (TimeoutError, socket.timeout) as exc:
                         raise _RequestTimeout() from exc
                     if not block:
                         if over:
